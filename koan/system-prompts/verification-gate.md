@@ -1,5 +1,3 @@
-
-
 # Verification Gate — Evidence Before Completion
 
 Before claiming a mission is complete, you MUST provide fresh verification evidence.
