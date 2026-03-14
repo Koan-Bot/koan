@@ -355,7 +355,8 @@ def handle_chat(text: str):
                 log("chat", "Empty response from Claude.")
         except subprocess.TimeoutExpired:
             log("error", f"Claude timed out ({CHAT_TIMEOUT}s). Retrying with lite context...")
-            # Retry with reduced context
+            # Retry with reduced context and shorter timeout to cap total wait
+            retry_timeout = max(CHAT_TIMEOUT // 2, 10)
             lite_prompt = _build_chat_prompt(text, lite=True)
             lite_cmd = build_full_command(
                 prompt=lite_prompt,
@@ -367,7 +368,7 @@ def handle_chat(text: str):
             try:
                 result = run_cli(
                     lite_cmd,
-                    capture_output=True, text=True, timeout=CHAT_TIMEOUT,
+                    capture_output=True, text=True, timeout=retry_timeout,
                     cwd=PROJECT_PATH or str(KOAN_ROOT),
                 )
                 response = _clean_chat_response(result.stdout.strip(), text)
