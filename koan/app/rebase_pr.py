@@ -240,15 +240,15 @@ def run_rebase(
     if not context["branch"]:
         return False, "Could not determine PR branch name."
 
-    # Warn about pending (unsubmitted) reviews we cannot read
+    # Note pending (unsubmitted) reviews — they can't be read via API but
+    # we flag them so the review feedback step is aware.
     if context.get("has_pending_reviews"):
         notify_fn(
             f"⚠️ PR #{pr_number} has pending (unsubmitted) review comments "
-            f"that are invisible to the API. The rebase will proceed but may "
-            f"miss some feedback. Consider submitting the pending review on "
-            f"GitHub."
+            f"that are invisible to the API. Will incorporate this signal "
+            f"into the review analysis."
         )
-        actions_log.append("Warning: pending (unsubmitted) review comments detected")
+        actions_log.append("Detected pending (unsubmitted) review comments")
 
     branch = context["branch"]
     base = context["base"]
@@ -299,6 +299,7 @@ def run_rebase(
         context.get("review_comments", "").strip()
         or context.get("reviews", "").strip()
         or context.get("issue_comments", "").strip()
+        or context.get("has_pending_reviews")
     )
 
     if has_review_feedback:

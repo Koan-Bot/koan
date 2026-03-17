@@ -837,6 +837,29 @@ class TestRunRebase:
         mock_checkout.assert_called_once()
 
     @patch("app.rebase_pr._safe_checkout")
+    @patch("app.rebase_pr._get_current_branch", return_value="feat")
+    @patch("app.rebase_pr._apply_review_feedback")
+    @patch("app.rebase_pr._checkout_pr_branch")
+    @patch("app.rebase_pr._rebase_with_conflict_resolution")
+    @patch("app.rebase_pr.fetch_pr_context")
+    def test_pending_reviews_triggers_review_step(
+        self, mock_ctx, mock_rebase, mock_checkout, mock_apply, mock_branch, mock_safe,
+    ):
+        """Pending reviews should trigger the review feedback step even with no visible comments."""
+        mock_ctx.return_value = {
+            "title": "T", "body": "", "branch": "feat",
+            "base": "main", "state": "", "author": "", "url": "",
+            "diff": "+code", "review_comments": "", "reviews": "", "issue_comments": "",
+            "has_pending_reviews": True,
+        }
+        mock_checkout.return_value = "origin"
+        mock_rebase.return_value = "origin"
+        notify = MagicMock()
+        run_rebase("o", "r", "1", "/p", notify_fn=notify)
+        # Review feedback step should run despite no visible comments
+        mock_apply.assert_called_once()
+
+    @patch("app.rebase_pr._safe_checkout")
     @patch("app.rebase_pr.run_gh")
     @patch("app.rebase_pr._apply_review_feedback")
     @patch("app.rebase_pr.fetch_pr_context")

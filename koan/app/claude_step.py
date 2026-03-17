@@ -428,6 +428,16 @@ def _build_pr_prompt(
         context: PR context dict from fetch_pr_context().
         skill_dir: Optional skill directory for prompt resolution.
     """
+    pending_note = ""
+    if context.get("has_pending_reviews"):
+        pending_note = (
+            "**Note:** This PR has pending (unsubmitted) review comments that "
+            "are invisible to the API. A reviewer has started a review but not "
+            "yet submitted it. Pay extra attention to the PR description, "
+            "existing reviews, and conversation thread for any signals about "
+            "what the reviewer may want changed."
+        )
+
     kwargs = dict(
         TITLE=context["title"],
         BODY=context.get("body", ""),
@@ -437,6 +447,7 @@ def _build_pr_prompt(
         REVIEW_COMMENTS=context.get("review_comments", ""),
         REVIEWS=context.get("reviews", ""),
         ISSUE_COMMENTS=context.get("issue_comments", ""),
+        PENDING_REVIEWS_NOTE=pending_note,
     )
     return load_prompt_or_skill(skill_dir, prompt_name, **kwargs)
 

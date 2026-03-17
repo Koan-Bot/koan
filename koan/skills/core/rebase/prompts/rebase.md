@@ -32,6 +32,8 @@ You are rebasing a pull request and applying changes requested by reviewers.
 
 {ISSUE_COMMENTS}
 
+{PENDING_REVIEWS_NOTE}
+
 ---
 
 ## Your Task
