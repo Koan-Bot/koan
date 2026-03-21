@@ -69,6 +69,12 @@
     </div>
 </div>
 
+{# Health card — populated by /api/health poll every 60s #}
+<div id="health-card" class="card" style="display:none;">
+    <div class="stat-label">Health</div>
+    <div id="health-indicators" style="display:flex;gap:1.25rem;flex-wrap:wrap;margin-top:0.5rem;font-size:0.875rem;"></div>
+</div>
+
 {% if project_stats %}
 <h2>Projects</h2>
 <div class="grid">
@@ -362,6 +368,52 @@
 
     loadAttention();
     setInterval(loadAttention, 30000);
+})();
+
+// Health polling — every 60s, uses setTimeout to avoid overlap
+(function () {
+    var card = document.getElementById('health-card');
+    var indicators = document.getElementById('health-indicators');
+    if (!card || !indicators) return;
+
+    var STATUS_COLORS = { ok: 'var(--green)', warn: 'var(--orange)', error: 'var(--red)' };
+
+    function dot(status) {
+        var color = STATUS_COLORS[status] || 'var(--text-muted)';
+        return '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + color + ';margin-right:4px;vertical-align:middle;"></span>';
+    }
+
+    function renderHealth(data) {
+        var html = '';
+        if (data.disk) {
+            html += '<span>' + dot(data.disk.status) + 'Disk ' + data.disk.used_pct + '%</span>';
+        }
+        if (data.run) {
+            html += '<span>' + dot(data.run.status) + 'Run ' + (data.run.alive ? '✓' : '✗') + '</span>';
+        }
+        if (data.awake) {
+            html += '<span>' + dot(data.awake.status) + 'Awake ' + (data.awake.alive ? '✓' : '✗') + '</span>';
+        }
+        if (data.github) {
+            html += '<span>' + dot(data.github.status) + 'GitHub ' + (data.github.reachable ? '✓' : '✗') + '</span>';
+        }
+        indicators.innerHTML = html;
+        card.style.display = '';
+    }
+
+    function loadHealth() {
+        fetch('/api/health')
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                renderHealth(data);
+                setTimeout(loadHealth, 60000);
+            })
+            .catch(function () {
+                setTimeout(loadHealth, 60000);
+            });
+    }
+
+    loadHealth();
 })();
 </script>
 {% endblock %}

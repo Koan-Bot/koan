@@ -157,6 +157,7 @@
         'c': '/chat',
         'd': '/',
         'g': '/progress',
+        'o': '/logs',
     };
 
     function isInputFocused() {

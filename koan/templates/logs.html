@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Kōan — Logs{% endblock %}
+{% block content %}
+<h1>Logs</h1>
+
+<div class="card" style="margin-bottom:1rem;">
+    <div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;">
+        <label for="log-source" style="color:var(--text-muted);font-size:0.875rem;">Source</label>
+        <select id="log-source" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;">
+            <option value="all">All</option>
+            <option value="run">run</option>
+            <option value="awake">awake</option>
+        </select>
+        <input id="log-filter" type="text" placeholder="Filter…"
+               style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;flex:1;min-width:160px;"
+               autocomplete="off" spellcheck="false">
+        <span id="log-count" style="color:var(--text-muted);font-size:0.875rem;white-space:nowrap;"></span>
+        <label style="display:flex;align-items:center;gap:0.35rem;font-size:0.875rem;color:var(--text-muted);cursor:pointer;">
+            <input id="log-autoscroll" type="checkbox" checked> Auto-scroll
+        </label>
+        <button id="log-refresh"
+                style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.75rem;cursor:pointer;">
+            Refresh
+        </button>
+    </div>
+</div>
+
+<div class="card" style="padding:0;">
+    <pre id="log-output"
+         style="margin:0;padding:1rem;font-family:var(--mono);font-size:0.8rem;line-height:1.55;
+                overflow-x:auto;overflow-y:auto;max-height:70vh;white-space:pre-wrap;word-break:break-all;">
+<span style="color:var(--text-muted);">Loading…</span>
+    </pre>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var source = document.getElementById('log-source');
+    var filterInput = document.getElementById('log-filter');
+    var output = document.getElementById('log-output');
+    var countBadge = document.getElementById('log-count');
+    var autoscrollCb = document.getElementById('log-autoscroll');
+    var refreshBtn = document.getElementById('log-refresh');
+
+    var debounceTimer = null;
+    var currentFilter = '';
+
+    function highlight(text) {
+        // Escape HTML, then colour error/warn keywords
+        var esc = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        if (/error|fail|exception|traceback/i.test(esc)) {
+            return '<span style="color:var(--red);">' + esc + '</span>';
+        }
+        if (/warn(ing)?/i.test(esc)) {
+            return '<span style="color:var(--orange);">' + esc + '</span>';
+        }
+        return esc;
+    }
+
+    function load() {
+        var src = source.value;
+        var q = filterInput.value.trim();
+        var url = '/api/logs?source=' + encodeURIComponent(src) + '&limit=500';
+        if (q) url += '&q=' + encodeURIComponent(q);
+
+        fetch(url)
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                var lines = data.lines || [];
+                countBadge.textContent = lines.length + ' line' + (lines.length !== 1 ? 's' : '');
+
+                if (lines.length === 0) {
+                    output.innerHTML = '<span style="color:var(--text-muted);">No log lines found.</span>';
+                    return;
+                }
+
+                var html = lines.map(function (l) {
+                    var prefix = src === 'all'
+                        ? '<span style="color:var(--text-muted);user-select:none;">[' + l.source + '] </span>'
+                        : '';
+                    return prefix + highlight(l.text);
+                }).join('\n');
+
+                output.innerHTML = html;
+
+                if (autoscrollCb.checked) {
+                    output.scrollTop = output.scrollHeight;
+                }
+            })
+            .catch(function () {
+                output.innerHTML = '<span style="color:var(--red);">Failed to fetch logs.</span>';
+            });
+    }
+
+    source.addEventListener('change', load);
+
+    filterInput.addEventListener('input', function () {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(load, 300);
+    });
+
+    refreshBtn.addEventListener('click', load);
+
+    // Initial load
+    load();
+})();
+</script>
+{% endblock %}

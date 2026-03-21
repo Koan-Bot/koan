@@ -15,9 +15,11 @@ Usage:
     make dashboard
 """
 
+import collections
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -44,6 +46,7 @@ from app.signals import (
     QUOTA_RESET_FILE,
     STATUS_FILE,
     STOP_FILE,
+    pid_file,
 )
 from app.missions import (
     cancel_pending_mission,
@@ -821,6 +824,12 @@ def api_metrics():
     return jsonify(metrics)
 
 
+@app.route("/logs")
+def logs_page():
+    """Log viewer — searchable view of recent agent process logs."""
+    return render_template("logs.html")
+
+
 @app.route("/journal")
 def journal_page():
     """Journal viewer."""
@@ -1234,6 +1243,141 @@ def _find_linked_missions(issue_url: str, issue_number: int) -> list:
         elif issue_number_str in line and "/plan" in line.lower():
             linked.append(stripped)
     return linked[:20]  # cap to avoid huge responses
+
+
+_LOG_LINE_MAX = 2000
+_LOG_LIMIT_MAX = 2000
+_LOG_LIMIT_DEFAULT = 200
+_DISK_WARN_PCT = 85
+_DISK_ERROR_PCT = 95
+
+
+def _tail_log_file(log_path: Path, limit: int) -> list:
+    """Return the last *limit* lines from *log_path* as a list of strings.
+
+    Uses collections.deque to avoid loading the whole file into memory.
+    Each line is truncated to _LOG_LINE_MAX characters.
+    Returns an empty list if the file does not exist or cannot be read.
+    """
+    try:
+        with open(log_path, errors="replace") as fh:
+            lines = list(collections.deque(fh, maxlen=limit))
+    except OSError:
+        return []
+    return [line.rstrip("\n")[:_LOG_LINE_MAX] for line in lines]
+
+
+@app.route("/api/logs")
+def api_logs():
+    """Serve recent lines from process log files.
+
+    Query parameters:
+      source  — one of ``run``, ``awake``, ``all`` (default ``all``)
+      limit   — max lines to return (default 200, capped at 2000)
+      q       — optional substring filter (case-insensitive)
+    """
+    source = request.args.get("source", "all").lower()
+    try:
+        limit = min(int(request.args.get("limit", _LOG_LIMIT_DEFAULT)), _LOG_LIMIT_MAX)
+    except (ValueError, TypeError):
+        limit = _LOG_LIMIT_DEFAULT
+    q = request.args.get("q", "").lower()
+
+    logs_dir = KOAN_ROOT / "logs"
+    sources = ("run", "awake") if source == "all" else (source,)
+
+    result = []
+    for src in sources:
+        log_path = logs_dir / f"{src}.log"
+        for line in _tail_log_file(log_path, limit):
+            if q and q not in line.lower():
+                continue
+            result.append({"source": src, "text": line})
+
+    # When merging multiple sources, take the last *limit* entries.
+    if len(sources) > 1 and len(result) > limit:
+        result = result[-limit:]
+
+    return jsonify({"lines": result, "total": len(result)})
+
+
+def _check_process_health(koan_root: Path, process_name: str) -> dict:
+    """Return alive status for a managed process by reading its PID file."""
+    pid_path = koan_root / pid_file(process_name)
+    alive = False
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            os.kill(pid, 0)
+            alive = True
+        except (OSError, ValueError):
+            pass
+    return {"alive": alive, "status": "ok" if alive else "warn"}
+
+
+@app.route("/api/health")
+def api_health():
+    """System health indicators — disk, run process, awake process.
+
+    Checks are synchronous and local (no external network calls).
+    A GitHub API connectivity check is performed asynchronously with a
+    short timeout so it never blocks the response.
+
+    Response shape::
+
+        {
+          "disk":  {"used_pct": 82, "status": "ok"},
+          "run":   {"alive": true,  "status": "ok"},
+          "awake": {"alive": false, "status": "warn"},
+          "github": {"reachable": true, "status": "ok"}   # optional async
+        }
+    """
+    # --- Disk ---
+    try:
+        du = shutil.disk_usage(str(KOAN_ROOT))
+        used_pct = int(du.used * 100 / du.total) if du.total else 0
+    except OSError:
+        used_pct = 0
+    if used_pct >= _DISK_ERROR_PCT:
+        disk_status = "error"
+    elif used_pct >= _DISK_WARN_PCT:
+        disk_status = "warn"
+    else:
+        disk_status = "ok"
+
+    # --- Processes ---
+    run_health = _check_process_health(KOAN_ROOT, "run")
+    awake_health = _check_process_health(KOAN_ROOT, "awake")
+
+    response = {
+        "disk": {"used_pct": used_pct, "status": disk_status},
+        "run": run_health,
+        "awake": awake_health,
+    }
+
+    # --- GitHub (async, best-effort, 3s timeout) ---
+    import concurrent.futures
+
+    def _check_github() -> dict:
+        try:
+            result = subprocess.run(
+                ["gh", "api", "rate_limit", "--jq", ".rate.remaining"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                return {"reachable": True, "status": "ok"}
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return {"reachable": False, "status": "warn"}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_check_github)
+        try:
+            response["github"] = future.result(timeout=4)
+        except concurrent.futures.TimeoutError:
+            response["github"] = {"reachable": False, "status": "warn"}
+
+    return jsonify(response)
 
 
 @app.route("/api/status")

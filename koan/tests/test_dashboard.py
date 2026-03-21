@@ -1179,3 +1179,177 @@ class TestPlansPage:
             )
         assert len(linked) == 1
         assert "/plan" in linked[0]
+
+
+class TestApiLogs:
+    """Tests for /api/logs endpoint (Phase 1)."""
+
+    def test_api_logs_no_log_dir(self, app_client, tmp_path):
+        """Returns empty lines when logs/ directory doesn't exist."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?limit=20")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["lines"] == []
+        assert data["total"] == 0
+
+    def test_api_logs_run_only(self, app_client, tmp_path):
+        """source=run returns lines from run.log only."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text("line1\nline2\nline3\n")
+        (logs_dir / "awake.log").write_text("awake_line\n")
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        texts = [l["text"] for l in data["lines"]]
+        assert "line1" in texts
+        assert "line2" in texts
+        # awake lines must not appear
+        assert all("awake_line" not in t for t in texts)
+        assert all(l["source"] == "run" for l in data["lines"])
+
+    def test_api_logs_filter(self, app_client, tmp_path):
+        """?q=error returns only lines containing the query string."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text(
+            "info: startup ok\nerror: something failed\ninfo: all good\n"
+        )
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run&q=error")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data["lines"]) == 1
+        assert "error" in data["lines"][0]["text"]
+
+    def test_api_logs_limit(self, app_client, tmp_path):
+        """?limit=50 returns at most 50 lines."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        content = "\n".join(f"line {i}" for i in range(300))
+        (logs_dir / "run.log").write_text(content + "\n")
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run&limit=50")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data["lines"]) == 50
+
+    def test_api_logs_limit_clamped(self, app_client, tmp_path):
+        """limit > 2000 is clamped to 2000."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        content = "\n".join(f"line {i}" for i in range(10))
+        (logs_dir / "run.log").write_text(content + "\n")
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run&limit=9999")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data["lines"]) <= 2000
+
+    def test_api_logs_all_sources(self, app_client, tmp_path):
+        """source=all merges run and awake log lines."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text("run_line\n")
+        (logs_dir / "awake.log").write_text("awake_line\n")
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=all")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        sources = {l["source"] for l in data["lines"]}
+        assert "run" in sources
+        assert "awake" in sources
+
+    def test_api_logs_missing_source_file(self, app_client, tmp_path):
+        """source=awake when awake.log absent returns empty lines."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text("run_line\n")
+        # awake.log deliberately absent
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=awake")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["lines"] == []
+
+    def test_api_logs_long_lines_truncated(self, app_client, tmp_path):
+        """Lines longer than 2000 chars are truncated."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        long_line = "x" * 3000
+        (logs_dir / "run.log").write_text(long_line + "\n")
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data["lines"]) == 1
+        assert len(data["lines"][0]["text"]) <= 2000
+
+
+class TestApiHealth:
+    """Tests for /api/health endpoint (Phase 3)."""
+
+    def test_api_health_structure(self, app_client, tmp_path):
+        """Response contains disk, run, and awake keys."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("shutil.disk_usage") as mock_du:
+            mock_du.return_value = type("du", (), {"total": 100, "used": 50, "free": 50})()
+            resp = app_client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "disk" in data
+        assert "run" in data
+        assert "awake" in data
+
+    def test_api_health_no_pids(self, app_client, tmp_path):
+        """With no PID files, run.alive and awake.alive are false."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("shutil.disk_usage") as mock_du:
+            mock_du.return_value = type("du", (), {"total": 100, "used": 50, "free": 50})()
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["run"]["alive"] is False
+        assert data["awake"]["alive"] is False
+
+    def test_api_health_disk_ok(self, app_client, tmp_path):
+        """Disk below 85% reports status ok."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("shutil.disk_usage") as mock_du:
+            mock_du.return_value = type("du", (), {"total": 100, "used": 80, "free": 20})()
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["disk"]["status"] == "ok"
+        assert data["disk"]["used_pct"] == 80
+
+    def test_api_health_disk_warn(self, app_client, tmp_path):
+        """Disk at 90% reports status warn."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("shutil.disk_usage") as mock_du:
+            mock_du.return_value = type("du", (), {"total": 100, "used": 90, "free": 10})()
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["disk"]["status"] == "warn"
+
+    def test_api_health_disk_error(self, app_client, tmp_path):
+        """Disk at 96% reports status error."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("shutil.disk_usage") as mock_du:
+            mock_du.return_value = type("du", (), {"total": 100, "used": 96, "free": 4})()
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["disk"]["status"] == "error"
+
+    def test_api_health_process_alive(self, app_client, tmp_path):
+        """With a valid PID file and live process, run.alive is true."""
+        import os
+        my_pid = os.getpid()
+        pid_path = tmp_path / ".koan-pid-run"
+        pid_path.write_text(str(my_pid))
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("shutil.disk_usage") as mock_du:
+            mock_du.return_value = type("du", (), {"total": 100, "used": 50, "free": 50})()
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["run"]["alive"] is True
