@@ -47,6 +47,7 @@ from app.run_log import (  # noqa: F401 — re-exported for backward compat
 )
 from app.shutdown_manager import is_shutdown_requested, clear_shutdown
 from app.signals import (
+    ABORT_FILE,
     CYCLE_FILE,
     PAUSE_FILE,
     PROJECT_FILE,
@@ -261,8 +262,9 @@ def run_claude_task(
 
     Returns the child exit code.
     """
-    global _last_mission_timed_out
+    global _last_mission_timed_out, _last_mission_aborted
     _last_mission_timed_out = False
+    _last_mission_aborted = False
 
     _sig.task_running = True
     _sig.first_ctrl_c = 0
@@ -318,6 +320,19 @@ def run_claude_task(
                         proc.wait(timeout=30)
                         break
                     except subprocess.TimeoutExpired:
+                        # Check for abort signal (user sent /abort)
+                        koan_root_path = os.environ.get("KOAN_ROOT", "")
+                        abort_path = Path(koan_root_path, ABORT_FILE) if koan_root_path else None
+                        if abort_path and abort_path.exists():
+                            log("koan", "Abort signal detected — aborting current mission")
+                            abort_path.unlink(missing_ok=True)
+                            _last_mission_aborted = True
+                            _kill_process_group(proc)
+                            try:
+                                proc.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                log("error", f"Process {proc.pid} unkillable after abort — abandoning")
+                            break
                         if timed_out:
                             # Watchdog already fired but process survived —
                             # make one last kill attempt from the main thread.
@@ -344,7 +359,9 @@ def run_claude_task(
                 cleanup()
 
         exit_code = proc.returncode
-        if timed_out:
+        if _last_mission_aborted:
+            exit_code = 1
+        elif timed_out:
             exit_code = 1
             _last_mission_timed_out = True
     finally:
@@ -625,6 +642,7 @@ def main_loop():
     # file persists and would cause an immediate exit on next startup.
     Path(koan_root, STOP_FILE).unlink(missing_ok=True)
     Path(koan_root, SHUTDOWN_FILE).unlink(missing_ok=True)
+    Path(koan_root, ABORT_FILE).unlink(missing_ok=True)
     Path(koan_root, CYCLE_FILE).unlink(missing_ok=True)
     clear_restart(koan_root)
 
@@ -1122,6 +1140,7 @@ _MISSION_RETRY_DELAY = 10  # seconds
 # were a transient network error (the retryable-pattern list matches
 # "timeout" which would otherwise trigger a second full-length run).
 _last_mission_timed_out = False
+_last_mission_aborted = False
 
 
 def _get_git_head(project_path: str) -> str:
@@ -1168,6 +1187,12 @@ def _maybe_retry_mission(
     # RETRYABLE pattern and start another full-length session.
     if _last_mission_timed_out:
         log("koan", "Skipping retry — mission was killed by watchdog timeout")
+        return claude_exit, stdout_file, stderr_file
+
+    # User-initiated aborts must not be retried — the user explicitly asked
+    # to stop this mission.
+    if _last_mission_aborted:
+        log("koan", "Skipping retry — mission was aborted by user")
         return claude_exit, stdout_file, stderr_file
 
     # Read output for classification
@@ -1629,6 +1654,12 @@ def _run_iteration(
         # cli_skill translation may have changed mission_title to a different string.
         if original_mission_title:
             _finalize_mission(instance, original_mission_title, project_name, claude_exit)
+
+        # If mission was aborted, notify and skip heavy post-mission pipeline
+        if _last_mission_aborted and original_mission_title:
+            log("koan", f"Mission aborted: {original_mission_title[:60]}")
+            _notify(instance, f"⏭️ [{project_name}] Mission aborted: {original_mission_title[:60]}")
+            return True  # count as productive so loop continues immediately
 
         # Post-mission pipeline
         _status_prefix = f"Run {run_num}/{max_runs}"
