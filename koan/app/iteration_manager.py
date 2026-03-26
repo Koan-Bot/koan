@@ -144,6 +144,22 @@ def _inject_recurring(instance_dir: Path):
         return []
 
 
+def _drain_ci_queue(instance_dir: str):
+    """Drain one CI queue entry per iteration.
+
+    Non-blocking: makes a single ``gh run list`` call and takes action
+    based on the result (remove on pass/none, inject /ci_check on fail,
+    skip on pending).
+    """
+    try:
+        from app.ci_queue_runner import drain_one
+        result = drain_one(instance_dir)
+        if result:
+            _log_iteration("ci", result)
+    except Exception as e:
+        _log_iteration("error", f"CI queue drain error: {e}")
+
+
 def _fallback_mission_extract(instance_dir: Path, projects_str: str,
                               context_msg: str):
     """Attempt direct mission extraction when the picker fails or returns empty.
@@ -730,6 +746,9 @@ def plan_iteration(
 
     # Step 3: Inject recurring missions
     recurring_injected = _inject_recurring(instance)
+
+    # Step 3b: Drain CI check queue (one entry per iteration)
+    _drain_ci_queue(str(instance))
 
     # Step 4: Pick mission
     mission_project, mission_title = _pick_mission(
