@@ -81,10 +81,13 @@ class TestHandleRouting:
 # ---------------------------------------------------------------------------
 
 class TestMissionQueuing:
+    OWN_PR = patch("app.github_skill_helpers.is_own_pr", return_value=(True, "koan/fix"))
+
     def test_valid_url_queues_mission(self, handler, ctx):
         ctx.args = "https://github.com/sukria/koan/pull/42"
         with patch("app.utils.resolve_project_path", return_value="/home/koan"), \
              patch("app.utils.get_known_projects", return_value=[("koan", "/home/koan")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission") as mock_insert:
             result = handler.handle(ctx)
             assert "queued" in result.lower()
@@ -98,6 +101,7 @@ class TestMissionQueuing:
         ctx.args = "https://github.com/sukria/koan/pull/42#discussion_r123"
         with patch("app.utils.resolve_project_path", return_value="/home/koan"), \
              patch("app.utils.get_known_projects", return_value=[("koan", "/home/koan")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission") as mock_insert:
             result = handler.handle(ctx)
             assert "queued" in result.lower()
@@ -107,6 +111,7 @@ class TestMissionQueuing:
         ctx.args = "please rebase https://github.com/sukria/koan/pull/99 thanks"
         with patch("app.utils.resolve_project_path", return_value="/home/koan"), \
              patch("app.utils.get_known_projects", return_value=[("koan", "/home/koan")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission") as mock_insert:
             result = handler.handle(ctx)
             assert "queued" in result.lower()
@@ -117,6 +122,7 @@ class TestMissionQueuing:
         ctx.args = "https://github.com/sukria/koan/pull/42"
         with patch("app.utils.resolve_project_path", return_value="/home/koan"), \
              patch("app.utils.get_known_projects", return_value=[("koan", "/home/koan")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission"):
             result = handler.handle(ctx)
             assert result == "Rebase queued for PR #42 (sukria/koan)"
@@ -126,6 +132,7 @@ class TestMissionQueuing:
         ctx.args = "https://github.com/sukria/koan/pull/42"
         with patch("app.utils.resolve_project_path", return_value="/home/koan"), \
              patch("app.utils.get_known_projects", return_value=[("koan", "/home/koan")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission") as mock_insert:
             handler.handle(ctx)
             entry = mock_insert.call_args[0][1]
@@ -140,6 +147,7 @@ class TestMissionQueuing:
         ctx.args = "https://github.com/other/myrepo/pull/7"
         with patch("app.utils.resolve_project_path", return_value="/some/myrepo"), \
              patch("app.utils.get_known_projects", return_value=[("onlyone", "/other/path")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission") as mock_insert:
             result = handler.handle(ctx)
             assert "queued" in result.lower()
@@ -152,6 +160,7 @@ class TestMissionQueuing:
         ctx.args = "https://github.com/sukria/koan/pull/42"
         with patch("app.utils.resolve_project_path", return_value="/home/koan"), \
              patch("app.utils.get_known_projects", return_value=[("koan", "/home/koan")]), \
+             self.OWN_PR, \
              patch("app.utils.insert_pending_mission") as mock_insert:
             handler.handle(ctx)
             missions_path = mock_insert.call_args[0][0]
