@@ -1,0 +1,40 @@
+"""Post-mission signal collector for prompt audit correlation.
+
+Logs mission outcome metadata to prompt-audit-signals.jsonl so the
+prompt audit skill can correlate prompt usage with success/failure rates.
+
+To activate: copy this file to instance/hooks/prompt_audit_signals.py
+(remove the .example extension).
+"""
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def on_post_mission(ctx):
+    """Log post-mission metadata to JSONL for prompt audit analysis."""
+    instance_dir = ctx.get("instance_dir", "")
+    if not instance_dir:
+        return
+
+    signals_path = Path(instance_dir) / "prompt-audit-signals.jsonl"
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "project_name": ctx.get("project_name", ""),
+        "mission_title": ctx.get("mission_title", ""),
+        "exit_code": ctx.get("exit_code", -1),
+        "duration_minutes": ctx.get("duration_minutes", 0),
+    }
+
+    try:
+        with open(signals_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass  # Fire-and-forget — don't break the pipeline
+
+
+HOOKS = {
+    "post_mission": on_post_mission,
+}

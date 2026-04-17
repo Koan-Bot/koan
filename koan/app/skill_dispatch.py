@@ -80,6 +80,7 @@ _CANONICAL_RUNNERS = {
     "incident": "skills.core.incident.incident_runner",
     "audit": "skills.core.audit.audit_runner",
     "security_audit": "skills.core.security_audit.security_audit_runner",
+    "prompt_audit": "skills.core.prompt_audit.prompt_audit_runner",
     "ci_check": "app.ci_queue_runner",
 }
 
@@ -310,6 +311,9 @@ def build_skill_command(
         ),
         "security_audit": lambda: _build_audit_cmd(
             base_cmd, args, project_name, project_path, instance_dir,
+        ),
+        "prompt_audit": lambda: _build_prompt_audit_cmd(
+            base_cmd, project_name, instance_dir, koan_root,
         ),
         "ci_check": lambda: _build_pr_url_cmd(base_cmd, args, project_path),
     }
@@ -655,6 +659,20 @@ def _build_audit_cmd(
         cmd.extend(["--context-file", path])
 
     return cmd
+
+
+def _build_prompt_audit_cmd(
+    base_cmd: List[str],
+    project_name: str,
+    instance_dir: str,
+    koan_root: str,
+) -> List[str]:
+    """Build prompt_audit_runner command."""
+    return base_cmd + [
+        "--project-name", project_name,
+        "--instance-dir", instance_dir,
+        "--koan-root", koan_root,
+    ]
 
 
 def _discover_runner_module(command: str) -> Optional[str]:

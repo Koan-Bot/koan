@@ -1320,6 +1320,27 @@ Each finding becomes a GitHub issue with:
 - **Suggested Fix** — Concrete remediation steps
 - **Details table** — Severity, category, location, and effort estimate
 
+### Prompt Audit
+
+**`/prompt_audit`** — Audit all system and skill prompts for quality, clarity, redundancy, staleness, and effectiveness. Uses post-mission signal data (if the optional hook is active) to correlate prompt usage with outcomes. Writes findings to `memory/prompt-audit-report.md`.
+
+- **Usage:** `/prompt_audit [project-name]`
+
+<details>
+<summary>Use cases</summary>
+
+- `/prompt_audit` — Audit all prompts (defaults to koan project)
+- `/prompt_audit koan` — Audit prompts for a specific project
+</details>
+
+Each finding includes:
+- **Prompt** — Which prompt file has the issue
+- **Category** — clarity, redundancy, staleness, effectiveness, length, structure, etc.
+- **Severity** — critical, high, medium, or low
+- **Suggestion** — Concrete, actionable improvement
+
+To enable signal collection for effectiveness correlation, copy `instance.example/hooks/prompt_audit_signals.py.example` to `instance/hooks/prompt_audit_signals.py`.
+
 ### Incident Triage
 
 **`/incident`** — Triage a production error from a stack trace or log snippet. Kōan will parse the error, identify the root cause, propose a fix with tests, and submit a draft PR.
@@ -1432,6 +1453,7 @@ All commands at a glance. **Tier:** B = Beginner, I = Intermediate, P = Power Us
 | `/profile <project>` | `/perf`, `/benchmark` | P | Performance profiling mission |
 | `/audit <project> [ctx] [limit=N]` | — | P | Audit project, create GitHub issues (top N, default 5) |
 | `/security_audit <project> [ctx] [limit=N]` | `/security`, `/secu` | P | Security audit, find critical vulnerabilities (top N, default 5) |
+| `/prompt_audit [project]` | — | P | Audit system/skill prompts for quality and effectiveness |
 | `/tech_debt [project]` | `/td`, `/debt` | P | Scan project for tech debt |
 | `/dead_code [project]` | `/dc` | P | Scan for unused code |
 | `/incident <error>` | — | P | Triage a production error |
