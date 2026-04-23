@@ -495,6 +495,28 @@ def execute_skill(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillE
     return None
 
 
+def _refresh_stale_app_modules() -> None:
+    """Reload app modules that skill handlers commonly import.
+
+    After an auto-update, the bridge process keeps old modules cached in
+    ``sys.modules`` while ``_execute_handler`` loads handler code fresh via
+    ``exec_module``.  The handler's ``import`` / ``from … import`` statements
+    resolve from the stale cache, so new functions or changed signatures are
+    invisible — causing TypeErrors and AttributeErrors at runtime.
+
+    Reloading here (once per handler invocation, before ``exec_module``)
+    protects *every* handler — current and future — without per-handler
+    boilerplate.
+    """
+    import sys
+
+    _MODULES_TO_REFRESH = ("app.github_skill_helpers",)
+    for mod_name in _MODULES_TO_REFRESH:
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            importlib.reload(mod)
+
+
 def _execute_handler(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillError]]:
     """Load and execute a Python handler."""
     handler_path = skill.handler_path
@@ -502,6 +524,9 @@ def _execute_handler(skill: Skill, ctx: SkillContext) -> Optional[Union[str, Ski
         return None
 
     try:
+        # Refresh modules that may be stale after auto-update (issue #1235).
+        _refresh_stale_app_modules()
+
         spec = importlib.util.spec_from_file_location(
             f"skill_handler_{skill.qualified_name}",
             str(handler_path),

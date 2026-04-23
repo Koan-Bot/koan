@@ -17,6 +17,7 @@ from app.skills import (
     _parse_bool_flag,
     _parse_inline_list,
     _parse_yaml_lite,
+    _refresh_stale_app_modules,
     build_registry,
     execute_skill,
     get_default_skills_dir,
@@ -1909,3 +1910,28 @@ class TestAliasCollisionDetection:
             f"Core skills have command/alias collisions:\n"
             + "\n".join(collisions)
         )
+
+
+# ---------------------------------------------------------------------------
+# Stale module cache guard (issue #1235)
+# ---------------------------------------------------------------------------
+
+class TestRefreshStaleAppModules:
+    """Verify _refresh_stale_app_modules reloads cached app modules."""
+
+    def test_restores_deleted_attribute(self):
+        """Simulates a stale sys.modules entry where a new function is missing.
+        After _refresh_stale_app_modules, the attribute should be restored."""
+        import app.github_skill_helpers as gh_mod
+
+        original = gh_mod.queue_github_mission
+        del gh_mod.queue_github_mission
+
+        try:
+            _refresh_stale_app_modules()
+            assert hasattr(gh_mod, "queue_github_mission"), (
+                "queue_github_mission should be restored after module refresh"
+            )
+        finally:
+            if not hasattr(gh_mod, "queue_github_mission"):
+                gh_mod.queue_github_mission = original
