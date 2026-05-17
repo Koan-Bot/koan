@@ -259,12 +259,12 @@ memory:
 ## 5. Risks
 
 - **Prompt-injection surface widened.** `context.md` is now injected
-  verbatim into every skill prompt. An operator who pastes untrusted
-  content into it (e.g. a copy-paste from a GitHub issue body that
-  contained a prompt-injection payload) hands that content to Claude
-  with no fencing. Mitigation today: the file is explicitly documented
-  as human-only territory. Future hardening: wrap the verbatim sections
-  in the same fencing applied by `prompt_guard.fence_external_data`.
+  into every skill prompt. An operator who pastes untrusted content
+  into it (e.g. a copy-paste from a GitHub issue body that contained
+  a prompt-injection payload) hands that content to Claude. Mitigation:
+  both `context.md` and `priorities.md` are wrapped in
+  `prompt_guard.fence_external_data` so payloads are neutralized, and
+  the files are documented as human-only territory.
 - **Memory-block growth can starve the rest of the prompt.** The
   agent-loop prompt already carries merge policy, PR guidelines, drift
   detection, deep research, etc. Adding 80 + 40 + ~25 lines of memory
@@ -308,9 +308,8 @@ memory:
 - **Token-aware caps for `context.md` / `priorities.md`.** Replace the
   80-line / 40-line caps with token caps using the provider's tokenizer
   (we already have `cli_provider` indirection for the model name).
-- **Fence the verbatim sections.** Apply `prompt_guard.fence_external_data`
-  to `context.md` and `priorities.md` content so an accidental
-  prompt-injection payload is at least neutralized.
+- ~~**Fence the verbatim sections.**~~ Done — both `context.md` and
+  `priorities.md` are already wrapped in `fence_external_data`.
 - **Cap the total memory block.** Add a `memory.max_block_lines` config
   knob that clamps the assembled block — drop learnings first
   (least-confident source), then truncate context, then priorities.

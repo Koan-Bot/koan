@@ -575,11 +575,13 @@ def _append_lessons_to_learnings(
             "\n".join(new_lines), existing_content, project_path,
         )
         if filtered is not None:
-            # Re-apply exact-string dedup to the CLI output in case the
-            # model echoed an existing line back unchanged.
+            # Keep only bullet lines (^- ) to guard against model
+            # hallucinating non-lesson content, then re-apply
+            # exact-string dedup in case the model echoed existing lines.
             new_lines = [
                 line for line in filtered.splitlines()
-                if line.strip() and line.strip() not in existing_lines
+                if line.strip().startswith("- ")
+                and line.strip() not in existing_lines
             ]
 
     if not new_lines:

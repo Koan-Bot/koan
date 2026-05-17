@@ -253,7 +253,14 @@ def _clamp_to_max_lines(parts: list[str], max_lines: int) -> tuple[list[str], in
         if dropped > 0:
             out[i] = truncated
             excess -= dropped
+        elif excess > 0:
+            # Part too small to truncate (≤3 lines) — drop it entirely
+            # so the clamp doesn't silently fail.
+            dropped = len(out[i].splitlines())
+            out[i] = ""
+            excess -= dropped
 
+    out = [p for p in out if p]
     kept_total = sum(len(p.splitlines()) for p in out)
     return out, total - kept_total
 
