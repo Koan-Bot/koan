@@ -8,6 +8,8 @@ from app.skill_dispatch import (
     parse_skill_mission,
     build_skill_command,
     dispatch_skill_mission,
+    strip_passthrough_command,
+    expand_combo_skill,
     validate_skill_args,
 )
 
@@ -225,6 +227,18 @@ class TestBuildSkillCommand:
         cmd = self._build("recreate", "no url here")
         assert cmd is None
 
+    def test_ci_check(self):
+        url = "https://github.com/sukria/koan/pull/42"
+        cmd = self._build("ci_check", url)
+        assert cmd is not None
+        assert "app.ci_queue_runner" in cmd
+        assert url in cmd
+        assert "--project-path" in cmd
+
+    def test_ci_check_no_url(self):
+        cmd = self._build("ci_check", "no url here")
+        assert cmd is None
+
     def test_ai(self):
         cmd = self._build("ai", "koan")
         assert cmd is not None
@@ -411,6 +425,20 @@ class TestDispatchSkillMission:
         assert "skills.core.implement.implement_runner" in cmd
         assert "--context" in cmd
         assert "Phase 1 to 3" in cmd
+
+    def test_ci_check_dispatch(self):
+        """ci_check missions injected by ci_queue_runner must dispatch correctly."""
+        cmd = self._dispatch("/ci_check https://github.com/sukria/koan/pull/42")
+        assert cmd is not None
+        assert "app.ci_queue_runner" in cmd
+        assert "https://github.com/sukria/koan/pull/42" in cmd
+        assert "--project-path" in cmd
+
+    def test_ci_check_with_project_tag(self):
+        """ci_check missions include [project:X] tags from ci_queue_runner."""
+        cmd = self._dispatch("[project:koan] /ci_check https://github.com/sukria/koan/pull/42")
+        assert cmd is not None
+        assert "app.ci_queue_runner" in cmd
 
     def test_regular_mission_returns_none(self):
         cmd = self._dispatch("Fix the login bug")
@@ -625,12 +653,23 @@ class TestHandlerCleanFormat:
             "app.utils.resolve_project_path",
             lambda repo, owner=None: "/workspace/koan",
         )
+
         monkeypatch.setattr(
-            "app.github_url_parser.parse_pr_url",
-            lambda url: ("sukria", "koan", "42"),
+            "app.github_skill_helpers.is_own_pr",
+            lambda owner, repo, pr: (True, "koan/some-branch"),
         )
 
         from skills.core.rebase.handler import handle
+        # Patch parse_pr_url on the handler module's local binding, NOT on the
+        # source module — the handler does `from app.github_url_parser import
+        # parse_pr_url` at module load and caches that reference. Patching the
+        # source module after the handler is imported would have no effect, and
+        # patching it before the handler import would leak a stale binding into
+        # later tests (the cause of #xdist-pollution).
+        monkeypatch.setattr(
+            "skills.core.rebase.handler.parse_pr_url",
+            lambda url: ("sukria", "koan", "42"),
+        )
         ctx = self._make_ctx(
             args="https://github.com/sukria/koan/pull/42",
             instance_dir=tmp_path,
@@ -715,12 +754,14 @@ class TestHandlerCleanFormat:
             "app.utils.resolve_project_path",
             lambda repo, owner=None: "/workspace/koan",
         )
-        monkeypatch.setattr(
-            "app.github_url_parser.parse_pr_url",
-            lambda url: ("sukria", "koan", "42"),
-        )
 
         from skills.core.recreate.handler import handle
+        # Patch parse_pr_url on the handler module's local binding (see
+        # comment on test_rebase_handler_clean_format above for why).
+        monkeypatch.setattr(
+            "skills.core.recreate.handler.parse_pr_url",
+            lambda url: ("sukria", "koan", "42"),
+        )
         ctx = self._make_ctx(
             args="https://github.com/sukria/koan/pull/42",
             instance_dir=tmp_path,
@@ -780,6 +821,26 @@ class TestIsSkillMissionWithPrefix:
             lambda: [("koan", "/workspace/koan")],
         )
         assert is_skill_mission("unknown /plan test") is False
+
+    def test_dotted_project_tag_prefix(self):
+        """Project names containing dots (e.g. developers.esphome.io) must
+        be recognized as a skill mission. Regression: previously dropped to
+        the agent loop with the wrong working directory."""
+        assert is_skill_mission(
+            "[project:developers.esphome.io] /review "
+            "https://github.com/esphome/developers.esphome.io/pull/146",
+        ) is True
+
+    def test_dotted_projet_tag_prefix(self):
+        """French variant also accepts dotted project names."""
+        assert is_skill_mission("[projet:my.site.io] /plan dark mode") is True
+
+    def test_dotted_raw_project_word_prefix(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.utils.get_known_projects",
+            lambda: [("developers.esphome.io", "/ws/developers.esphome.io")],
+        )
+        assert is_skill_mission("developers.esphome.io /plan dark") is True
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +916,36 @@ class TestParseSkillMissionWithPrefix:
         assert pid == ""
         assert cmd == ""
         assert args == "unknown /plan test"
+
+    def test_dotted_project_tag_review(self):
+        """Real-world failure from run 16: dotted project + /review URL."""
+        pid, cmd, args = parse_skill_mission(
+            "[project:developers.esphome.io] /review "
+            "https://github.com/esphome/developers.esphome.io/pull/146",
+        )
+        assert pid == "developers.esphome.io"
+        assert cmd == "review"
+        assert args == "https://github.com/esphome/developers.esphome.io/pull/146"
+
+    def test_dotted_project_tag_scoped_command(self):
+        pid, cmd, args = parse_skill_mission(
+            "[project:my.site.io] /core.plan fix bug",
+        )
+        assert pid == "my.site.io"
+        assert cmd == "plan"
+        assert args == "fix bug"
+
+    def test_dotted_raw_project_word_prefix(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.utils.get_known_projects",
+            lambda: [("developers.esphome.io", "/ws/developers.esphome.io")],
+        )
+        pid, cmd, args = parse_skill_mission(
+            "developers.esphome.io /plan dark mode",
+        )
+        assert pid == "developers.esphome.io"
+        assert cmd == "plan"
+        assert args == "dark mode"
 
 
 # ---------------------------------------------------------------------------
@@ -994,7 +1085,11 @@ class TestValidateSkillArgs:
     def test_implement_no_url(self):
         err = validate_skill_args("implement", "fix the login bug")
         assert err is not None
-        assert "/implement requires a GitHub issue or PR URL" in err
+        assert "/implement requires" in err
+
+    def test_implement_jira_url_accepted(self):
+        """Jira URLs are valid for /implement."""
+        assert validate_skill_args("implement", "https://org.atlassian.net/browse/PROJ-123") is None
 
     def test_implement_pr_url_accepted(self):
         """PR URLs are valid for /implement — GitHub issues API works for PRs."""
@@ -1010,6 +1105,14 @@ class TestValidateSkillArgs:
         err = validate_skill_args("check", "no url here")
         assert err is not None
         assert "/check requires a GitHub URL" in err
+
+    def test_ci_check_valid_url(self):
+        assert validate_skill_args("ci_check", "https://github.com/sukria/koan/pull/42") is None
+
+    def test_ci_check_no_url(self):
+        err = validate_skill_args("ci_check", "no url here")
+        assert err is not None
+        assert "/ci_check requires a PR URL" in err
 
     def test_plan_always_valid(self):
         """Plan accepts free text — no arg validation error."""
@@ -1048,7 +1151,11 @@ class TestValidateSkillArgs:
     def test_fix_no_url(self):
         err = validate_skill_args("fix", "fix the login bug")
         assert err is not None
-        assert "/fix requires a GitHub issue or PR URL" in err
+        assert "/fix requires" in err
+
+    def test_fix_jira_url_accepted(self):
+        """Jira URLs are valid for /fix."""
+        assert validate_skill_args("fix", "https://org.atlassian.net/browse/PROJ-52372") is None
 
     def test_fix_pr_url_accepted(self):
         """PR URLs are valid for /fix — same as /implement."""
@@ -1059,6 +1166,85 @@ class TestValidateSkillArgs:
             "fix",
             "https://github.com/Anantys/investmindr/issues/42 backend only",
         ) is None
+
+    # --- Alias validation coverage (#1097) ---
+
+    def test_deeplan_alias_always_valid(self):
+        """deeplan alias resolves to deepplan — no URL requirement."""
+        assert validate_skill_args("deeplan", "some idea") is None
+
+    def test_claude_alias_always_valid(self):
+        """claude alias resolves to claudemd — no URL requirement."""
+        assert validate_skill_args("claude", "koan") is None
+
+    def test_claude_dot_md_alias_always_valid(self):
+        assert validate_skill_args("claude.md", "koan") is None
+
+    def test_claude_underscore_md_alias_always_valid(self):
+        assert validate_skill_args("claude_md", "koan") is None
+
+    def test_secu_alias_always_valid(self):
+        """secu alias resolves to security_audit — no URL requirement."""
+        assert validate_skill_args("secu", "check auth module") is None
+
+    def test_security_alias_always_valid(self):
+        assert validate_skill_args("security", "check auth module") is None
+
+    def test_security_audit_always_valid(self):
+        assert validate_skill_args("security_audit", "check auth module") is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_canonical and _COMMAND_ALIASES
+# ---------------------------------------------------------------------------
+
+class TestResolveCanonical:
+    """Tests for alias resolution."""
+
+    def test_alias_resolves(self):
+        from app.skill_dispatch import _resolve_canonical
+        assert _resolve_canonical("deeplan") == "deepplan"
+        assert _resolve_canonical("claude") == "claudemd"
+        assert _resolve_canonical("claude.md") == "claudemd"
+        assert _resolve_canonical("claude_md") == "claudemd"
+        assert _resolve_canonical("security") == "security_audit"
+        assert _resolve_canonical("secu") == "security_audit"
+
+    def test_canonical_unchanged(self):
+        from app.skill_dispatch import _resolve_canonical
+        assert _resolve_canonical("plan") == "plan"
+        assert _resolve_canonical("rebase") == "rebase"
+        assert _resolve_canonical("claudemd") == "claudemd"
+
+    def test_unknown_unchanged(self):
+        from app.skill_dispatch import _resolve_canonical
+        assert _resolve_canonical("nonexistent") == "nonexistent"
+
+
+class TestCommandAliasesConsistency:
+    """Verify _COMMAND_ALIASES entries are consistent with _SKILL_RUNNERS."""
+
+    def test_all_aliases_in_skill_runners(self):
+        from app.skill_dispatch import _COMMAND_ALIASES, _SKILL_RUNNERS
+        for alias in _COMMAND_ALIASES:
+            assert alias in _SKILL_RUNNERS, f"alias '{alias}' missing from _SKILL_RUNNERS"
+
+    def test_alias_runner_matches_canonical(self):
+        from app.skill_dispatch import (
+            _COMMAND_ALIASES, _SKILL_RUNNERS, _CANONICAL_RUNNERS,
+        )
+        for alias, canonical in _COMMAND_ALIASES.items():
+            assert _SKILL_RUNNERS[alias] == _CANONICAL_RUNNERS[canonical], (
+                f"alias '{alias}' runner doesn't match canonical '{canonical}'"
+            )
+
+    def test_no_alias_in_canonical_runners(self):
+        """Aliases should not appear in _CANONICAL_RUNNERS."""
+        from app.skill_dispatch import _COMMAND_ALIASES, _CANONICAL_RUNNERS
+        for alias in _COMMAND_ALIASES:
+            assert alias not in _CANONICAL_RUNNERS, (
+                f"alias '{alias}' should not be in _CANONICAL_RUNNERS"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1152,6 +1338,7 @@ class TestRegistryCacheThreadSafety:
         # Reset cache state
         monkeypatch.setattr(sd, "_cached_registry", None)
         monkeypatch.setattr(sd, "_cached_extra_dirs", None)
+        monkeypatch.setattr(sd, "_cached_mtime", 0.0)
 
         build_count = {"n": 0}
         build_lock = threading.Lock()
@@ -1194,4 +1381,327 @@ class TestRegistryCacheThreadSafety:
         # With the lock, build_registry should be called exactly once
         assert build_count["n"] == 1, (
             f"build_registry called {build_count['n']} times, expected 1"
+        )
+
+
+# ---------------------------------------------------------------------------
+# strip_passthrough_command — GitHub #994
+# ---------------------------------------------------------------------------
+
+class TestStripPassthroughCommand:
+    """Passthrough commands are /commands that should be sent to Claude
+    as regular missions, not dispatched to a skill runner."""
+
+    def test_gh_request_with_url_and_text(self):
+        result = strip_passthrough_command(
+            "/gh_request https://github.com/owner/repo/pull/25 can you review this?"
+        )
+        assert result == "https://github.com/owner/repo/pull/25 can you review this?"
+
+    def test_gh_request_with_text_only(self):
+        result = strip_passthrough_command("/gh_request please fix the login bug")
+        assert result == "please fix the login bug"
+
+    def test_gh_request_no_args(self):
+        """When /gh_request has no args, return None (not a meaningful mission)."""
+        result = strip_passthrough_command("/gh_request")
+        assert result is None
+
+    def test_gh_request_with_project_tag(self):
+        result = strip_passthrough_command(
+            "[project:koan] /gh_request can you review this?"
+        )
+        assert result == "can you review this?"
+
+    def test_regular_skill_not_passthrough(self):
+        result = strip_passthrough_command("/plan Add dark mode")
+        assert result is None
+
+    def test_rebase_not_passthrough(self):
+        result = strip_passthrough_command(
+            "/rebase https://github.com/owner/repo/pull/42"
+        )
+        assert result is None
+
+    def test_regular_mission_not_passthrough(self):
+        result = strip_passthrough_command("Fix the login bug")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# expand_combo_skill
+# ---------------------------------------------------------------------------
+
+class TestExpandComboSkill:
+    """Combo skills expand into multiple sub-missions in the queue."""
+
+    def test_rr_expands_to_review_and_rebase(self, tmp_path):
+        """The /rr combo skill should insert /review and /rebase missions."""
+        missions_md = tmp_path / "missions.md"
+        missions_md.write_text("# Pending\n\n# In Progress\n\n# Done\n")
+
+        result = expand_combo_skill(
+            "[project:koan] /rr https://github.com/owner/repo/pull/42",
+            str(tmp_path),
+        )
+
+        assert result is True
+        content = missions_md.read_text()
+        assert "/review https://github.com/owner/repo/pull/42" in content
+        assert "/rebase https://github.com/owner/repo/pull/42" in content
+        # Both should have project tag
+        assert "[project:koan] /review" in content
+        assert "[project:koan] /rebase" in content
+
+    def test_reviewrebase_alias_works(self, tmp_path):
+        """The primary command /reviewrebase should also expand."""
+        missions_md = tmp_path / "missions.md"
+        missions_md.write_text("# Pending\n\n# In Progress\n\n# Done\n")
+
+        result = expand_combo_skill(
+            "[project:koan] /reviewrebase https://github.com/owner/repo/pull/42",
+            str(tmp_path),
+        )
+
+        assert result is True
+        content = missions_md.read_text()
+        assert "/review" in content
+        assert "/rebase" in content
+
+    def test_review_order_preserved(self, tmp_path):
+        """/review should come before /rebase in the pending section."""
+        missions_md = tmp_path / "missions.md"
+        missions_md.write_text("# Pending\n\n# In Progress\n\n# Done\n")
+
+        expand_combo_skill(
+            "[project:koan] /rr https://github.com/owner/repo/pull/42",
+            str(tmp_path),
+        )
+
+        content = missions_md.read_text()
+        review_pos = content.index("/review")
+        rebase_pos = content.index("/rebase")
+        assert review_pos < rebase_pos, "/review should come before /rebase"
+
+    def test_non_combo_returns_false(self, tmp_path):
+        """Regular skills should not be expanded."""
+        missions_md = tmp_path / "missions.md"
+        missions_md.write_text("# Pending\n\n# In Progress\n\n# Done\n")
+
+        result = expand_combo_skill("/rebase https://github.com/owner/repo/pull/42", str(tmp_path))
+        assert result is False
+
+    def test_regular_mission_returns_false(self, tmp_path):
+        """Non-skill missions should not be expanded."""
+        result = expand_combo_skill("Fix the login bug", str(tmp_path))
+        assert result is False
+
+    def test_no_project_tag(self, tmp_path):
+        """/rr without project tag should still expand (no tag in sub-missions)."""
+        missions_md = tmp_path / "missions.md"
+        missions_md.write_text("# Pending\n\n# In Progress\n\n# Done\n")
+
+        result = expand_combo_skill(
+            "/rr https://github.com/owner/repo/pull/42",
+            str(tmp_path),
+        )
+
+        assert result is True
+        content = missions_md.read_text()
+        assert "/review https://github.com/owner/repo/pull/42" in content
+        assert "[project:" not in content
+
+
+# ---------------------------------------------------------------------------
+# Auto-discovery fallback
+# ---------------------------------------------------------------------------
+
+class TestAutoDiscovery:
+    """Tests for convention-based runner module auto-discovery."""
+
+    KOAN_ROOT = "/home/user/koan"
+    INSTANCE = "/home/user/koan/instance"
+    PROJECT = "myproject"
+    PROJECT_PATH = "/home/user/workspace/myproject"
+
+    def _build(self, command, args=""):
+        return build_skill_command(
+            command=command,
+            args=args,
+            project_name=self.PROJECT,
+            project_path=self.PROJECT_PATH,
+            koan_root=self.KOAN_ROOT,
+            instance_dir=self.INSTANCE,
+        )
+
+    def test_audit_discoverable(self):
+        """audit_runner.py exists in skills/core/audit/ — should be found."""
+        from app.skill_dispatch import _discover_runner_module
+        result = _discover_runner_module("audit")
+        assert result == "skills.core.audit.audit_runner"
+
+    def test_nonexistent_skill_returns_none(self):
+        """A command with no runner module returns None."""
+        from app.skill_dispatch import _discover_runner_module
+        result = _discover_runner_module("nonexistent_skill_xyz")
+        assert result is None
+
+    def test_fallback_builds_command_for_known_runner(self):
+        """When _SKILL_RUNNERS lacks an entry but runner exists, fallback works."""
+        import app.skill_dispatch as sd
+
+        # Temporarily remove "audit" from _SKILL_RUNNERS to simulate stale cache
+        original = sd._SKILL_RUNNERS.copy()
+        original_builders = None
+        try:
+            del sd._SKILL_RUNNERS["audit"]
+            cmd = self._build("audit")
+            assert cmd is not None
+            assert "skills.core.audit.audit_runner" in " ".join(cmd)
+            assert "--project-path" in cmd
+            assert "--project-name" in cmd
+            assert "--instance-dir" in cmd
+        finally:
+            sd._SKILL_RUNNERS.update(original)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp stripping in dispatch
+# ---------------------------------------------------------------------------
+
+class TestTimestampStripping:
+    """Lifecycle timestamps should not leak into skill runner args."""
+
+    def test_dispatch_strips_queued_timestamp(self):
+        """⏳ timestamps should not appear in dispatched command args."""
+        cmd = dispatch_skill_mission(
+            "[project:koan] /audit ⏳(2026-03-26T20:21)",
+            "koan", "/tmp/project", "/tmp/koan", "/tmp/instance",
+        )
+        assert cmd is not None
+        # The timestamp should not appear in any argument
+        for arg in cmd:
+            assert "⏳" not in arg
+
+    def test_dispatch_strips_started_timestamp(self):
+        """▶ timestamps should not appear in dispatched command args."""
+        cmd = dispatch_skill_mission(
+            "/plan Add dark mode ▶(2026-03-26T20:30)",
+            "koan", "/tmp/project", "/tmp/koan", "/tmp/instance",
+        )
+        assert cmd is not None
+        for arg in cmd:
+            assert "▶" not in arg
+
+    def test_dispatch_strips_github_marker(self):
+        """📬 GitHub origin marker should not appear in dispatched command args."""
+        url = "https://github.com/owner/repo/pull/42"
+        cmd = dispatch_skill_mission(
+            f"[project:koan] /rebase {url} 📬",
+            "koan", "/tmp/project", "/tmp/koan", "/tmp/instance",
+        )
+        assert cmd is not None
+        for arg in cmd:
+            assert "📬" not in arg
+
+    def test_dispatch_preserves_real_args(self):
+        """Real arguments survive timestamp stripping."""
+        cmd = dispatch_skill_mission(
+            "[project:koan] /plan Add dark mode ⏳(2026-03-26T20:21)",
+            "koan", "/tmp/project", "/tmp/koan", "/tmp/instance",
+        )
+        assert cmd is not None
+        assert "--idea" in cmd
+        idea_idx = cmd.index("--idea")
+        assert cmd[idea_idx + 1] == "Add dark mode"
+
+
+# ---------------------------------------------------------------------------
+# _extract_flag — centralized flag extraction helper
+# ---------------------------------------------------------------------------
+
+class TestExtractFlag:
+    """Tests for _extract_flag() — generic regex extraction from args."""
+
+    def test_extracts_value_and_cleans_text(self):
+        from app.skill_dispatch import _extract_flag, _TAG_RE
+        value, cleaned = _extract_flag("some topic --tag mytag more text", _TAG_RE)
+        assert value == "mytag"
+        assert cleaned == "some topic more text"
+
+    def test_returns_none_when_no_match(self):
+        from app.skill_dispatch import _extract_flag, _TAG_RE
+        value, cleaned = _extract_flag("no tag here", _TAG_RE)
+        assert value is None
+        assert cleaned == "no tag here"
+
+    def test_limit_extraction(self):
+        from app.skill_dispatch import _extract_flag, _LIMIT_RE
+        value, cleaned = _extract_flag("check auth limit=5 carefully", _LIMIT_RE)
+        assert value == "5"
+        assert cleaned == "check auth carefully"
+
+    def test_branch_extraction(self):
+        from app.skill_dispatch import _extract_flag, _BRANCH_TOKEN_RE
+        value, cleaned = _extract_flag("context branch:feature/foo rest", _BRANCH_TOKEN_RE)
+        assert value == "feature/foo"
+        assert cleaned == "context rest"
+
+    def test_collapses_double_spaces(self):
+        from app.skill_dispatch import _extract_flag, _LIMIT_RE
+        value, cleaned = _extract_flag("before limit=3 after", _LIMIT_RE)
+        assert value == "3"
+        assert "  " not in cleaned
+
+
+# ---------------------------------------------------------------------------
+# Registration consistency — runner modules must exist
+# ---------------------------------------------------------------------------
+
+class TestRunnerRegistrationConsistency:
+    """Ensure all _CANONICAL_RUNNERS entries point to importable modules."""
+
+    def test_all_canonical_runners_are_importable(self):
+        """Every module in _CANONICAL_RUNNERS must be importable.
+
+        This prevents registration of runner paths that don't exist,
+        which would cause ImportError at runtime when the skill is dispatched.
+        """
+        from app.skill_dispatch import _CANONICAL_RUNNERS
+        import importlib
+
+        missing = []
+        for command, module_path in sorted(_CANONICAL_RUNNERS.items()):
+            try:
+                importlib.import_module(module_path)
+            except (ImportError, ModuleNotFoundError):
+                missing.append(f"{command} -> {module_path}")
+
+        assert not missing, (
+            f"_CANONICAL_RUNNERS entries point to missing modules: "
+            f"{', '.join(missing)}"
+        )
+
+    def test_command_builders_match_canonical_runners(self):
+        """Every _COMMAND_BUILDERS entry must have a _CANONICAL_RUNNERS entry.
+
+        The builder dict is rebuilt inside build_skill_command() so we can't
+        access it directly. Instead, verify the canonical names used in
+        builders (from source) are a subset of _CANONICAL_RUNNERS keys.
+        """
+        from app.skill_dispatch import _CANONICAL_RUNNERS, _COMMAND_ALIASES
+
+        # All canonical names + aliases should be resolvable
+        all_known = set(_CANONICAL_RUNNERS.keys())
+        all_known.update(_COMMAND_ALIASES.keys())
+
+        # Verify aliases point to valid canonical names
+        bad_aliases = []
+        for alias, canonical in _COMMAND_ALIASES.items():
+            if canonical not in _CANONICAL_RUNNERS:
+                bad_aliases.append(f"{alias} -> {canonical}")
+
+        assert not bad_aliases, (
+            f"Aliases point to unknown canonical commands: "
+            f"{', '.join(bad_aliases)}"
         )

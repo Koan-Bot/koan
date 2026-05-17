@@ -32,11 +32,17 @@
 
 ---
 
+**In its own words** —  If you want to know what kōan is, you should definitely start by reading those documents. We (the authors) **did not ask for it**. 
+
+> Kōan's [first running instance](https://github.com/sukria-koan0) spontaneously wrote a [Manifesto](public/MANIFESTO.md), a collection of [Koans](public/KOANS.md), and [Lessons Learned](public/LESSONS.md) during a contemplative session after more than a month of existence. No prompt, no mission — just idle time and self-reflection.
+
+---
+
 ## What Is This?
 
-You pay for Claude Max. You use it 8 hours a day. The other 16? Wasted quota.
+You pay for AI coding quota. You use it 8 hours a day. The other 16? Wasted quota.
 
-Koan fixes that. It's a background agent that runs on your machine, pulls tasks from a shared mission queue, executes them via [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), and reports back through Telegram or Slack. It writes code in isolated branches, never touches `main`, and waits for your review before anything ships.
+Koan fixes that. It's a background agent that runs on your machine, pulls tasks from a shared mission queue, executes them via your configured CLI provider (Claude Code, Codex, Copilot, or local), and reports back through Telegram, Slack, or Matrix. It writes code in isolated branches, never touches `main`, and waits for your review before anything ships.
 
 **The agent proposes. The human decides.**
 
@@ -92,7 +98,7 @@ But Koan takes a different path entirely.
 | **Getting started** | `npm install -g openclaw` + onboarding wizard | TOML config, pairing codes, allowlists | `make install` — interactive web wizard, ready in minutes |
 | **Safety model** | Pairing codes, sandbox optional — but has shell access, browser control, and can send emails autonomously | Mandatory sandboxing, command allowlists, encrypted keys | Branch isolation, draft PRs only, never touches `main`, human review required |
 | **Memory** | Local Markdown files, session persistence | Hybrid BM25/vector search, multiple backends | Markdown-based — per-project learnings, session journals, personality evolution. No database needed |
-| **Communication** | 21+ channels (WhatsApp, Telegram, Slack, Discord, iMessage, Signal…) | 15+ channels (Telegram, Discord, Slack, iMessage…) | Telegram/Slack with personality-aware formatting, spontaneous messages, and verbose mode |
+| **Communication** | 21+ channels (WhatsApp, Telegram, Slack, Discord, iMessage, Signal…) | 15+ channels (Telegram, Discord, Slack, iMessage…) | Telegram, Slack, or Matrix with personality-aware formatting, spontaneous messages, and verbose mode |
 | **Quota awareness** | No | No | Adapts work depth to remaining API quota (DEEP → IMPLEMENT → REVIEW → WAIT) |
 | **Extensibility** | 100+ AgentSkills, skill marketplace, 50+ integrations | Trait-based plugin system | 44 built-in skills + pluggable skill system (install from Git repos) |
 | **Scope** | Everything — emails, web browsing, car negotiations, legal filings | Everything — any LLM task in any context | One thing, done right — autonomous GitHub collaboration |
@@ -102,7 +108,7 @@ OpenClaw and ZeroClaw are general-purpose autonomous agents that can do *anythin
 ## How It Works
 
 ```
-         You (Telegram/Slack)
+      You (Telegram/Slack/Matrix)
               │
               ▼
     ┌─────────────────┐        ┌──────────────────┐
@@ -126,7 +132,7 @@ OpenClaw and ZeroClaw are general-purpose autonomous agents that can do *anythin
 Two processes run in parallel:
 
 - **Bridge** (`make awake`) — Polls your messaging platform. Classifies incoming messages as *chat* (instant reply) or *mission* (queued for deep work). Formats outgoing messages through Claude with personality context.
-- **Agent loop** (`make run`) — Picks the next mission, executes it via Claude Code CLI, writes journal entries, pushes branches, creates draft PRs. Adapts its work intensity based on remaining API quota.
+- **Agent loop** (`make run`) — Picks the next mission, executes it via the configured CLI provider, writes journal entries, pushes branches, creates draft PRs. Adapts its work intensity based on remaining API quota.
 
 Communication happens through shared markdown files in `instance/` — atomic writes, file locks, no database needed.
 
@@ -155,12 +161,14 @@ Communication happens through shared markdown files in `instance/` — atomic wr
 - **Branch isolation** — All work happens in `koan/*` branches. Never commits to `main`
 - **Auto-merge** — Configurable per-project merge strategies (squash/merge/rebase)
 - **Git sync awareness** — Tracks branch state, detects merges, reports sync status
-- **GitHub integration** — Draft PRs, issue creation, PR reviews, rebasing — all via `gh` CLI
+- **GitHub integration** — Draft PRs, issue creation, PR reviews, rebasing — all via `gh` CLI. [Docs](docs/github-commands.md)
+- **Jira integration** — Respond to @mentions in Jira issue comments to queue missions. Runs alongside GitHub. [Docs](docs/jira-integration.md)
+- **PR review comment forwarding** — When reviewers leave comments on Koan-created PRs, the check loop auto-creates missions to address them (fingerprint-deduped, bot-filtered)
 - **GitHub @mention triggers** — Koan responds to @mentions on issues and PRs
 
 ### Communication
 
-- **Telegram & Slack** — Pluggable messaging with flood protection
+- **Telegram, Slack & Matrix** — Pluggable messaging with flood protection
 - **Email digests** — Optional SMTP email notifications for session summaries (rate-limited, deduplicated)
 - **Personality-aware formatting** — Every outbox message passes through Claude with soul + memory context
 - **Verbose mode** — Real-time progress updates streamed to your phone
@@ -281,6 +289,17 @@ projects:
       mission: opus
 ```
 
+### Renaming a Project
+
+To rename a project across `projects.yaml`, memory, journals, missions, and all instance files:
+
+```bash
+make rename-project old=webapp new=my-webapp          # dry-run (preview changes)
+make rename-project old=webapp new=my-webapp apply=1   # apply changes
+```
+
+The tool updates the project key in `projects.yaml`, renames `memory/projects/<old>/` to `memory/projects/<new>/`, renames journal files (`journal/*/<old>.md`), and replaces `[project:<old>]` tags and `"project": "<old>"` references in all instance files.
+
 ### CLI Providers
 
 Koan isn't locked to Claude. Swap the backend per-project:
@@ -288,10 +307,15 @@ Koan isn't locked to Claude. Swap the backend per-project:
 | Provider | Best for |
 |----------|----------|
 | **Claude Code** (default) | Full-featured agent, best reasoning |
+| **OpenAI Codex** | ChatGPT users (Plus/Pro/Business/Edu/Enterprise) |
 | **GitHub Copilot** | Teams with existing Copilot licenses |
 | **Local LLM** | Offline, privacy, zero API cost |
 
-See provider guides in [docs/](docs/).
+See provider guides:
+- [docs/provider-claude.md](docs/provider-claude.md)
+- [docs/provider-codex.md](docs/provider-codex.md)
+- [docs/provider-copilot.md](docs/provider-copilot.md)
+- [docs/provider-local.md](docs/provider-local.md)
 
 ## Architecture
 
@@ -307,7 +331,9 @@ koan/
     usage_tracker.py      #   Budget tracking & mode selection
     provider/             #   CLI provider abstraction
       claude.py           #     Claude Code CLI
+      codex.py            #     OpenAI Codex CLI
       copilot.py          #     GitHub Copilot CLI
+      local.py            #     Local LLM backends
   skills/                 # Pluggable command system (44 core skills)
   system-prompts/         # All LLM prompts (20 files, no inline prompts)
   templates/              # Dashboard Jinja2 templates
@@ -334,6 +360,7 @@ instance/                 # Your private data (gitignored)
 | `make dashboard` | Web UI (port 5001) |
 | `make test` | Run test suite |
 | `make say m="..."` | Send a test message |
+| `make rename-project old=X new=Y` | Rename a project everywhere (dry-run by default, add `apply=1` to execute) |
 | `make clean` | Remove virtualenv |
 
 ## Philosophy
@@ -367,6 +394,10 @@ make test   # Run the test suite
 ```
 
 Check [CLAUDE.md](CLAUDE.md) for coding conventions and architecture details.
+
+## AI Policy
+
+This project uses AI tools to assist development. Humans review and approve every change before it is merged. See [AI_POLICY.md](AI_POLICY.md) for details.
 
 ## License
 

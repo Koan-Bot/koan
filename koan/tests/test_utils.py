@@ -254,6 +254,49 @@ class TestInsertPendingMission:
         temp_files = list(tmp_path.glob(".missions-*"))
         assert temp_files == [], f"Temp files left behind after error: {temp_files}"
 
+    def test_returns_true_when_inserted(self, tmp_path):
+        from app.utils import insert_pending_mission
+        missions = tmp_path / "missions.md"
+        missions.write_text("# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n")
+
+        result = insert_pending_mission(
+            missions, "- [project:koan] /rebase https://github.com/o/r/pull/1"
+        )
+        assert result is True
+        assert "/rebase" in missions.read_text()
+
+    def test_returns_false_on_duplicate(self, tmp_path):
+        from app.utils import insert_pending_mission
+        missions = tmp_path / "missions.md"
+        missions.write_text(
+            "# Missions\n\n## Pending\n\n"
+            "- [project:koan] /rebase https://github.com/o/r/pull/1 ⏳(2026-05-16T10:00)\n\n"
+            "## In Progress\n\n## Done\n"
+        )
+
+        result = insert_pending_mission(
+            missions, "- [project:koan] /rebase https://github.com/o/r/pull/1"
+        )
+        assert result is False
+        # File unchanged — no double entry
+        content = missions.read_text()
+        assert content.count("/rebase https://github.com/o/r/pull/1") == 1
+
+    def test_non_github_mission_always_inserted(self, tmp_path):
+        from app.utils import insert_pending_mission
+        missions = tmp_path / "missions.md"
+        missions.write_text(
+            "# Missions\n\n## Pending\n\n"
+            "- [project:koan] Fix the login bug\n\n"
+            "## In Progress\n\n## Done\n"
+        )
+
+        result = insert_pending_mission(
+            missions, "- [project:koan] Fix the login bug"
+        )
+        # Non-GitHub missions are not deduped (no signature)
+        assert result is True
+
     def test_modify_missions_file_returns_new_content(self, tmp_path):
         """modify_missions_file should return the transformed content."""
         from app.utils import modify_missions_file
@@ -795,6 +838,74 @@ class TestTruncateText:
         assert truncate_text("", 100) == ""
 
 
+class TestTruncateDiff:
+    """Tests for truncate_diff() — file-aware diff truncation."""
+
+    def _make_file_block(self, filename, lines=10):
+        """Build a realistic unified diff block for one file."""
+        header = f"diff --git a/{filename} b/{filename}\n"
+        header += f"--- a/{filename}\n+++ b/{filename}\n"
+        header += "@@ -1,5 +1,5 @@\n"
+        body = "".join(f"+line {i}\n" for i in range(lines))
+        return header + body
+
+    def test_small_diff_unchanged(self):
+        from app.utils import truncate_diff
+        diff = self._make_file_block("a.py", lines=3)
+        assert truncate_diff(diff, 10000) == diff
+
+    def test_empty_diff(self):
+        from app.utils import truncate_diff
+        assert truncate_diff("", 100) == ""
+
+    def test_preserves_whole_file_blocks(self):
+        from app.utils import truncate_diff
+        # Use a small first block and a large second block so the budget
+        # comfortably fits block_a + footer but not block_b.
+        block_a = self._make_file_block("a.py", lines=3)
+        block_b = self._make_file_block("b.py", lines=50)
+        diff = block_a + block_b
+        # Budget: block_a (~87) + 120 for footer, well under block_b (~387)
+        budget = len(block_a) + 120
+        assert budget < len(diff), "budget must be less than full diff"
+        result = truncate_diff(diff, budget)
+        assert "a.py" in result
+        assert "b.py" in result  # listed in omitted summary
+        assert "omitted" in result
+        # b.py's diff block must not be in result (only in omitted summary)
+        assert "diff --git a/b.py" not in result
+
+    def test_lists_omitted_files(self):
+        from app.utils import truncate_diff
+        block_a = self._make_file_block("src/a.py", lines=3)
+        block_b = self._make_file_block("src/b.py", lines=50)
+        block_c = self._make_file_block("src/c.py", lines=50)
+        diff = block_a + block_b + block_c
+        # Budget fits first block + footer, but not second/third blocks
+        budget = len(block_a) + 150
+        assert budget < len(block_a) + len(block_b), "budget must exclude block_b"
+        result = truncate_diff(diff, budget)
+        assert "2 file(s) omitted" in result
+        assert "src/b.py" in result
+        assert "src/c.py" in result
+
+    def test_all_files_fit(self):
+        from app.utils import truncate_diff
+        block_a = self._make_file_block("a.py", lines=3)
+        block_b = self._make_file_block("b.py", lines=3)
+        diff = block_a + block_b
+        result = truncate_diff(diff, len(diff) + 100)
+        assert result == diff
+        assert "omitted" not in result
+
+    def test_falls_back_on_unparseable_diff(self):
+        from app.utils import truncate_diff
+        weird = "not a real diff " * 100
+        result = truncate_diff(weird, 50)
+        assert len(result) < 100
+        assert "truncated" in result
+
+
 class TestIsKnownProject:
     """Tests for is_known_project() shared utility."""
 
@@ -900,3 +1011,127 @@ class TestGetContemplativeChance:
         (config_dir / "config.yaml").write_text("contemplative_chance: 0\n")
         from app.utils import get_contemplative_chance
         assert get_contemplative_chance() == 0
+
+
+# ---------------------------------------------------------------------------
+# filter_diff_by_ignore
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIFF = """\
+diff --git a/src/main.py b/src/main.py
+index abc..def 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -1,3 +1,4 @@
+ import os
++import sys
+ def main():
+     pass
+diff --git a/vendor/lib.js b/vendor/lib.js
+index 111..222 100644
+--- a/vendor/lib.js
++++ b/vendor/lib.js
+@@ -1,2 +1,3 @@
+ // vendored
++// updated
+diff --git a/package-lock.json b/package-lock.json
+index 333..444 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1 +1,2 @@
+ {}
++{"lock": true}
+"""
+
+
+class TestFilterDiffByIgnore:
+    """Tests for filter_diff_by_ignore()."""
+
+    def _import(self):
+        from app.utils import filter_diff_by_ignore
+        return filter_diff_by_ignore
+
+    def test_no_patterns_returns_original(self):
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, [], [])
+        assert result == _FIXTURE_DIFF
+        assert skipped == []
+
+    def test_empty_diff_returns_empty(self):
+        fn = self._import()
+        result, skipped = fn("", ["*.lock"], [])
+        assert result == ""
+        assert skipped == []
+
+    def test_glob_pattern_without_slash_matches_basename(self):
+        """*.lock matches package-lock.json at any depth."""
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, ["*.json"], [])
+        assert "package-lock.json" not in result
+        assert "package-lock.json" in skipped
+
+    def test_glob_pattern_with_slash_matches_full_path(self):
+        """vendor/** matches vendor/lib.js."""
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, ["vendor/**"], [])
+        assert "vendor/lib.js" not in result
+        assert "vendor/lib.js" in skipped
+        assert "src/main.py" in result
+
+    def test_regex_pattern_matches_full_path(self):
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, [], [r"^vendor/"])
+        assert "vendor/lib.js" not in result
+        assert "vendor/lib.js" in skipped
+
+    def test_multiple_patterns_remove_multiple_files(self):
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, ["vendor/**", "*.json"], [])
+        assert "vendor/lib.js" in skipped
+        assert "package-lock.json" in skipped
+        assert "src/main.py" in result
+
+    def test_all_files_ignored_returns_empty_diff(self):
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, ["**"], [])
+        # All 3 files should be removed
+        assert len(skipped) == 3
+        assert result.strip() == ""
+
+    def test_no_matching_patterns_preserves_all(self):
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, ["*.rb"], [r"^nonexistent/"])
+        assert result == _FIXTURE_DIFF
+        assert skipped == []
+
+    def test_malformed_regex_is_skipped_without_exception(self):
+        fn = self._import()
+        # Should not raise — bad pattern is logged and skipped
+        result, skipped = fn(_FIXTURE_DIFF, [], [r"[invalid(regex"])
+        # No crash; all files preserved
+        assert "src/main.py" in result
+        assert skipped == []
+
+    def test_non_matching_regex_preserves_all(self):
+        fn = self._import()
+        result, skipped = fn(_FIXTURE_DIFF, [], [r"^generated/"])
+        assert result == _FIXTURE_DIFF
+        assert skipped == []
+
+    def test_binary_file_hunk_handled_correctly(self):
+        """Binary file entries still start with diff --git, must be handled."""
+        binary_diff = (
+            "diff --git a/src/main.py b/src/main.py\n"
+            "index abc..def 100644\n"
+            "--- a/src/main.py\n"
+            "+++ b/src/main.py\n"
+            "@@ -1 +1 @@\n"
+            " x\n"
+            "diff --git a/image.png b/image.png\n"
+            "index 000..111 100644\n"
+            "Binary files a/image.png and b/image.png differ\n"
+        )
+        fn = self._import()
+        result, skipped = fn(binary_diff, ["*.png"], [])
+        assert "image.png" in skipped
+        assert "src/main.py" in result

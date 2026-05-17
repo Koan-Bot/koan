@@ -478,15 +478,16 @@ class TestGenerateIterationPlan:
 # ---------------------------------------------------------------------------
 
 class TestRunClaudePlan:
+    @patch("app.config.get_skill_max_turns", return_value=50)
     @patch("app.config.get_skill_timeout", return_value=3600)
     @patch("app.cli_provider.run_command_streaming", return_value="result with spaces")
-    def test_returns_stripped_output(self, mock_cmd, mock_timeout):
+    def test_returns_stripped_output(self, mock_cmd, mock_timeout, mock_turns):
         result = _run_claude_plan("test prompt", "/project")
         assert result == "result with spaces"
         mock_cmd.assert_called_once_with(
             "test prompt", "/project",
             allowed_tools=["Read", "Glob", "Grep", "WebFetch"],
-            max_turns=25, timeout=3600,
+            max_turns=50, timeout=3600,
         )
 
     @patch("app.cli_provider.run_command_streaming",
@@ -703,7 +704,7 @@ class TestSearchExistingIssue:
             assert result is None
 
     def test_timeout_returns_none(self):
-        with patch("app.github.subprocess.run",
+        with patch("app.plan_runner.api",
                     side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30)):
             result = _search_existing_issue("o", "r", "idea")
             assert result is None
@@ -783,7 +784,8 @@ class TestGetRepoInfo:
             assert repo is None
 
     def test_timeout_returns_none(self):
-        with patch("app.github.subprocess.run",
+        with patch("app.plan_runner.resolve_target_repo", return_value=None), \
+             patch("app.plan_runner.run_gh",
                     side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=15)):
             owner, repo = _get_repo_info("/path")
             assert owner is None

@@ -17,6 +17,7 @@ extracted to dedicated modules (config.py, journal.py, conversation_history.py).
 Backward-compatible re-exports are provided below.
 """
 
+import contextlib
 import fcntl
 import os
 import re
@@ -33,9 +34,23 @@ if "KOAN_ROOT" not in os.environ:
     raise SystemExit("KOAN_ROOT environment variable is not set. Run via 'make run' or 'make awake'.")
 KOAN_ROOT = Path(os.environ["KOAN_ROOT"])
 
-# Pre-compiled regex for project tag extraction (accepts both [project:X] and [projet:X])
-_PROJECT_TAG_RE = re.compile(r'\[projec?t:([a-zA-Z0-9_-]+)\]')
-_PROJECT_TAG_STRIP_RE = re.compile(r'\[projec?t:[a-zA-Z0-9_-]+\]\s*')
+# Single source of truth for the project-name character class.
+# Dots are allowed because project names may be domain-like, e.g. developers.esphome.io.
+# Extend here (not in scattered call sites) when the allowed character set changes.
+PROJECT_NAME_CHARS = r"a-zA-Z0-9_.-"
+
+# Bracketed inline tag, capturing form: [project:X] / [projet:X]
+PROJECT_TAG_RE = re.compile(rf'\[projec?t:([{PROJECT_NAME_CHARS}]+)\]')
+# Bracketed inline tag, strip form (with trailing whitespace consumed).
+PROJECT_TAG_STRIP_RE = re.compile(rf'\[projec?t:[{PROJECT_NAME_CHARS}]+\]\s*')
+# Anchored prefix form (used to peel a leading tag off a mission line).
+PROJECT_TAG_PREFIX_RE = re.compile(rf'^\[projec?t:([{PROJECT_NAME_CHARS}]+)\]\s*')
+# Full alternation form with surrounding whitespace (dashboard / template-side parity).
+PROJECT_TAG_FULL_RE = re.compile(rf'\s*\[(?:project|projet):([{PROJECT_NAME_CHARS}]+)\]\s*')
+# Markdown sub-header form: "### project:name" / "### projet:name"
+PROJECT_SUBHEADER_RE = re.compile(rf'###\s+projec?t\s*:\s*([{PROJECT_NAME_CHARS}]+)', re.IGNORECASE)
+# Natural-text hint form: "(projet: name)" / "projet:name" (no brackets)
+PROJECT_HINT_RE = re.compile(rf'\(?\s*projec?t\s*:\s*([{PROJECT_NAME_CHARS}]+)\s*\)?', re.IGNORECASE)
 
 _MISSIONS_DEFAULT = "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n"
 _MISSIONS_LOCK = threading.Lock()
@@ -114,10 +129,10 @@ def parse_project(text: str) -> Tuple[Optional[str], str]:
     Returns (project_name, cleaned_text) where cleaned_text has the tag removed.
     Returns (None, text) if no tag found.
     """
-    match = _PROJECT_TAG_RE.search(text)
+    match = PROJECT_TAG_RE.search(text)
     if match:
         project = match.group(1)
-        cleaned = _PROJECT_TAG_STRIP_RE.sub('', text).strip()
+        cleaned = PROJECT_TAG_STRIP_RE.sub('', text).strip()
         return project, cleaned
     return None, text
 
@@ -234,11 +249,18 @@ def atomic_write(path: Path, content: str):
             os.fsync(f.fileno())
         os.replace(tmp, str(path))
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
+
+
+def atomic_write_json(path: Path, data, indent=None):
+    """Serialize ``data`` to JSON and write atomically via :func:`atomic_write`.
+
+    Convenience wrapper used by modules that persist dicts/lists as JSON.
+    """
+    import json
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=indent))
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -246,6 +268,73 @@ def truncate_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n...(truncated)"
+
+
+def truncate_diff(diff: str, max_chars: int) -> str:
+    """Truncate a unified diff intelligently, preserving whole file blocks.
+
+    Instead of cutting at an arbitrary character offset (which leaves the
+    reviewer guessing what was cut), this splits the diff into per-file
+    blocks and keeps as many complete blocks as fit within *max_chars*.
+    Files that don't fit are listed as a summary at the end so the
+    reviewer knows they exist.
+    """
+    if not diff or len(diff) <= max_chars:
+        return diff
+
+    # Split into per-file blocks at 'diff --git' boundaries.
+    raw_blocks = re.split(r'(?=^diff --git )', diff, flags=re.MULTILINE)
+    blocks = [b for b in raw_blocks if b.strip()]
+
+    if not blocks:
+        # Can't parse structure — fall back to character truncation.
+        return truncate_text(diff, max_chars)
+
+    # Pre-scan filenames so we can estimate the worst-case footer size
+    # and reserve budget for it, ensuring output stays within max_chars.
+    filenames: list[str] = []
+    for block in blocks:
+        m = re.match(r'diff --git a/\S+ b/(\S+)', block)
+        filenames.append(m.group(1) if m else "(unknown file)")
+
+    # Greedy first pass: keep blocks that fit without any footer.
+    kept: list[str] = []
+    skipped: list[str] = []
+    used = 0
+
+    for block, name in zip(blocks, filenames):
+        if used + len(block) <= max_chars:
+            kept.append((block, name))
+            used += len(block)
+        else:
+            skipped.append(name)
+
+    # If we skipped files, we need a footer — trim kept blocks until
+    # the footer fits too.
+    while skipped and kept:
+        footer = _build_footer(skipped, len(kept))
+        if used + len(footer) <= max_chars:
+            break
+        # Drop the last kept block to make room for the footer.
+        dropped_block, dropped_name = kept.pop()
+        used -= len(dropped_block)
+        skipped.insert(0, dropped_name)
+
+    result = "".join(b for b, _ in kept)
+    if skipped:
+        result += _build_footer(skipped, len(kept))
+    return result
+
+
+def _build_footer(skipped: list[str], kept_count: int) -> str:
+    """Build the omitted-files footer string."""
+    listing = "\n".join(f"  - {f}" for f in skipped)
+    return (
+        f"\n\n...(diff truncated — {len(skipped)} file(s) omitted, "
+        f"{kept_count} file(s) shown)\n"
+        f"Omitted files:\n{listing}\n"
+    )
+
 
 
 def _locked_missions_rw(missions_path: Path, transform):
@@ -293,10 +382,8 @@ def _locked_missions_rw(missions_path: Path, transform):
                         os.fsync(f.fileno())
                     os.replace(tmp, str(missions_path))
                 except BaseException:
-                    try:
+                    with contextlib.suppress(OSError):
                         os.unlink(tmp)
-                    except OSError:
-                        pass
                     raise
             finally:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
@@ -304,7 +391,9 @@ def _locked_missions_rw(missions_path: Path, transform):
     return new_content
 
 
-def insert_pending_mission(missions_path: Path, entry: str, *, urgent: bool = False):
+def insert_pending_mission(
+    missions_path: Path, entry: str, *, urgent: bool = False,
+) -> bool:
     """Insert a mission entry into the pending section of missions.md.
 
     By default, inserts at the bottom of the pending section (FIFO queue).
@@ -313,13 +402,24 @@ def insert_pending_mission(missions_path: Path, entry: str, *, urgent: bool = Fa
     Uses file locking for the entire read-modify-write cycle to prevent
     TOCTOU race conditions between awake.py and dashboard.py.
     Creates the file with default structure if it doesn't exist.
-    """
-    from app.missions import insert_mission
 
-    _locked_missions_rw(
-        missions_path,
-        lambda content: insert_mission(content, entry, urgent=urgent),
-    )
+    Returns:
+        True if the mission was inserted, False if it was a duplicate
+        (same command + URL already pending or in progress).
+    """
+    from app.missions import insert_mission, is_duplicate_mission
+
+    inserted = True
+
+    def _transform(content: str) -> str:
+        nonlocal inserted
+        if is_duplicate_mission(content, entry):
+            inserted = False
+            return content
+        return insert_mission(content, entry, urgent=urgent)
+
+    _locked_missions_rw(missions_path, _transform)
+    return inserted
 
 
 def modify_missions_file(missions_path: Path, transform):
@@ -395,6 +495,60 @@ def project_name_for_path(project_path: str) -> str:
     return Path(project_path).name
 
 
+def _find_partial_name_candidates(
+    repo_lower: str, projects: list
+) -> list:
+    """Find projects whose name/basename partially matches the repo name.
+
+    Catches aliased clones: e.g. repo "perl-convert-asn1" with local dir
+    "convert-asn1".  Matches when one name is a dash-separated suffix of
+    the other.
+
+    Returns a list of (name, path) tuples — candidates to validate via remote.
+    """
+    candidates = []
+    for name, path in projects:
+        name_lower = name.lower()
+        basename_lower = Path(path).name.lower()
+        for local in (name_lower, basename_lower):
+            if local == repo_lower:
+                continue  # Already handled by exact-match steps
+            # repo name ends with -<local> (e.g., "perl-convert-asn1" ends with "-convert-asn1")
+            if repo_lower.endswith(f"-{local}") or repo_lower.endswith(f"_{local}"):
+                candidates.append((name, path))
+                break
+            # local name ends with -<repo> (e.g., local "perl-convert-asn1" for repo "convert-asn1")
+            if local.endswith(f"-{repo_lower}") or local.endswith(f"_{repo_lower}"):
+                candidates.append((name, path))
+                break
+    return candidates
+
+
+def _persist_and_cache_remotes(
+    name: str, path: str, all_remotes: list, projects: list
+) -> None:
+    """Persist discovered github remotes to yaml and in-memory cache."""
+    primary = get_github_remote(path)
+    try:
+        from app.projects_config import load_projects_config, save_projects_config
+        config = load_projects_config(str(KOAN_ROOT))
+        if config and name in config.get("projects", {}):
+            proj = config["projects"][name]
+            if isinstance(proj, dict) and proj.get("path"):
+                if primary and not proj.get("github_url"):
+                    proj["github_url"] = primary
+                proj["github_urls"] = all_remotes
+                save_projects_config(str(KOAN_ROOT), config)
+    except Exception as e:
+        print(f"[utils] Failed to persist github_urls for {name}: {e}", file=sys.stderr)
+    if primary:
+        try:
+            from app.projects_merged import set_github_url
+            set_github_url(name, primary)
+        except Exception as e:
+            print(f"[utils] Failed to cache github_url for {name}: {e}", file=sys.stderr)
+
+
 def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optional[str]:
     """Find local project path matching a repository name.
 
@@ -404,6 +558,10 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
        so cross-owner matches work on the fast path
     2. Exact match on project name (case-insensitive)
     3. Match on directory basename (case-insensitive)
+    3b. Partial name match + remote validation: when the repo was cloned with
+        a different local name (e.g., perl-Convert-ASN1 → Convert-ASN1), check
+        if a project name/basename is a suffix of the repo name (or vice versa)
+        and validate via git remotes.
     4. Auto-discover from ALL git remotes (if owner provided): subprocess
        fallback for projects not yet populated by ensure_github_urls()
     5. Fallback to single project if only one configured
@@ -437,11 +595,18 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
                                 return path
         except Exception as e:
             print(f"[utils] GitHub URL match via projects.yaml failed: {e}", file=sys.stderr)
-        # Also check in-memory github_url cache (workspace projects)
+        # Also check in-memory github_url caches (workspace projects)
         try:
-            from app.projects_merged import get_github_url_cache
+            from app.projects_merged import get_all_github_urls_cache, get_github_url_cache
+            # Check primary URL cache
             for proj_name, gh_url in get_github_url_cache().items():
                 if gh_url.lower() == target:
+                    for name, path in projects:
+                        if name == proj_name:
+                            return path
+            # Check all-URLs cache (covers forks with upstream remotes)
+            for proj_name, urls in get_all_github_urls_cache().items():
+                if target in (u.lower() for u in urls):
                     for name, path in projects:
                         if name == proj_name:
                             return path
@@ -458,6 +623,19 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
         if Path(path).name.lower() == repo_name.lower():
             return path
 
+    # 3b. Partial name match + remote validation
+    #     Handles aliased clones: repo "perl-Convert-ASN1" cloned as "Convert-ASN1".
+    #     Checks if a project name/basename is a suffix of the repo name (or vice
+    #     versa) separated by a dash, then validates via git remote.
+    if target:
+        repo_lower = repo_name.lower()
+        candidates = _find_partial_name_candidates(repo_lower, projects)
+        for _cname, cpath in candidates:
+            all_remotes = get_all_github_remotes(cpath)
+            if target in all_remotes:
+                _persist_and_cache_remotes(_cname, cpath, all_remotes, projects)
+                return cpath
+
     # 4. Auto-discover from ALL git remotes (origin, upstream, etc.)
     #    This catches cross-owner matches: e.g. local origin is atoomic/koan
     #    but the PR URL points to sukria/koan (the upstream remote).
@@ -465,27 +643,7 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
         for name, path in projects:
             all_remotes = get_all_github_remotes(path)
             if target in all_remotes:
-                # Persist discovery to projects.yaml for yaml projects
-                primary = get_github_remote(path)
-                try:
-                    from app.projects_config import load_projects_config, save_projects_config
-                    config = load_projects_config(str(KOAN_ROOT))
-                    if config and name in config.get("projects", {}):
-                        proj = config["projects"][name]
-                        if isinstance(proj, dict) and proj.get("path"):
-                            if primary and not proj.get("github_url"):
-                                proj["github_url"] = primary
-                            proj["github_urls"] = all_remotes
-                            save_projects_config(str(KOAN_ROOT), config)
-                except Exception as e:
-                    print(f"[utils] Failed to persist github_urls for {name}: {e}", file=sys.stderr)
-                if primary:
-                    # Also cache in memory (works for workspace projects)
-                    try:
-                        from app.projects_merged import set_github_url
-                        set_github_url(name, primary)
-                    except Exception as e:
-                        print(f"[utils] Failed to cache github_url for {name}: {e}", file=sys.stderr)
+                _persist_and_cache_remotes(name, path, all_remotes, projects)
                 return path
 
     # 5. Fallback to single project (skip when owner-specific lookup found nothing)
@@ -502,7 +660,7 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
             config = load_projects_config(str(KOAN_ROOT))
             if config:
                 candidates = []
-                for pname, project in config.get("projects", {}).items():
+                for project in config.get("projects", {}).values():
                     if not isinstance(project, dict):
                         continue
                     all_urls = []
@@ -524,12 +682,30 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
     return None
 
 
-def append_to_outbox(outbox_path: Path, content: str):
+def append_to_outbox(outbox_path: Path, content: str, priority=None):
     """Append content to outbox.md with file locking.
 
     Safe to call from run.py via: python3 -c "from app.utils import append_to_outbox; ..."
     or from Python directly.
+
+    Args:
+        outbox_path: Path to outbox.md
+        content: Message content to append
+        priority: Optional NotificationPriority — when provided, prepends a
+                  [priority:name] header so flush_outbox() can parse and apply
+                  priority-based filtering. Legacy callers omitting priority
+                  default to ACTION in flush_outbox().
     """
+    if priority is not None:
+        # Import here to avoid circular imports (utils is imported at module level
+        # by many modules including notify.py which defines NotificationPriority)
+        try:
+            from app.notify import NotificationPriority
+            if isinstance(priority, NotificationPriority):
+                content = f"[priority:{priority.name.lower()}]\n{content}"
+        except ImportError:
+            pass  # If import fails, write without header (treated as action)
+
     with open(outbox_path, "a", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -537,6 +713,108 @@ def append_to_outbox(outbox_path: Path, content: str):
             f.flush()
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# Diff filtering utilities
+# ---------------------------------------------------------------------------
+
+
+def filter_diff_by_ignore(
+    diff: str,
+    glob_patterns: list,
+    regex_patterns: list,
+) -> "tuple[str, list[str]]":
+    """Remove file hunks from a unified diff based on ignore patterns.
+
+    Splits the unified diff at 'diff --git' boundaries and removes any
+    file block whose path matches a glob or regex pattern.
+
+    Args:
+        diff: Unified diff string (as returned by GitHub).
+        glob_patterns: List of glob patterns. Patterns without '/' are matched
+            against the basename only (so '*.lock' matches at any depth).
+            Patterns with '/' are matched against the full path.
+        regex_patterns: List of regex patterns matched against the full path.
+            Malformed patterns are skipped with a warning.
+
+    Returns:
+        (filtered_diff, skipped_files) tuple. filtered_diff is the diff with
+        ignored file blocks removed. skipped_files is the list of file paths
+        that were removed (for logging). Returns original diff unchanged if
+        the diff cannot be split into file blocks (safety net).
+    """
+    import fnmatch
+    import os
+    import re as _re
+
+    if not diff:
+        return diff, []
+
+    if not glob_patterns and not regex_patterns:
+        return diff, []
+
+    # Compile regex patterns once; log and skip malformed ones
+    compiled_regexes = []
+    for pat in regex_patterns:
+        try:
+            compiled_regexes.append(_re.compile(pat))
+        except _re.error as e:
+            print(
+                f"[utils] filter_diff_by_ignore: skipping malformed regex {pat!r}: {e}",
+                file=sys.stderr,
+            )
+
+    # Split diff into file blocks. Each block starts with 'diff --git'.
+    # Re-join the delimiter with the block that follows it.
+    raw_blocks = _re.split(r'(?=^diff --git )', diff, flags=_re.MULTILINE)
+
+    # If splitting yields <=1 block, the format is unexpected — return unchanged
+    if len(raw_blocks) <= 1:
+        return diff, []
+
+    def _should_ignore(path: str) -> bool:
+        # Glob matching
+        for pat in glob_patterns:
+            if "/" in pat:
+                if fnmatch.fnmatch(path, pat):
+                    return True
+            else:
+                # Match against basename for patterns without slash
+                if fnmatch.fnmatch(os.path.basename(path), pat):
+                    return True
+                # Also try full path for patterns like '*.generated'
+                if fnmatch.fnmatch(path, pat):
+                    return True
+        # Regex matching against full path
+        for rx in compiled_regexes:
+            if rx.search(path):
+                return True
+        return False
+
+    kept_blocks = []
+    skipped_files = []
+    _diff_git_re = _re.compile(r'^diff --git a/(.+) b/(.+)$', _re.MULTILINE)
+
+    for block in raw_blocks:
+        if not block.strip():
+            # Preserve any leading whitespace/preamble before the first block
+            kept_blocks.append(block)
+            continue
+
+        match = _diff_git_re.search(block)
+        if not match:
+            kept_blocks.append(block)
+            continue
+
+        # Use the b/ path as canonical (post-rename / current name)
+        file_path = match.group(2)
+        if _should_ignore(file_path):
+            skipped_files.append(file_path)
+        else:
+            kept_blocks.append(block)
+
+    return "".join(kept_blocks), skipped_files
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +830,7 @@ from app.config import (  # noqa: E402, F401
     get_tools_description,
     get_model_config,
     get_start_on_pause,
+    get_start_passive,
     get_max_runs,
     get_interval_seconds,
     get_fast_reply_model,
@@ -561,8 +840,6 @@ from app.config import (  # noqa: E402, F401
     get_claude_flags_for_role,
     get_cli_binary_for_shell,
     get_cli_provider_name,
-    get_tool_flags_for_shell,
-    get_output_flags_for_shell,
     get_auto_merge_config,
 )
 

@@ -33,10 +33,24 @@ from typing import List, Optional, Tuple
 from app.loop_manager import resolve_focus_area
 
 
+# Set to True when running as CLI subprocess (stdout carries JSON).
+_cli_mode = False
+
+
 def _log_iteration(category: str, message: str):
-    """Log iteration events to stderr. Uses stderr to avoid polluting
-    stdout when iteration_manager runs as a subprocess (CLI mode outputs JSON)."""
-    print(f"[{category}] {message}", file=sys.stderr)
+    """Log iteration events via run_log.log() for timestamp+color support.
+
+    Falls back to stderr when in CLI subprocess mode (stdout carries JSON)
+    or when run_log is not available.
+    """
+    if _cli_mode:
+        print(f"[{category}] {message}", file=sys.stderr)
+        return
+    try:
+        from app.run_log import log as _run_log
+        _run_log(category, message)
+    except ImportError:
+        print(f"[{category}] {message}", file=sys.stderr)
 
 
 def _refresh_usage(usage_state: Path, usage_md: Path, count: int):
@@ -58,6 +72,10 @@ _MODE_DOWNGRADE = {
     "review": "wait",
 }
 
+# When the rolling burn-rate estimate predicts the session will be exhausted
+# in less than this many minutes, drop the chosen mode one tier.
+BURN_RATE_DOWNGRADE_THRESHOLD_MIN = 30.0
+
 
 def _downgrade_if_unaffordable(tracker, mode: str) -> str:
     """Downgrade mode until can_afford_run() passes or we hit wait.
@@ -76,6 +94,31 @@ def _downgrade_if_unaffordable(tracker, mode: str) -> str:
     return mode
 
 
+def _downgrade_if_burning_fast(instance_dir: Path, session_pct: float,
+                               mode: str):
+    """Drop one tier when projected exhaustion is imminent.
+
+    Returns (mode, downgraded_from) where downgraded_from is the previous
+    mode if a downgrade fired, else None.
+    """
+    if mode == "wait" or mode not in _MODE_DOWNGRADE:
+        return mode, None
+    try:
+        from app.burn_rate import time_to_exhaustion
+        tte = time_to_exhaustion(instance_dir, session_pct, mode=mode)
+    except (ImportError, OSError, ValueError):
+        return mode, None
+    if tte is None or tte >= BURN_RATE_DOWNGRADE_THRESHOLD_MIN:
+        return mode, None
+    downgraded = _MODE_DOWNGRADE.get(mode, mode)
+    if downgraded == mode:
+        return mode, None
+    _log_iteration("koan",
+        f"Burn-rate downgrade: {mode} → {downgraded} "
+        f"(est. {tte:.0f} min to exhaustion)")
+    return downgraded, mode
+
+
 def _get_usage_decision(usage_md: Path, count: int, projects_str: str):
     """Parse usage.md and decide autonomous mode.
 
@@ -90,12 +133,20 @@ def _get_usage_decision(usage_md: Path, count: int, projects_str: str):
                                warn_pct=warn_pct, stop_pct=stop_pct)
         mode = tracker.decide_mode()
 
+        # Burn-rate downgrade: applied here (not inside UsageTracker) so the
+        # tracker stays a pure parser+threshold class with no I/O coupling.
+        mode, burn_downgrade_from = _downgrade_if_burning_fast(
+            usage_md.parent, tracker.session_pct, mode,
+        )
+
         # Verify the chosen mode is affordable; downgrade if not
         mode = _downgrade_if_unaffordable(tracker, mode)
 
         session_rem, weekly_rem = tracker.remaining_budget()
         available_pct = int(min(session_rem, weekly_rem))
         reason = tracker.get_decision_reason(mode)
+        if burn_downgrade_from:
+            reason += f" (burn-rate downgrade from {burn_downgrade_from})"
 
         # Get display lines for console output
         display_lines = []
@@ -108,11 +159,15 @@ def _get_usage_decision(usage_md: Path, count: int, projects_str: str):
             if weekly_match:
                 display_lines.append(weekly_match.group(0).strip())
 
+        # Get today's actual cost from cost tracker (accurate, not estimated)
+        cost_today = _get_cost_today(usage_md.parent)
+
         return {
             "mode": mode,
             "available_pct": available_pct,
             "reason": reason,
             "display_lines": display_lines,
+            "cost_today": cost_today,
         }
     except (ImportError, OSError, ValueError) as e:
         _log_iteration("error", f"Usage tracker error: {e}")
@@ -123,6 +178,141 @@ def _get_usage_decision(usage_md: Path, count: int, projects_str: str):
             "display_lines": [],
             "tracker_error": str(e),
         }
+
+
+BURN_RATE_WARNING_THRESHOLD_MIN = 60.0
+BURN_RATE_WARNING_MIN_RESET_GAP_MIN = 120.0
+
+
+def _read_session_pct_and_reset(usage_state_path: Path):
+    """Return (session_pct, minutes_until_session_reset) or (None, None).
+
+    Reads usage_state.json directly so the warning logic does not depend on
+    the freshness of usage.md.
+    """
+    try:
+        import json
+        from datetime import datetime
+        from app.usage_estimator import (
+            SESSION_DURATION_HOURS,
+            _get_limits,
+        )
+        from app.utils import load_config
+    except (ImportError, OSError, ValueError):
+        return None, None
+
+    if not usage_state_path.exists():
+        return None, None
+
+    try:
+        state = json.loads(usage_state_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None, None
+
+    try:
+        session_limit, _ = _get_limits(load_config())
+    except (OSError, ValueError, TypeError):
+        return None, None
+    if session_limit <= 0:
+        return None, None
+
+    tokens = state.get("session_tokens", 0) or 0
+    session_pct = min(100.0, tokens / session_limit * 100.0)
+
+    try:
+        session_start = datetime.fromisoformat(state["session_start"])
+    except (KeyError, ValueError, TypeError):
+        return session_pct, None
+
+    elapsed = (datetime.now() - session_start).total_seconds() / 60.0
+    minutes_remaining = max(0.0, SESSION_DURATION_HOURS * 60.0 - elapsed)
+    return session_pct, minutes_remaining
+
+
+def _maybe_warn_burn_rate(instance_dir: Path, usage_state_path: Path) -> None:
+    """Fire a Telegram warning when projected exhaustion is imminent.
+
+    Conditions (all must hold):
+      - rolling burn rate has enough history to estimate
+      - time-to-exhaustion < 60 minutes
+      - session reset is still > 2 hours away (otherwise quota will reset
+        before the user could meaningfully react)
+      - no warning has been fired since the start of the current session
+    """
+    try:
+        from app.burn_rate import (
+            time_to_exhaustion,
+            burn_rate_pct_per_minute,
+            get_last_warned_at,
+            mark_warned,
+            clear_warning,
+        )
+    except ImportError:
+        return
+
+    session_pct, minutes_until_reset = _read_session_pct_and_reset(
+        usage_state_path
+    )
+    if session_pct is None or minutes_until_reset is None:
+        return
+
+    last_warned = get_last_warned_at(instance_dir)
+    if last_warned is not None:
+        try:
+            import json
+            from datetime import datetime, timezone
+            state = json.loads(usage_state_path.read_text())
+            session_start = datetime.fromisoformat(state["session_start"])
+            if session_start.tzinfo is None:
+                session_start = session_start.replace(tzinfo=timezone.utc)
+            if last_warned < session_start:
+                clear_warning(instance_dir)
+                last_warned = None
+        except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
+            pass
+
+    if last_warned is not None:
+        return  # Already warned for this session cycle
+
+    if minutes_until_reset <= BURN_RATE_WARNING_MIN_RESET_GAP_MIN:
+        return  # Quota will reset soon anyway — no point alerting
+
+    tte = time_to_exhaustion(instance_dir, session_pct)
+    if tte is None or tte >= BURN_RATE_WARNING_THRESHOLD_MIN:
+        return
+
+    rate = burn_rate_pct_per_minute(instance_dir) or 0.0
+    msg = (
+        "⚠️ Burn-rate alert: at "
+        f"{rate * 60:.1f}%/h the session quota will be exhausted in "
+        f"~{tte:.0f} min, but resets in "
+        f"~{minutes_until_reset / 60:.1f}h. Consider pausing or switching to "
+        "lighter missions."
+    )
+
+    try:
+        from app.utils import append_to_outbox
+        outbox = Path(instance_dir) / "outbox.md"
+        append_to_outbox(outbox, msg)
+    except (ImportError, OSError) as exc:
+        _log_iteration("error", f"Burn-rate warning send failed: {exc}")
+        return
+
+    mark_warned(instance_dir)
+
+
+def _get_cost_today(instance_dir: Path) -> float:
+    """Get today's actual API cost from cost tracker JSONL data.
+
+    Returns 0.0 if cost tracking is unavailable.
+    """
+    try:
+        from app.cost_tracker import summarize_day
+        summary = summarize_day(instance_dir)
+        return summary.get("total_cost_usd", 0.0)
+    except (ImportError, OSError, ValueError, KeyError) as e:
+        _log_iteration("error", f"Cost tracker read failed: {e}")
+        return 0.0
 
 
 def _inject_recurring(instance_dir: Path):
@@ -144,6 +334,20 @@ def _inject_recurring(instance_dir: Path):
         return []
 
 
+def _drain_ci_queue(instance_dir: Path):
+    """Drain one CI queue entry (non-blocking).
+
+    Returns:
+        status message string, or None if queue is empty / still pending.
+    """
+    try:
+        from app.ci_queue_runner import drain_one
+        return drain_one(str(instance_dir))
+    except (ImportError, OSError, ValueError) as e:
+        _log_iteration("error", f"CI queue drain error: {e}")
+        return None
+
+
 def _fallback_mission_extract(instance_dir: Path, projects_str: str,
                               context_msg: str):
     """Attempt direct mission extraction when the picker fails or returns empty.
@@ -160,17 +364,19 @@ def _fallback_mission_extract(instance_dir: Path, projects_str: str,
         from app.pick_mission import fallback_extract
 
         missions_path = instance_dir / "missions.md"
-        if not missions_path.exists():
+        try:
+            content = missions_path.read_text()
+        except FileNotFoundError:
             return None, None
 
-        pending_count = count_pending(missions_path.read_text())
+        pending_count = count_pending(content)
         if pending_count <= 0:
             return None, None
 
         _log_iteration("error",
             f"{context_msg} — {pending_count} pending mission(s) exist "
             f"— attempting direct extraction")
-        project, title = fallback_extract(missions_path, projects_str)
+        project, title = fallback_extract(content, projects_str)
         if project and title:
             _log_iteration("mission",
                 f"Direct fallback picked: [{project}] {title[:60]}")
@@ -210,6 +416,67 @@ def _pick_mission(instance_dir: Path, projects_str: str, run_num: int,
             "Picker crashed but")
 
 
+def _classify_mission(
+    mission_title: str,
+    project_name: str,
+    missions_path,
+) -> Optional[str]:
+    """Classify mission complexity and cache the tier in missions.md.
+
+    Checks for an existing [complexity:X] tag first (cache hit).  If
+    absent, calls the lightweight model to classify the mission.
+
+    Args:
+        mission_title: The mission text to classify.
+        project_name: Project name for per-project model/routing config.
+        missions_path: Path to missions.md for tag caching.
+
+    Returns:
+        Tier string ("trivial", "simple", "medium", "complex") or None
+        when routing is disabled or classification fails.
+    """
+    try:
+        from app.config import get_complexity_routing_config
+        routing = get_complexity_routing_config(project_name)
+        if routing is None:
+            return None  # Routing disabled for this project
+    except Exception as e:
+        _log_iteration("error", f"Complexity routing config error: {e}")
+        return None
+
+    # Cache hit — already classified
+    try:
+        from app.missions import extract_complexity_tag
+        cached = extract_complexity_tag(mission_title)
+        if cached is not None:
+            _log_iteration("complexity",
+                f"mission='{mission_title[:60]}' tier={cached} (cached)")
+            return cached
+    except Exception as e:
+        _log_iteration("error", f"Complexity tag extraction error: {e}")
+
+    # Cache miss — call the classifier
+    try:
+        from app.complexity_classifier import classify_mission_complexity
+        tier_obj = classify_mission_complexity(mission_title, project_name)
+        tier = tier_obj.value
+    except Exception as e:
+        _log_iteration("error", f"Complexity classification error: {e}")
+        return "medium"  # Safe default
+
+    _log_iteration("complexity",
+        f"mission='{mission_title[:60]}' tier={tier}")
+
+    # Write tag to missions.md (best-effort — never block execution)
+    try:
+        from app.missions import tag_complexity_in_pending
+        tag_complexity_in_pending(mission_title, tier, missions_path)
+    except Exception as e:
+        _log_iteration("error", f"Complexity tag write error: {e}")
+
+    return tier
+
+
 def _projects_to_str(projects: List[Tuple[str, str]]) -> str:
     """Convert a list of (name, path) tuples to semicolon-separated string.
 
@@ -221,28 +488,17 @@ def _projects_to_str(projects: List[Tuple[str, str]]) -> str:
 
 def _resolve_project_path(
     project_name: str, projects: List[Tuple[str, str]],
-) -> Optional[str]:
-    """Find the path for a project name.
+) -> Optional[Tuple[str, str]]:
+    """Find the canonical name and path for a project name (case-insensitive).
 
     Returns:
-        Path string or None if not found
+        (canonical_name, path) tuple or None if not found
     """
+    lower = project_name.lower()
     for name, path in projects:
-        if name == project_name:
-            return path
+        if name.lower() == lower:
+            return (name, path)
     return None
-
-
-def _get_project_by_index(projects: List[Tuple[str, str]], idx: int):
-    """Get (name, path) for project at given index.
-
-    Returns:
-        (name, path) tuple
-    """
-    if not projects:
-        return "default", ""
-    idx = max(0, min(idx, len(projects) - 1))
-    return projects[idx]
 
 
 def _get_known_project_names(projects: List[Tuple[str, str]]) -> list:
@@ -252,18 +508,22 @@ def _get_known_project_names(projects: List[Tuple[str, str]]) -> list:
 
 def _should_contemplate(autonomous_mode: str, focus_active: bool,
                         contemplative_chance: int,
-                        schedule_state=None) -> bool:
+                        schedule_state=None,
+                        focus_mode: bool = False) -> bool:
     """Check if this iteration should be a contemplative session.
 
     Contemplative sessions only trigger when:
+    - Focus mode is NOT active (neither config-level nor file-based)
     - Mode is deep or implement (need budget for Claude call)
-    - Focus mode is NOT active
     - Schedule is not in work_hours
     - Random roll succeeds (chance boosted during deep_hours)
 
     Returns:
         True if should run a contemplative session
     """
+    if focus_mode:
+        return False
+
     if autonomous_mode not in ("deep", "implement"):
         return False
 
@@ -295,6 +555,21 @@ def _check_focus(koan_root: str):
         return None
 
 
+def _check_passive(koan_root: str):
+    """Check passive mode state.
+
+    Returns:
+        PassiveState object if active, None if not active.
+        Gracefully returns None if passive_manager module is not available.
+    """
+    try:
+        from app.passive_manager import check_passive
+        return check_passive(koan_root)
+    except (ImportError, OSError, ValueError) as e:
+        _log_iteration("error", f"Passive check failed: {e}")
+        return None
+
+
 def _select_random_exploration_project(
     projects: List[Tuple[str, str]],
     last_project: str = "",
@@ -304,7 +579,9 @@ def _select_random_exploration_project(
 
     Uses session outcome history to weight selection: fresh projects
     (recently productive) are preferred over stale ones (consecutive
-    empty sessions).  Also avoids repeating the last explored project.
+    empty sessions). By default, avoids repeating the last explored
+    project, but can optionally stay on the same project to preserve
+    prompt-cache warmth across consecutive runs.
 
     Args:
         projects: List of eligible (name, path) tuples (must be non-empty).
@@ -317,6 +594,29 @@ def _select_random_exploration_project(
     if len(projects) == 1:
         return projects[0]
 
+    # Optional cache-aware "fast lane": intentionally keep the same project
+    # as the previous run to maximize prompt prefix cache reuse.
+    if last_project and len(projects) > 1:
+        previous = next(((n, p) for n, p in projects if n == last_project), None)
+        if previous:
+            try:
+                from app.config import get_same_project_stickiness_percent
+
+                stickiness = get_same_project_stickiness_percent()
+            except (ImportError, OSError, ValueError) as e:
+                _log_iteration("error", f"Stickiness config lookup failed: {e}")
+                stickiness = 0
+
+            if stickiness > 0:
+                roll = random.randint(1, 100)
+                if roll <= stickiness:
+                    _log_iteration(
+                        "koan",
+                        f"Cache fast lane: reusing project '{last_project}' "
+                        f"(roll={roll} <= stickiness={stickiness})",
+                    )
+                    return previous
+
     # Load session outcomes once for both freshness and drift lookups
     # (avoids 2N file reads — one per project per function)
     weights = None
@@ -325,11 +625,11 @@ def _select_random_exploration_project(
     if instance_dir:
         try:
             from app.session_tracker import (
-                _load_outcomes, get_project_freshness, get_project_drift,
+                load_outcomes, get_project_freshness, get_project_drift,
             )
             from pathlib import Path as _Path
             outcomes_path = _Path(instance_dir) / "session_outcomes.json"
-            all_outcomes = _load_outcomes(outcomes_path)
+            all_outcomes = load_outcomes(outcomes_path)
 
             weights = get_project_freshness(instance_dir, projects,
                                              _all_outcomes=all_outcomes)
@@ -403,7 +703,8 @@ def _select_random_exploration_project(
     return random.choice(candidates)
 
 
-FilterResult = namedtuple("FilterResult", ["projects", "pr_limited"])
+FilterResult = namedtuple("FilterResult", ["projects", "pr_limited", "branch_saturated", "focus_gated"],
+                         defaults=[[]])
 AutonomousDecision = namedtuple("AutonomousDecision", ["action", "focus_remaining"])
 
 
@@ -413,16 +714,19 @@ def _filter_exploration_projects(
 ) -> FilterResult:
     """Filter projects to only those eligible for exploration.
 
-    Checks two gates in order:
+    Checks three gates in order:
     1. ``exploration`` flag — projects with ``exploration: false`` are excluded.
     2. ``max_open_prs`` limit — projects at or over their PR limit are excluded.
+    3. ``max_pending_branches`` limit — projects at or over their branch limit
+       are excluded.
 
     Returns a FilterResult with:
     - ``projects``: list of (name, path) tuples eligible for exploration
     - ``pr_limited``: list of project names excluded due to PR limit
+    - ``branch_saturated``: list of project names excluded due to branch limit
     """
     from app.projects_config import (
-        load_projects_config, get_project_exploration,
+        load_projects_config, get_project_exploration, get_project_focus,
         get_project_max_open_prs,
     )
 
@@ -430,14 +734,25 @@ def _filter_exploration_projects(
         config = load_projects_config(koan_root)
     except (OSError, ValueError) as e:
         print(f"[iteration_manager] Could not load projects config: {e}", file=sys.stderr)
-        return FilterResult(projects=projects, pr_limited=[])
+        return FilterResult(projects=projects, pr_limited=[], branch_saturated=[], focus_gated=[])
 
     if config is None:
-        return FilterResult(projects=projects, pr_limited=[])
+        return FilterResult(projects=projects, pr_limited=[], branch_saturated=[], focus_gated=[])
+
+    # Gate 0: focus flag — filter out projects with focus: true
+    focus_gated = []
+    not_focused = []
+    for name, path in projects:
+        if get_project_focus(config, name):
+            _log_iteration("koan",
+                f"Project '{name}' has focus: true — excluding from exploration")
+            focus_gated.append(name)
+        else:
+            not_focused.append((name, path))
 
     # Gate 1: exploration flag
     exploration_enabled = [
-        (name, path) for name, path in projects
+        (name, path) for name, path in not_focused
         if get_project_exploration(config, name)
     ]
 
@@ -449,7 +764,7 @@ def _filter_exploration_projects(
         skip_pr_limit = should_relax_pr_limit(schedule_state)
 
     if skip_pr_limit:
-        return FilterResult(projects=exploration_enabled, pr_limited=[])
+        return FilterResult(projects=exploration_enabled, pr_limited=[], branch_saturated=[], focus_gated=focus_gated)
 
     from app.github import get_gh_username, batch_count_open_prs, cached_count_open_prs
     author = get_gh_username()
@@ -487,46 +802,86 @@ def _filter_exploration_projects(
 
         projects_needing_check[name] = (path, limit, urls_to_check)
 
-    if not projects_needing_check:
-        return FilterResult(projects=filtered, pr_limited=pr_limited)
+    if projects_needing_check:
+        # Phase 2: Batch-fetch PR counts for all repos in one GraphQL call
+        all_repos = []
+        for (_, _, urls) in projects_needing_check.values():
+            all_repos.extend(urls)
+        all_repos = list(dict.fromkeys(all_repos))  # deduplicate, preserve order
 
-    # Phase 2: Batch-fetch PR counts for all repos in one GraphQL call
-    all_repos = []
-    for _, (_, _, urls) in projects_needing_check.items():
-        all_repos.extend(urls)
-    all_repos = list(dict.fromkeys(all_repos))  # deduplicate, preserve order
+        batch_results = batch_count_open_prs(all_repos, author)
 
-    batch_results = batch_count_open_prs(all_repos, author)
+        # Phase 3: Evaluate limits using batch results (fall back to sequential on miss)
+        for name, (path, limit, urls_to_check) in projects_needing_check.items():
+            total_open = 0
+            any_error = False
 
-    # Phase 3: Evaluate limits using batch results (fall back to sequential on miss)
-    for name, (path, limit, urls_to_check) in projects_needing_check.items():
-        total_open = 0
-        any_error = False
+            for url in urls_to_check:
+                if url in batch_results:
+                    count = batch_results[url]
+                else:
+                    # Batch missed this repo — fall back to individual query
+                    count = cached_count_open_prs(url, author)
+                if count >= 0:
+                    total_open += count
+                else:
+                    any_error = True
 
-        for url in urls_to_check:
-            if url in batch_results:
-                count = batch_results[url]
+            if any_error and total_open == 0:
+                # All URLs errored — conservative: treat as PR-limited
+                pr_limited.append(name)
+                continue
+
+            if total_open >= limit:
+                _log_iteration("koan",
+                    f"Project '{name}' at PR limit ({total_open}/{limit}) — excluding from exploration")
+                pr_limited.append(name)
             else:
-                # Batch missed this repo — fall back to individual query
-                count = cached_count_open_prs(url, author)
-            if count >= 0:
-                total_open += count
-            else:
-                any_error = True
+                filtered.append((name, path))
 
-        if any_error and total_open == 0:
-            # All URLs errored — conservative: treat as PR-limited
-            pr_limited.append(name)
+    # Gate 3: max_pending_branches limit
+    from app.projects_config import get_project_max_pending_branches
+
+    instance_dir = str(Path(koan_root) / "instance")
+    branch_saturated = []
+    final_filtered = []
+
+    for name, path in filtered:
+        branch_limit = get_project_max_pending_branches(config, name)
+        if branch_limit == 0:
+            final_filtered.append((name, path))
             continue
 
-        if total_open >= limit:
-            _log_iteration("koan",
-                f"Project '{name}' at PR limit ({total_open}/{limit}) — excluding from exploration")
-            pr_limited.append(name)
-        else:
-            filtered.append((name, path))
+        project_cfg = config.get("projects", {}).get(name, {}) or {}
+        urls = set()
+        primary = project_cfg.get("github_url", "")
+        if primary:
+            urls.add(primary)
+        for u in project_cfg.get("github_urls", []):
+            if u:
+                urls.add(u)
 
-    return FilterResult(projects=filtered, pr_limited=pr_limited)
+        try:
+            from app.branch_limiter import count_pending_branches
+            count = count_pending_branches(
+                instance_dir, name, path, list(urls), author,
+            )
+        except Exception as e:
+            _log_iteration("debug",
+                f"Branch count failed for '{name}': {e} — allowing")
+            final_filtered.append((name, path))
+            continue
+
+        if count >= branch_limit:
+            _log_iteration("koan",
+                f"Project '{name}' branch-saturated ({count}/{branch_limit}) "
+                f"— excluding from exploration")
+            branch_saturated.append(name)
+        else:
+            final_filtered.append((name, path))
+
+    return FilterResult(projects=final_filtered, pr_limited=pr_limited,
+                        branch_saturated=branch_saturated, focus_gated=focus_gated)
 
 
 def _check_schedule():
@@ -548,8 +903,10 @@ def _make_result(*, action, project_name, project_path="",
                  mission_title="", autonomous_mode, focus_area="",
                  available_pct, decision_reason, display_lines,
                  recurring_injected, focus_remaining=None,
+                 passive_remaining=None,
                  schedule_mode="normal", error=None,
-                 tracker_error=None):
+                 tracker_error=None, cost_today=0.0,
+                 mission_tier=None):
     """Build a standardised iteration-plan result dict."""
     return {
         "action": action,
@@ -563,9 +920,12 @@ def _make_result(*, action, project_name, project_path="",
         "display_lines": display_lines,
         "recurring_injected": recurring_injected,
         "focus_remaining": focus_remaining,
+        "passive_remaining": passive_remaining,
         "schedule_mode": schedule_mode,
         "error": error,
         "tracker_error": tracker_error,
+        "cost_today": cost_today,
+        "mission_tier": mission_tier,
     }
 
 
@@ -574,6 +934,7 @@ def _decide_autonomous_action(
     koan_root: str,
     schedule_state,
     contemplative_chance: int = 10,
+    focus_mode: bool = False,
 ) -> "AutonomousDecision":
     """Decide autonomous action via a linear priority chain.
 
@@ -586,21 +947,26 @@ def _decide_autonomous_action(
     3. Schedule wait — work_hours active, skip exploration
     4. Autonomous exploration — default fallback
 
+    When ``focus_mode`` is True (config-level or file-based), contemplation
+    and exploration are disabled — the loop idles via ``focus_wait``.
+
     Returns:
         AutonomousDecision(action, focus_remaining)
     """
     focus_state = _check_focus(koan_root)
-    focus_active = focus_state is not None
+    focus_active = focus_state is not None or focus_mode
     _log_iteration("koan",
         f"Evaluating autonomous action "
-        f"(mode={autonomous_mode}, focus_active={focus_active})")
+        f"(mode={autonomous_mode}, focus_active={focus_active}, "
+        f"focus_mode={focus_mode})")
 
     # 1. Contemplative session (random reflection)
     if _should_contemplate(autonomous_mode, focus_active,
-                           contemplative_chance, schedule_state):
+                           contemplative_chance, schedule_state,
+                           focus_mode=focus_mode):
         return AutonomousDecision(action="contemplative", focus_remaining=None)
 
-    # 2. Focus mode active → wait for missions
+    # 2. Focus mode active → wait for missions (file-based or config-level)
     if focus_state is not None:
         try:
             focus_remaining = focus_state.remaining_display()
@@ -609,6 +975,11 @@ def _decide_autonomous_action(
             focus_remaining = "unknown"
         return AutonomousDecision(action="focus_wait",
                                  focus_remaining=focus_remaining)
+
+    # 2b. Config-level focus mode (permanent, no remaining time)
+    if focus_mode:
+        return AutonomousDecision(action="focus_wait",
+                                 focus_remaining="permanent")
 
     # 3. Schedule work_hours → suppress exploration
     if schedule_state is not None and schedule_state.in_work_hours:
@@ -644,7 +1015,7 @@ def plan_iteration(
     Returns:
         dict with iteration plan:
         {
-            "action": "mission" | "autonomous" | "contemplative" | "focus_wait" | "schedule_wait" | "exploration_wait" | "pr_limit_wait" | "wait_pause" | "error",
+            "action": "mission" | "autonomous" | "contemplative" | "passive_wait" | "focus_wait" | "schedule_wait" | "exploration_wait" | "pr_limit_wait" | "wait_pause" | "error",
             "project_name": str,
             "project_path": str,
             "mission_title": str (empty for autonomous/contemplative),
@@ -669,8 +1040,20 @@ def plan_iteration(
     # Convert projects to string format for downstream functions
     projects_str = _projects_to_str(projects)
 
+    # Step 0: Detect config-level focus mode (disables autonomous work)
+    try:
+        from app.config import is_focus_mode
+        focus_mode = is_focus_mode()
+    except (ImportError, OSError, ValueError) as e:
+        _log_iteration("error", f"Focus mode config lookup failed: {e}")
+        focus_mode = False
+
     # Step 1: Refresh usage
     _refresh_usage(usage_state, usage_md, count)
+
+    # Step 1b: Warn the human when the rolling burn rate predicts a near-future
+    # quota wipeout. Fires at most once per quota cycle.
+    _maybe_warn_burn_rate(instance, usage_state)
 
     # Step 2: Get usage decision (mode, available%, reason, project idx)
     decision = _get_usage_decision(usage_md, count, projects_str)
@@ -679,7 +1062,19 @@ def plan_iteration(
     decision_reason = decision["reason"]
     display_lines = decision["display_lines"]
     tracker_error = decision.get("tracker_error")
+    cost_today = decision.get("cost_today", 0.0)
     _log_iteration("koan", f"Usage decision: mode={autonomous_mode}, available={available_pct}%")
+
+    # Step 2a: Cap mode at implement when focus mode is active.
+    # DEEP mode encourages autonomous GitHub issue pickup, which focus
+    # mode explicitly forbids — missions only, no autonomous work.
+    if focus_mode and autonomous_mode == "deep":
+        decision_reason = (
+            f"{decision_reason} (capped from deep: focus mode active)"
+        )
+        autonomous_mode = "implement"
+        _log_iteration("koan",
+            "Focus mode: capped mode deep → implement")
 
     # Step 2b: Check schedule and cap mode based on deep_hours config.
     # This runs early (before mission pick) so the capped mode affects
@@ -706,20 +1101,55 @@ def plan_iteration(
     # Step 3: Inject recurring missions
     recurring_injected = _inject_recurring(instance)
 
-    # Step 4: Pick mission
+    # Step 3b: Drain CI queue (one entry per iteration, non-blocking)
+    ci_drain_msg = _drain_ci_queue(instance)
+
+    # Step 4: Pick mission. Manual missions (queued in missions.md or via
+    # notifications) are always eligible regardless of branch saturation —
+    # max_pending_branches is a self-throttle for autonomous exploration,
+    # not a gate on human instructions. Saturation is enforced by
+    # _filter_exploration_projects in the no-mission path only.
     mission_project, mission_title = _pick_mission(
         instance, projects_str, run_num, autonomous_mode, last_project,
     )
     if mission_project and mission_title:
-        _log_iteration("mission", f"Mission picked: [{mission_project}] {mission_title[:80]}")
+        _log_iteration("mission",
+            f"Mission picked: [{mission_project}] {mission_title[:80]}")
     else:
         _log_iteration("koan", "No pending mission — entering autonomous mode")
 
-    # Step 5: Resolve project
+    # Step 4b: Passive mode gate — block all execution
+    # Missions stay Pending, no autonomous work. Must check before start_mission().
+    passive_state = _check_passive(koan_root)
+    if passive_state is not None:
+        remaining = passive_state.remaining_display()
+        _log_iteration("koan", f"Passive mode active ({remaining}) — skipping execution")
+        return _make_result(
+            action="passive_wait",
+            project_name=mission_project or (projects[0][0] if projects else "default"),
+            project_path="",
+            mission_title="",
+            autonomous_mode=autonomous_mode,
+            focus_area="Passive mode: read-only, no execution",
+            available_pct=available_pct,
+            decision_reason=f"Passive mode — read-only ({remaining})",
+            display_lines=display_lines,
+            recurring_injected=recurring_injected,
+            focus_remaining=None,
+            schedule_mode=schedule_state.mode if schedule_state else "normal",
+            tracker_error=tracker_error,
+            passive_remaining=remaining,
+        )
+
+    # Step 5: Resolve project for the picked mission.
     if mission_project and mission_title:
-        # Mission picked — resolve project path
-        project_name = mission_project
-        project_path = _resolve_project_path(project_name, projects)
+        resolved = _resolve_project_path(mission_project, projects)
+
+        if resolved is None:
+            project_name = mission_project
+            project_path = None
+        else:
+            project_name, project_path = resolved
 
         if project_path is None:
             known = _get_known_project_names(projects)
@@ -736,6 +1166,16 @@ def plan_iteration(
                 error=f"Unknown project '{project_name}'. Known: {', '.join(known)}",
                 tracker_error=tracker_error,
             )
+
+    # Step 5b: Pre-classify mission complexity (when a mission was picked
+    # and project resolved successfully).  Cache the tier in missions.md
+    # so re-runs skip the classifier call entirely.
+    mission_tier: Optional[str] = None
+    if mission_project and mission_title and project_path is not None:
+        mission_tier = _classify_mission(
+            mission_title, project_name, instance / "missions.md"
+        )
+
     else:
         # No mission — autonomous mode
         mission_title = ""
@@ -758,13 +1198,48 @@ def plan_iteration(
                 tracker_error=tracker_error,
             )
 
+        # Short-circuit: config-level focus mode means no autonomous work.
+        # Skip exploration filtering, contemplative rolls, and any gh calls —
+        # idle with wake-on-mission like exploration_wait.
+        if focus_mode:
+            _log_iteration("koan",
+                "Focus mode: no pending mission — entering focus_wait")
+            focus_area = resolve_focus_area(autonomous_mode, has_mission=False)
+            return _make_result(
+                action="focus_wait",
+                project_name=projects[0][0] if projects else "default",
+                project_path=projects[0][1] if projects else "",
+                autonomous_mode=autonomous_mode,
+                focus_area=focus_area,
+                available_pct=available_pct,
+                decision_reason=(
+                    "Focus mode — no autonomous work, "
+                    "waiting for queued missions"
+                ),
+                display_lines=display_lines,
+                recurring_injected=recurring_injected,
+                schedule_mode=schedule_state.mode if schedule_state else "normal",
+                tracker_error=tracker_error,
+            )
+
         # Filter to exploration-enabled projects only
         filter_result = _filter_exploration_projects(projects, koan_root,
                                                      schedule_state=schedule_state)
         exploration_projects = filter_result.projects
         if not exploration_projects:
-            # Determine whether this is exploration-disabled or PR-limited
-            if filter_result.pr_limited:
+            # Determine whether this is focus-gated, exploration-disabled, PR-limited, or branch-saturated
+            if filter_result.focus_gated:
+                _log_iteration("koan", "All projects have focus enabled — waiting for queued missions")
+                wait_action = "exploration_wait"
+                wait_reason = "All projects have focus enabled — waiting for queued missions"
+            elif filter_result.branch_saturated:
+                _log_iteration("koan", "All exploration projects branch-saturated — waiting for reviews")
+                wait_action = "branch_saturated_wait"
+                wait_reason = (
+                    f"Branch limit reached for: {', '.join(filter_result.branch_saturated)} "
+                    f"— waiting for reviews/merges"
+                )
+            elif filter_result.pr_limited:
                 _log_iteration("koan", "All exploration projects at PR limit — waiting for reviews")
                 wait_action = "pr_limit_wait"
                 wait_reason = (
@@ -814,6 +1289,7 @@ def plan_iteration(
 
         autonomous_decision = _decide_autonomous_action(
             autonomous_mode, koan_root, schedule_state, contemplative_chance,
+            focus_mode=focus_mode,
         )
         action = autonomous_decision.action
 
@@ -867,11 +1343,15 @@ def plan_iteration(
         recurring_injected=recurring_injected,
         schedule_mode=schedule_state.mode if schedule_state else "normal",
         tracker_error=tracker_error,
+        cost_today=cost_today,
+        mission_tier=mission_tier,
     )
 
 
 def main():
     """CLI entry point for iteration_manager."""
+    global _cli_mode
+    _cli_mode = True
     parser = argparse.ArgumentParser(description="Kōan iteration planner")
     subparsers = parser.add_subparsers(dest="command")
 

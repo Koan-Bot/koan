@@ -2,9 +2,11 @@
 name: implement
 scope: core
 group: code
+emoji: 🔨
 description: "Implement a GitHub issue (ex: /implement https://github.com/owner/repo/issues/42)"
 version: 1.0.0
 audience: hybrid
+caveman: true
 github_enabled: true
 github_context_aware: true
 commands:

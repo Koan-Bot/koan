@@ -5,35 +5,22 @@ history stored as JSONL files. Platform-agnostic — works with
 any messaging provider.
 """
 
+import contextlib
 import fcntl
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
 
 def _atomic_write(path: Path, content: str):
-    """Crash-safe file write using temp file + rename.
+    """Crash-safe file write — delegates to :func:`app.utils.atomic_write`.
 
-    Local wrapper to avoid circular import with utils.py (which re-exports
-    from this module). Uses the same mkstemp + fsync + replace pattern.
+    Imported lazily to avoid an import cycle: ``utils.py`` re-exports
+    symbols from this module at the bottom of its file.
     """
-    import tempfile
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".koan-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    from app.utils import atomic_write
+    atomic_write(path, content)
 
 
 def _parse_jsonl_lines(lines: list) -> List[Dict]:
@@ -166,10 +153,8 @@ def prune_topics(entries: list, max_entries: int = 20) -> list:
         return entries
 
     # Sort by compacted_at to ensure we keep the most recent
-    try:
+    with contextlib.suppress(TypeError, AttributeError):
         entries.sort(key=lambda e: e.get("compacted_at", ""))
-    except (TypeError, AttributeError):
-        pass
 
     return entries[-max_entries:]
 
@@ -225,10 +210,8 @@ def compact_history(history_file: Path, topics_file: Path, min_messages: int = 2
 
     if not topics_by_date:
         # No extractable topics, just purge atomically
-        try:
+        with contextlib.suppress(OSError):
             _atomic_write(history_file, "")
-        except OSError:
-            pass
         return len(messages)
 
     # Build compaction entry

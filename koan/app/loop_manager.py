@@ -16,6 +16,7 @@ CLI interface:
 """
 
 import argparse
+import contextlib
 import logging
 import os
 import re
@@ -29,6 +30,15 @@ from typing import Optional
 
 from app.missions import count_pending
 from app.utils import atomic_write
+
+
+def _log_loop(category: str, message: str):
+    """Log loop manager events via run_log.log() for timestamps and color."""
+    try:
+        from app.run_log import log as _run_log
+        _run_log(category, message)
+    except ImportError:
+        print(f"[{category}] {message}", file=sys.stderr)
 
 
 # --- Focus area resolution ---
@@ -65,12 +75,16 @@ def validate_projects(
 ) -> Optional[str]:
     """Validate project configuration.
 
+    Missing directories or non-git repos are warned about and filtered out.
+    Only returns an error if no valid projects remain after filtering.
+
     Args:
         projects: List of (name, path) tuples.
         max_projects: Maximum allowed projects.
 
     Returns:
         Error message string if validation fails, None if valid.
+        Side effect: prints warnings for skipped projects to stderr.
     """
     if not projects:
         return "No projects configured. Create projects.yaml or set KOAN_PROJECTS env var."
@@ -78,9 +92,12 @@ def validate_projects(
     if len(projects) > max_projects:
         return f"Max {max_projects} projects allowed. You have {len(projects)}."
 
+    valid_count = 0
     for name, path in projects:
         if not os.path.isdir(path):
-            return f"Project '{name}' path does not exist: {path}"
+            _log_loop("health", f"Project '{name}' path does not exist: {path} — skipping. "
+                      f"Remove it from projects.yaml to silence this warning.")
+            continue
 
         # Verify the project path is a git repository
         try:
@@ -91,15 +108,22 @@ def validate_projects(
                 timeout=5,
             )
             if result.returncode != 0:
-                return f"Project '{name}' is not a git repository: {path}"
+                _log_loop("health", f"Project '{name}' is not a git repository: {path} — skipping.")
+                continue
         except (OSError, subprocess.TimeoutExpired):
-            return f"Project '{name}' is not a git repository: {path}"
+            _log_loop("health", f"Project '{name}' is not a git repository: {path} — skipping.")
+            continue
+
+        valid_count += 1
+
+    if valid_count == 0:
+        return "No valid project directories found. Check your projects.yaml paths."
 
     return None
 
 
 def lookup_project(project_name: str, projects: list) -> Optional[str]:
-    """Find project path by name.
+    """Find project path by name (case-insensitive).
 
     Args:
         project_name: Name to look up.
@@ -108,8 +132,9 @@ def lookup_project(project_name: str, projects: list) -> Optional[str]:
     Returns:
         Project path if found, None otherwise.
     """
+    lower = project_name.lower()
     for name, path in projects:
-        if name == project_name:
+        if name.lower() == lower:
             return path
     return None
 
@@ -124,6 +149,35 @@ def format_project_list(projects: list) -> str:
         Formatted string with bullet points, one per line.
     """
     return "\n".join(f"  \u2022 {name}" for name, _ in sorted(projects))
+
+
+# --- CI queue drain during sleep ---
+
+# Throttle: minimum seconds between CI queue checks during sleep.
+_CI_QUEUE_SLEEP_INTERVAL = 30
+_last_ci_queue_sleep_check: float = 0
+
+
+def _drain_ci_queue_during_sleep(instance_dir: str, elapsed: float):
+    """Drain CI queue during interruptible sleep (throttled).
+
+    Called every ~10s from the sleep loop but only actually checks CI
+    status every _CI_QUEUE_SLEEP_INTERVAL seconds to avoid API spam.
+    """
+    global _last_ci_queue_sleep_check
+
+    now = time.monotonic()
+    if now - _last_ci_queue_sleep_check < _CI_QUEUE_SLEEP_INTERVAL:
+        return
+    _last_ci_queue_sleep_check = now
+
+    try:
+        from app.ci_queue_runner import drain_one
+        msg = drain_one(instance_dir)
+        if msg:
+            log.info("CI queue (sleep): %s", msg)
+    except (ImportError, OSError, ValueError) as e:
+        log.debug("CI queue drain error during sleep: %s", e)
 
 
 # --- Pending.md creation ---
@@ -209,9 +263,14 @@ _NOTIF_CACHE_MAX = 2000
 _notif_cache: dict = {}
 _notif_cache_lock = threading.Lock()
 
-# SSO alert cooldown: only send one Telegram alert per hour.
-_SSO_ALERT_COOLDOWN = 3600  # 1 hour
-_last_sso_alert: float = 0
+# --- Failed error reply queue ---
+# When posting an error reply to GitHub fails, store the params here for retry
+# on the next notification cycle. Each entry is a dict with keys:
+# owner, repo, issue_num, comment_id, error, comment_api_url.
+_MAX_REPLY_RETRIES = 3
+_MAX_PENDING_REPLIES = 50
+_pending_error_replies: list = []
+_pending_error_replies_lock = threading.Lock()
 
 # Lock protecting all module-level mutable GitHub state above.
 # Acquired for short state reads/writes only — never held during API calls.
@@ -283,7 +342,7 @@ def _cache_notif(notif: dict) -> None:
         for k in expired:
             del _notif_cache[k]
         # If still over limit, evict oldest
-        if len(_notif_cache) > _NOTIF_CACHE_MAX:
+        if _notif_cache and len(_notif_cache) > _NOTIF_CACHE_MAX:
             oldest_key = min(_notif_cache, key=_notif_cache.get)
             del _notif_cache[oldest_key]
 
@@ -355,28 +414,47 @@ def _load_github_config(config: dict, koan_root: str, instance_dir: str) -> Opti
 
 # Module-level cache for the GitHub notification skill registry.
 # _build_skill_registry() is called every ~30s cycle; caching avoids
-# rebuilding from filesystem each time.
+# rebuilding from filesystem each time.  Invalidated when skills
+# directories change on disk (mtime check).
 _gh_cached_registry = None
 _gh_cached_extra_dirs: Optional[tuple] = None
+_gh_cached_mtime: float = 0.0
+
+
+def _skills_dir_mtime(instance_dir: str) -> float:
+    """Get the max mtime of core and instance skills directories."""
+    best = 0.0
+    core_dir = Path(__file__).resolve().parent.parent / "skills" / "core"
+    with contextlib.suppress(OSError):
+        best = max(best, core_dir.stat().st_mtime)
+    instance_skills = Path(instance_dir) / "skills"
+    if instance_skills.is_dir():
+        with contextlib.suppress(OSError):
+            best = max(best, instance_skills.stat().st_mtime)
+    return best
 
 
 def _build_skill_registry(instance_dir: str):
     """Build combined skill registry from core and instance skills.
 
     Uses a module-level cache to avoid rebuilding from filesystem on
-    every GitHub notification polling cycle (~30s).
+    every GitHub notification polling cycle (~30s).  Automatically
+    invalidates when skills directories change on disk (new skill added).
 
     Returns:
         Populated SkillRegistry
     """
-    global _gh_cached_registry, _gh_cached_extra_dirs
+    global _gh_cached_registry, _gh_cached_extra_dirs, _gh_cached_mtime
     from app.skills import build_registry
 
     instance_skills = Path(instance_dir) / "skills"
     extra = tuple(p for p in [instance_skills] if p.is_dir())
+    current_mtime = _skills_dir_mtime(instance_dir)
 
     with _github_state_lock:
-        if _gh_cached_registry is not None and extra == _gh_cached_extra_dirs:
+        if (_gh_cached_registry is not None
+                and extra == _gh_cached_extra_dirs
+                and current_mtime <= _gh_cached_mtime):
             return _gh_cached_registry
 
     registry = build_registry(list(extra))
@@ -384,6 +462,7 @@ def _build_skill_registry(instance_dir: str):
     with _github_state_lock:
         _gh_cached_registry = registry
         _gh_cached_extra_dirs = extra
+        _gh_cached_mtime = current_mtime
 
     return registry
 
@@ -427,7 +506,7 @@ def _get_known_repos_from_projects(koan_root: str) -> Optional[set]:
     # 1. projects.yaml — primary source
     projects_config = load_projects_config(koan_root)
     if projects_config:
-        for name, proj in projects_config.get("projects", {}).items():
+        for proj in projects_config.get("projects", {}).values():
             if not isinstance(proj, dict):
                 continue
             gh_url = proj.get("github_url", "")
@@ -443,12 +522,12 @@ def _get_known_repos_from_projects(koan_root: str) -> Optional[set]:
         from app.projects_merged import get_all_github_urls_cache, get_github_url_cache
 
         # Primary URLs (origin remote)
-        for _name, url in get_github_url_cache().items():
+        for url in get_github_url_cache().values():
             if url:
                 known_repos.add(_normalize_github_url(url))
 
         # All remote URLs (origin + upstream + others)
-        for _name, urls in get_all_github_urls_cache().items():
+        for urls in get_all_github_urls_cache().values():
             for url in urls:
                 if url:
                     known_repos.add(_normalize_github_url(url))
@@ -478,41 +557,36 @@ def _get_effective_check_interval() -> int:
 
 
 def _check_sso_failures() -> None:
-    """After a notification cycle, check for SSO failures and alert once per cooldown."""
-    global _last_sso_alert
-
-    from app.github_notifications import get_sso_failure_count
+    """After a notification cycle, update consecutive counter and escalate if needed."""
+    from app.github_notifications import (
+        get_sso_failure_count,
+        update_consecutive_sso_failures,
+        check_sso_escalation,
+        get_consecutive_sso_failures,
+    )
 
     count = get_sso_failure_count()
+    update_consecutive_sso_failures()
+
     if count == 0:
         return
 
-    now = time.time()
-    with _github_state_lock:
-        if now - _last_sso_alert < _SSO_ALERT_COOLDOWN:
-            return
-        _last_sso_alert = now
-
+    consecutive = get_consecutive_sso_failures()
     _github_log(
-        f"SSO auth failure: {count} API call(s) returned 403 — "
+        f"SSO auth failure: {count} call(s) this cycle, "
+        f"{consecutive} consecutive — "
         "run: gh auth refresh -h github.com -s read:org",
         "warning",
     )
-    try:
-        from app.notify import send_telegram
-        send_telegram(
-            "⚠️ GitHub API returning 403 for enterprise org repos — "
-            "SSO token needs re-authorization.\n"
-            "Run: gh auth refresh -h github.com -s read:org"
-        )
-    except (ImportError, OSError) as e:
-        log.debug("Failed to send SSO alert: %s", e)
+
+    # Escalate to outbox after threshold (fires once per streak)
+    check_sso_escalation()
 
 
 def reset_github_backoff() -> None:
     """Reset backoff state. Useful for tests and when external events suggest activity."""
     global _last_github_check, _last_github_check_iso, _consecutive_empty_checks, _github_config_logged, _github_interval_loaded
-    global _github_config_cache, _github_config_cache_mtime, _last_sso_alert
+    global _github_config_cache, _github_config_cache_mtime
     with _github_state_lock:
         _last_github_check = 0
         _last_github_check_iso = ""
@@ -521,14 +595,55 @@ def reset_github_backoff() -> None:
         _github_interval_loaded = False
         _github_config_cache = _GITHUB_CONFIG_UNSET
         _github_config_cache_mtime = 0
-        _last_sso_alert = 0
     with _notif_cache_lock:
         _notif_cache.clear()
+    with _pending_error_replies_lock:
+        _pending_error_replies.clear()
+
+
+def _retry_failed_replies() -> None:
+    """Retry previously failed GitHub error replies.
+
+    Drains the pending queue and attempts each reply once. Replies that
+    fail again are re-queued (up to _MAX_REPLY_RETRIES total attempts).
+    """
+    with _pending_error_replies_lock:
+        if not _pending_error_replies:
+            return
+        batch = list(_pending_error_replies)
+        _pending_error_replies.clear()
+
+    if not batch:
+        return
+
+    from app.github_command_handler import post_error_reply
+
+    for entry in batch:
+        try:
+            post_error_reply(
+                entry["owner"], entry["repo"], entry["issue_num"],
+                entry["comment_id"], entry["error"],
+                comment_api_url=entry.get("comment_api_url", ""),
+            )
+        except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as e:
+            attempts = entry.get("attempts", 1) + 1
+            if attempts <= _MAX_REPLY_RETRIES:
+                entry["attempts"] = attempts
+                with _pending_error_replies_lock:
+                    if len(_pending_error_replies) < _MAX_PENDING_REPLIES:
+                        _pending_error_replies.append(entry)
+            else:
+                _github_log(
+                    f"Dropping error reply after {attempts - 1} attempts "
+                    f"({entry['owner']}/{entry['repo']}#{entry['issue_num']}): {e}",
+                    "warning",
+                )
 
 
 def process_github_notifications(
     koan_root: str,
     instance_dir: str,
+    force: bool = False,
 ) -> int:
     """Check GitHub notifications and create missions from @mentions.
 
@@ -539,6 +654,7 @@ def process_github_notifications(
     Args:
         koan_root: Path to koan root directory.
         instance_dir: Path to instance directory.
+        force: When True, bypass throttle and reset backoff (from /check_notifications).
 
     Returns:
         Number of missions created.
@@ -564,10 +680,18 @@ def process_github_notifications(
     now = time.time()
     # Atomic check-then-act: verify throttle and claim the timeslot under lock.
     with _github_state_lock:
+        if force:
+            _consecutive_empty_checks = 0
         effective_interval = _get_effective_check_interval_locked()
-        if now - _last_github_check < effective_interval:
+        if not force and now - _last_github_check < effective_interval:
             return 0
         _last_github_check = now
+
+    if force:
+        _github_log("Forced notification check (via /check_notifications)")
+
+    # Retry any previously failed error replies before processing new ones.
+    _retry_failed_replies()
 
     try:
         from app.utils import load_config
@@ -591,14 +715,8 @@ def process_github_notifications(
         projects_config = load_projects_config(koan_root)
 
         # Fetch and process notifications
-        from app.github_notifications import fetch_unread_notifications, mark_notification_read, reset_sso_failure_count
+        from app.github_notifications import fetch_unread_notifications, reset_sso_failure_count
         reset_sso_failure_count()
-        from app.github_command_handler import (
-            process_single_notification,
-            post_error_reply,
-            resolve_project_from_notification,
-            extract_issue_number_from_notification,
-        )
 
         # Pass ``since`` so we also get notifications that were auto-read
         # by the GitHub web UI before we could poll them (race condition
@@ -647,32 +765,19 @@ def process_github_notifications(
                 cached_count, len(uncached),
             )
 
-        missions_created = 0
-        for notif in uncached:
-            _log_notification(notif)
-            success, error = process_single_notification(
-                notif, registry, config, projects_config,
-                github_config.get("bot_username", ""),
-                github_config.get("max_age", 24),
-            )
+        from app.github_config import get_github_parallel_workers
+        workers = get_github_parallel_workers(config)
 
-            if success:
-                missions_created += 1
-                repo = notif.get("repository", {}).get("full_name", "?")
-                title = notif.get("subject", {}).get("title", "?")
-                _github_log(f"Mission queued from @mention on {repo}: {title}")
-                _notify_mission_from_mention(notif)
-            elif error:
-                repo = notif.get("repository", {}).get("full_name", "?")
-                _github_log(f"Notification error for {repo}: {error[:100]}", "warning")
-                _post_error_for_notification(notif, error)
+        missions_created = _process_notifications_concurrent(
+            uncached,
+            registry,
+            config,
+            projects_config,
+            github_config,
+            workers=workers,
+        )
 
-            # Cache after processing: prevents re-checking until updated_at changes.
-            # Applies to all outcomes — successful missions are also deduplicated
-            # by reaction checks, but caching avoids the API call entirely.
-            _cache_notif(notif)
-
-        # Drain non-actionable notifications (ci_activity, review_requested,
+        # Drain non-actionable notifications (ci_activity, state_change,
         # etc.) to prevent accumulation that blocks future @mention detection.
         # When old notifications pile up on a thread, new @mentions may update
         # the existing notification instead of creating a fresh "mention" one.
@@ -703,6 +808,107 @@ def process_github_notifications(
         return 0
 
 
+def _process_one_notification(
+    notif: dict,
+    registry,
+    config: dict,
+    projects_config,
+    github_config: dict,
+) -> bool:
+    """Process a single notification and return whether a mission was created.
+
+    Runs the full process_single_notification flow, caches the notification,
+    marks it as read, and emits side-effect logs / Telegram notifications.
+    Designed to be safe to run concurrently from a thread pool: all shared
+    state is mutated through thread-safe APIs (lock-guarded caches, atomic
+    file writes for missions).
+    """
+    from app.github_command_handler import process_single_notification
+    from app.github_notifications import mark_notification_read
+
+    try:
+        _log_notification(notif)
+        success, error = process_single_notification(
+            notif, registry, config, projects_config,
+            github_config.get("bot_username", ""),
+            github_config.get("max_age", 24),
+        )
+
+        # Cache immediately after processing: prevents re-processing on
+        # next cycle. Must happen before the error reply attempt so that
+        # a reply failure doesn't cause the whole notification to be
+        # re-processed (which could create duplicate missions).
+        _cache_notif(notif)
+
+        # Mark as read so subsequent checks (including after restart)
+        # skip this notification. The all=true fetch still returns read
+        # notifications, but they'll be filtered by the persistent
+        # tracker or reaction-based dedup much faster.
+        thread_id = str(notif.get("id", ""))
+        if thread_id:
+            mark_notification_read(thread_id)
+
+        if success:
+            repo = notif.get("repository", {}).get("full_name", "?")
+            title = notif.get("subject", {}).get("title", "?")
+            _github_log(f"Mission queued from @mention on {repo}: {title}")
+            _notify_mission_from_mention(notif)
+            return True
+        if error:
+            repo = notif.get("repository", {}).get("full_name", "?")
+            _github_log(f"Notification error for {repo}: {error[:100]}", "warning")
+            _post_error_for_notification(notif, error)
+        return False
+    except Exception as e:
+        # A crash in one worker must not block the others. Log and move on.
+        repo = notif.get("repository", {}).get("full_name", "?")
+        log.warning("GitHub: notification worker for %s failed: %s", repo, e)
+        return False
+
+
+def _process_notifications_concurrent(
+    notifications: list,
+    registry,
+    config: dict,
+    projects_config,
+    github_config: dict,
+    *,
+    workers: int,
+) -> int:
+    """Run _process_one_notification across a thread pool.
+
+    Returns the number of missions successfully created. Falls back to
+    serial processing when workers <= 1 (avoids the ThreadPoolExecutor
+    overhead for the common single-notification case).
+    """
+    if not notifications:
+        return 0
+
+    effective_workers = min(max(1, workers), len(notifications))
+
+    if effective_workers == 1:
+        return sum(
+            1 for n in notifications
+            if _process_one_notification(
+                n, registry, config, projects_config, github_config,
+            )
+        )
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(
+        max_workers=effective_workers,
+        thread_name_prefix="gh-notif",
+    ) as pool:
+        results = list(pool.map(
+            lambda n: _process_one_notification(
+                n, registry, config, projects_config, github_config,
+            ),
+            notifications,
+        ))
+    return sum(1 for r in results if r)
+
+
 # Maximum non-actionable notifications to drain per check cycle.
 # Prevents API overload on first run after a long accumulation period.
 _MAX_DRAIN_PER_CYCLE = 30
@@ -711,7 +917,7 @@ _MAX_DRAIN_PER_CYCLE = 30
 def _drain_notifications(notifications: list) -> int:
     """Mark non-actionable notifications as read to prevent accumulation.
 
-    Non-actionable notifications (ci_activity, review_requested, state_change,
+    Non-actionable notifications (ci_activity, state_change,
     etc.) pile up on threads the bot owns. When they stay unread, new @mentions
     on those threads may update the existing notification instead of creating a
     fresh "mention"-reason notification, causing @mentions to be missed.
@@ -758,19 +964,32 @@ def _notify_mission_from_mention(notif: dict) -> None:
         subject_type = notif.get("subject", {}).get("type", "?").lower()
         subject_api_url = notif.get("subject", {}).get("url", "")
         thread_url = api_url_to_web_url(subject_api_url) if subject_api_url else ""
+
+        # Use annotated command/author from process_single_notification
+        command_name = notif.get("_koan_command", "")
+        author = notif.get("_koan_author", "")
+
+        # Build descriptive title: "📬 GitHub @user → /rebase mission queued"
+        author_part = f"@{author}" if author else "@mention"
+        command_part = f" /{command_name}" if command_name else ""
         msg = (
-            f"📬 GitHub @mention → mission queued\n"
+            f"📬 GitHub {author_part} →{command_part} mission queued\n"
             f"{repo_name} ({subject_type}): {subject_title}"
         )
         if thread_url:
             msg += f"\n{thread_url}"
-        send_telegram(msg)
+        from app.notify import NotificationPriority
+        send_telegram(msg, priority=NotificationPriority.ACTION)
     except (ImportError, OSError) as e:
         log.debug("Failed to send notification message: %s", e)
 
 
 def _post_error_for_notification(notif: dict, error: str) -> None:
-    """Post error reply to a notification if possible."""
+    """Post error reply to a notification if possible.
+
+    On failure, queues the reply for retry on the next notification cycle
+    rather than silently dropping it.
+    """
     from app.github_command_handler import (
         post_error_reply,
         resolve_project_from_notification,
@@ -786,16 +1005,244 @@ def _post_error_for_notification(notif: dict, error: str) -> None:
 
     _, owner, repo = project_info
 
+    comment_id = ""
+    comment_api_url = ""
     try:
         comment = get_comment_from_notification(notif)
-        if comment:
-            comment_id = str(comment.get("id", ""))
-            comment_api_url = comment.get("url", "")
-            if comment_id:
-                post_error_reply(owner, repo, issue_num, comment_id, error,
-                                 comment_api_url=comment_api_url)
+        if not comment:
+            return
+        comment_id = str(comment.get("id", ""))
+        comment_api_url = comment.get("url", "")
+        if not comment_id:
+            return
+        post_error_reply(owner, repo, issue_num, comment_id, error,
+                         comment_api_url=comment_api_url)
     except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as e:
-        print(f"[loop_manager] Error posting reply to GitHub: {e}", file=sys.stderr)
+        _github_log(f"Error posting reply to GitHub, queuing for retry: {e}", "warning")
+        entry = {
+            "owner": owner, "repo": repo, "issue_num": issue_num,
+            "comment_id": comment_id, "error": error,
+            "comment_api_url": comment_api_url, "attempts": 1,
+        }
+        with _pending_error_replies_lock:
+            if len(_pending_error_replies) < _MAX_PENDING_REPLIES:
+                _pending_error_replies.append(entry)
+
+
+# --- Jira notification processing ---
+
+# Throttle: minimum seconds between Jira notification checks.
+# Overridden at runtime by jira.check_interval_seconds from config.yaml.
+_JIRA_CHECK_INTERVAL = 60
+# Maximum backoff interval when checks are consistently empty.
+# Overridden at runtime by jira.max_check_interval_seconds from config.yaml.
+_JIRA_MAX_CHECK_INTERVAL = 180
+_last_jira_check: float = 0
+_last_jira_check_iso: str = ""
+_consecutive_jira_empty: int = 0
+_jira_interval_loaded: bool = False
+_jira_config_logged: bool = False
+# Lock protecting all Jira module-level state.
+_jira_state_lock = threading.Lock()
+
+
+def _jira_log(message: str, level: str = "info") -> None:
+    """Log a message for Jira notifications."""
+    if level == "debug":
+        log.debug("[jira] %s", message)
+    elif level == "warning":
+        log.warning("[jira] %s", message)
+    else:
+        log.info("[jira] %s", message)
+
+
+def _get_effective_jira_interval_locked() -> int:
+    """Compute Jira check interval with backoff. Caller must hold _jira_state_lock."""
+    if _consecutive_jira_empty <= 0:
+        return _JIRA_CHECK_INTERVAL
+    return min(
+        _JIRA_CHECK_INTERVAL * (2 ** _consecutive_jira_empty),
+        _JIRA_MAX_CHECK_INTERVAL,
+    )
+
+
+def _load_processed_jira_tracker(instance_dir: str):
+    """Load the persistent Jira processed-comment tracker."""
+    from app.jira_notifications import _load_processed_tracker
+    tracker_path = Path(instance_dir) / ".jira-processed.json"
+    return _load_processed_tracker(tracker_path), tracker_path
+
+
+def process_jira_notifications(
+    koan_root: str,
+    instance_dir: str,
+    force: bool = False,
+) -> int:
+    """Check Jira comments for @mentions and create missions.
+
+    Respects throttling with exponential backoff: starts at
+    check_interval_seconds (default 60s), doubles on each empty
+    result (up to max_check_interval_seconds), resets on finding mentions.
+
+    Args:
+        koan_root: Path to koan root directory.
+        instance_dir: Path to instance directory.
+        force: When True, bypass throttle and reset backoff (from /check_notifications).
+
+    Returns:
+        Number of missions created.
+    """
+    global _last_jira_check, _last_jira_check_iso, _consecutive_jira_empty
+    global _JIRA_CHECK_INTERVAL, _JIRA_MAX_CHECK_INTERVAL, _jira_interval_loaded
+    global _jira_config_logged
+
+    # Load configured intervals on first call (lazy)
+    with _jira_state_lock:
+        need_interval_load = not _jira_interval_loaded
+
+    if need_interval_load:
+        try:
+            from app.jira_config import get_jira_check_interval, get_jira_max_check_interval
+            from app.utils import load_config
+
+            cfg = load_config()
+            with _jira_state_lock:
+                _JIRA_CHECK_INTERVAL = get_jira_check_interval(cfg)
+                _JIRA_MAX_CHECK_INTERVAL = get_jira_max_check_interval(cfg)
+                _jira_interval_loaded = True
+        except (ImportError, OSError, ValueError) as e:
+            log.debug("Could not load Jira check interval from config: %s", e)
+
+    now = time.time()
+    with _jira_state_lock:
+        if force:
+            _consecutive_jira_empty = 0
+        effective_interval = _get_effective_jira_interval_locked()
+        if not force and now - _last_jira_check < effective_interval:
+            return 0
+        _last_jira_check = now
+
+    if force:
+        _jira_log("Forced notification check (via /check_notifications)")
+
+    try:
+        from app.jira_config import (
+            get_jira_enabled,
+            get_jira_nickname,
+            get_jira_project_map,
+            validate_jira_config,
+        )
+        from app.utils import load_config
+
+        config = load_config()
+
+        if not get_jira_enabled(config):
+            with _jira_state_lock:
+                if not _jira_config_logged:
+                    log.debug("Jira integration disabled (jira.enabled not set in config.yaml)")
+                    _jira_config_logged = True
+            return 0
+
+        error = validate_jira_config(config)
+        if error:
+            with _jira_state_lock:
+                if not _jira_config_logged:
+                    _jira_log(f"Config error: {error}", "warning")
+                    _jira_config_logged = True
+            return 0
+
+        nickname = get_jira_nickname(config)
+        project_map = get_jira_project_map(config)
+        from app.jira_config import get_jira_branch_map
+        branch_map = get_jira_branch_map(config)
+
+        with _jira_state_lock:
+            if not _jira_config_logged:
+                _jira_log(
+                    f"Monitoring @{nickname} mentions across {len(project_map)} project(s)"
+                )
+                _jira_config_logged = True
+
+        # Determine since window
+        from datetime import timedelta, timezone
+
+        with _jira_state_lock:
+            since_value = _last_jira_check_iso or None
+
+        if since_value is None:
+            from app.jira_config import get_jira_max_age_hours
+            from datetime import datetime as _dt
+
+            max_age = get_jira_max_age_hours(config)
+            since_value = (
+                _dt.now(timezone.utc) - timedelta(hours=max_age)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _jira_log(
+                f"Cold start: fetching mentions since {since_value} "
+                f"(max_age={max_age}h lookback)"
+            )
+
+        from app.jira_notifications import fetch_jira_mentions
+
+        result = fetch_jira_mentions(config, project_map, since_iso=since_value)
+
+        from datetime import datetime as _dt
+
+        new_iso = _dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with _jira_state_lock:
+            _last_jira_check_iso = new_iso
+
+        mentions = result.mentions
+
+        if mentions:
+            _jira_log(f"Found {len(mentions)} @{nickname} mention(s)")
+        else:
+            log.debug("Jira: no @%s mentions found", nickname)
+
+        # Load persistent processed tracker
+        processed_set, tracker_path = _load_processed_jira_tracker(instance_dir)
+
+        # Build skill registry (reuse GitHub's cached registry helper)
+        registry = _build_skill_registry(instance_dir)
+
+        from app.jira_command_handler import process_jira_mention
+
+        missions_created = 0
+        for mention in mentions:
+            success, error_msg = process_jira_mention(
+                mention, registry, config, processed_set,
+                branch_map=branch_map,
+            )
+            if success:
+                missions_created += 1
+                issue_key = mention.get("issue_key", "?")
+                _jira_log(f"Mission queued from @{nickname} mention on {issue_key}")
+            elif error_msg:
+                log.debug("Jira: mention skipped: %s", error_msg)
+
+        # Persist updated tracker
+        if mentions:
+            from app.jira_notifications import _save_processed_tracker
+            _save_processed_tracker(tracker_path, processed_set)
+
+        # Update backoff
+        with _jira_state_lock:
+            if missions_created > 0 or mentions:
+                _consecutive_jira_empty = 0
+            else:
+                _consecutive_jira_empty += 1
+                if _consecutive_jira_empty > 1:
+                    log.debug(
+                        "Jira: no mentions (%d consecutive), next check in %ds",
+                        _consecutive_jira_empty,
+                        _get_effective_jira_interval_locked(),
+                    )
+
+        return missions_created
+
+    except (ImportError, OSError, ValueError, RuntimeError) as e:
+        log.warning("Jira notification check failed: %s", e)
+        return 0
 
 
 # --- Interruptible sleep ---
@@ -806,6 +1253,23 @@ def _check_signal_file(koan_root: str, filename: str) -> bool:
     return os.path.isfile(os.path.join(koan_root, filename))
 
 
+def _consume_check_notifications_signal(koan_root: str) -> bool:
+    """Check and consume the check-notifications signal file.
+
+    Returns True if the signal was present (and removes it).
+    Used by process_github_notifications / process_jira_notifications
+    to bypass throttle when the user requested /check_notifications.
+    """
+    from app.signals import CHECK_NOTIFICATIONS_FILE
+
+    path = os.path.join(koan_root, CHECK_NOTIFICATIONS_FILE)
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def check_pending_missions(instance_dir: str) -> bool:
     """Check if there are pending missions in missions.md."""
     try:
@@ -814,7 +1278,7 @@ def check_pending_missions(instance_dir: str) -> bool:
     except FileNotFoundError:
         return False
     except (OSError, ValueError) as e:
-        print(f"[loop_manager] Error reading missions.md: {e}", file=sys.stderr)
+        _log_loop("error", f"Error reading missions.md: {e}")
         return False
 
 
@@ -823,6 +1287,7 @@ def interruptible_sleep(
     koan_root: str,
     instance_dir: str,
     check_interval: int = 10,
+    wake_on_mission: bool = True,
 ) -> str:
     """Sleep for a given interval, waking early on events.
 
@@ -834,6 +1299,11 @@ def interruptible_sleep(
         koan_root: Path to koan root directory.
         instance_dir: Path to instance directory.
         check_interval: How often to check for wake events (seconds).
+        wake_on_mission: When True (default), return early if pending
+            missions or GitHub/Jira mission-inducing notifications appear.
+            Set False for wait states where pending missions are the
+            blocker (e.g. branch-saturated) and waking would just tight-
+            loop back into the same blocked state.
 
     Returns:
         Reason for waking: "timeout", "mission", "stop", "pause", "restart", "shutdown".
@@ -841,7 +1311,7 @@ def interruptible_sleep(
     elapsed = 0
     while elapsed < interval:
         # Check signals BEFORE sleeping so events are detected immediately.
-        if check_pending_missions(instance_dir):
+        if wake_on_mission and check_pending_missions(instance_dir):
             return "mission"
         if _check_signal_file(koan_root, ".koan-stop"):
             return "stop"
@@ -856,15 +1326,36 @@ def interruptible_sleep(
         from app.health_check import write_run_heartbeat
         write_run_heartbeat(koan_root)
 
+        # Feature tip: surface an unseen skill to the user (throttled)
+        from app.feature_tips import maybe_send_feature_tip
+        maybe_send_feature_tip(instance_dir)
+
         # Run periodic heartbeat checks (throttled to once per 30 min)
         from app.heartbeat import run_stale_mission_check, run_disk_space_check
         run_stale_mission_check(instance_dir)
         run_disk_space_check(koan_root)
 
+        # Drain CI queue (throttled to once per 30s).
+        # Completed CI runs inject missions or log success — detected faster
+        # than waiting for the next full iteration.
+        _drain_ci_queue_during_sleep(instance_dir, elapsed)
+
+        # Check if /check_notifications was requested (consume signal once,
+        # pass force=True to both GitHub and Jira checks).
+        force_check = _consume_check_notifications_signal(koan_root)
+
         # Check GitHub notifications (throttled to once per 60s).
         # Track wall time: API calls can be slow and should count toward elapsed.
         t0 = time.monotonic()
-        if process_github_notifications(koan_root, instance_dir) > 0:
+        gh_new = process_github_notifications(koan_root, instance_dir, force=force_check)
+        if wake_on_mission and gh_new > 0:
+            return "mission"
+        elapsed += time.monotonic() - t0
+
+        # Check Jira notifications (throttled to once per 60s).
+        t0 = time.monotonic()
+        jira_new = process_jira_notifications(koan_root, instance_dir, force=force_check)
+        if wake_on_mission and jira_new > 0:
             return "mission"
         elapsed += time.monotonic() - t0
 
@@ -929,8 +1420,10 @@ def _cli_validate_projects(args: list) -> None:
         print(error, file=sys.stderr)
         sys.exit(1)
 
+    # Only list projects with valid directories
     for name, path in projects:
-        print(f"{name}:{path}")
+        if os.path.isdir(path):
+            print(f"{name}:{path}")
 
 
 def _cli_lookup_project(args: list) -> None:

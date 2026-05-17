@@ -22,6 +22,7 @@ class ErrorCategory(Enum):
     RETRYABLE = "retryable"
     TERMINAL = "terminal"
     QUOTA = "quota"
+    AUTH = "auth"
     UNKNOWN = "unknown"
 
 
@@ -61,6 +62,19 @@ _TERMINAL_PATTERNS = [
     r"403\s+Forbidden",
 ]
 
+# Patterns indicating Claude is logged out / OAuth expired — needs human
+# intervention (re-login).  Checked before generic TERMINAL so we can
+# distinguish "auth expired, requeue the mission" from "bad API key, give up".
+_AUTH_PATTERNS = [
+    r"please\s+run\s+/login",
+    r"oauth\s+token\s+has\s+expired",
+    r"please\s+obtain\s+a\s+new\s+token",
+    r"refresh\s+your\s+existing\s+token",
+    r"not\s+authenticated",
+    r"please\s+log\s+in",
+]
+
+_AUTH_RE = re.compile("|".join(_AUTH_PATTERNS), re.IGNORECASE)
 _RETRYABLE_RE = re.compile("|".join(_RETRYABLE_PATTERNS), re.IGNORECASE)
 _TERMINAL_RE = re.compile("|".join(_TERMINAL_PATTERNS), re.IGNORECASE)
 
@@ -85,15 +99,30 @@ def classify_cli_error(
     if exit_code == 0:
         return ErrorCategory.UNKNOWN
 
+    # Coerce to strings — callers (and tests using MagicMock) may pass
+    # non-string values; regex search requires str input.
+    stdout = str(stdout) if stdout else ""
+    stderr = str(stderr) if stderr else ""
     combined = f"{stdout}\n{stderr}"
 
     # Check quota first — quota_handler is the authority for quota detection.
     # A 429 could be rate-limiting or quota exhaustion; defer to the
     # specialized detector which has provider-specific patterns.
-    from app.quota_handler import detect_quota_exhaustion
+    #
+    # IMPORTANT: Use the same split-detection strategy as handle_quota_exhaustion
+    # in quota_handler.py.  Loose patterns like "rate limit" and "too many
+    # requests" can appear in Claude's stdout when it discusses API rate
+    # limiting in its response text.  Only strict patterns are safe for stdout.
+    from app.quota_handler import _STRICT_QUOTA_RE, _QUOTA_RE
 
-    if detect_quota_exhaustion(combined):
+    if bool(_QUOTA_RE.search(stderr)) or bool(_STRICT_QUOTA_RE.search(stdout)):
         return ErrorCategory.QUOTA
+
+    # Auth errors — Claude is logged out, needs human intervention.
+    # Checked before generic TERMINAL so "401 + OAuth expired" routes here
+    # instead of falling into the generic "unauthorized" terminal bucket.
+    if _AUTH_RE.search(combined):
+        return ErrorCategory.AUTH
 
     # Terminal errors — don't retry
     if _TERMINAL_RE.search(combined):

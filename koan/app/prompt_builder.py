@@ -29,10 +29,41 @@ Usage:
 """
 
 import argparse
+import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Tuple
+
+logger = logging.getLogger(__name__)
+
+# Matches template placeholders like {INSTANCE}, {PROJECT_NAME}, etc.
+# Only uppercase letters, digits, and underscores — at least 2 chars to avoid
+# false positives on prose like {n} or {x}.
+_PLACEHOLDER_RE = re.compile(r"\{([A-Z][A-Z_0-9]+)\}")
+
+
+def _get_caveman_section() -> str:
+    """Return the caveman output optimization section if enabled.
+
+    Delegates to :func:`app.caveman.get_caveman_section` so the agent loop
+    and skill runners share a single resolution path.  The agent loop has no
+    associated skill, so only the global ``optimizations.caveman.enabled``
+    flag governs the result here.
+
+    Failures are non-fatal — caveman is an optimization, not a correctness
+    feature — but are logged so silent regressions stay visible.  This
+    matches the catch-and-log pattern used in
+    ``app.prompts._maybe_append_caveman`` and ``app.awake._build_chat_prompt``
+    so all three caveman injection sites behave the same way.
+    """
+    try:
+        from app.caveman import get_caveman_section
+        return get_caveman_section()
+    except Exception as e:
+        logger.warning("caveman section unavailable: %s", e)
+        return ""
 
 
 def _get_language_section() -> str:
@@ -45,6 +76,43 @@ def _get_language_section() -> str:
     except (ImportError, OSError):
         pass
     return ""
+
+
+def _get_rtk_section(project_name: str = "") -> str:
+    """Return the RTK awareness section when rtk is enabled for this context.
+
+    Mirrors :func:`_get_caveman_section` but with one extra gate: a project
+    can opt out via ``projects.yaml`` even when the global config has rtk
+    enabled (``get_project_rtk_enabled``).  The dual gate keeps two
+    legitimate concerns separate — "do I want rtk on this Kōan instance"
+    and "does this project's tooling tolerate rtk's filters".
+
+    Failures are non-fatal — like caveman, rtk is an optimization, not a
+    correctness feature — but are logged so silent regressions stay
+    visible.
+    """
+    try:
+        from app.config import is_rtk_awareness_enabled
+        if not is_rtk_awareness_enabled():
+            return ""
+        if project_name:
+            from app.projects_config import get_project_rtk_enabled, load_projects_config
+            try:
+                koan_root = os.environ.get("KOAN_ROOT", "")
+                projects_cfg = load_projects_config(koan_root) if koan_root else None
+                if projects_cfg and not get_project_rtk_enabled(projects_cfg, project_name):
+                    return ""
+            except (OSError, ValueError, KeyError):
+                # Project resolution failed — fall through to global decision
+                # rather than silently dropping the section.
+                pass
+        from app.prompts import load_prompt
+        return "\n\n" + load_prompt("rtk-awareness")
+    except (OSError, FileNotFoundError):
+        return ""
+    except Exception as e:
+        logger.warning("rtk awareness section unavailable: %s", e)
+        return ""
 
 
 def _load_config_safe() -> dict:
@@ -181,6 +249,94 @@ def _get_drift_section(instance: str, project_name: str, project_path: str) -> s
     return ""
 
 
+def _load_recall_config() -> Tuple[int, int]:
+    """Return ``(max_relevant_learnings, recent_hedge)`` from config.yaml.
+
+    Defaults to ``(40, 5)`` per issue #1306. ``recent_hedge`` is currently
+    config-only (no UI surface) and can be tuned via the same ``memory:``
+    block as the other learnings caps.
+    """
+    cfg = _load_config_safe()
+    mem = cfg.get("memory", {}) or {}
+    try:
+        max_k = int(mem.get("max_relevant_learnings", 40))
+    except (TypeError, ValueError):
+        max_k = 40
+    try:
+        hedge = int(mem.get("recall_recent_hedge", 5))
+    except (TypeError, ValueError):
+        hedge = 5
+    return max(0, max_k), max(0, hedge)
+
+
+def _get_learnings_section(
+    instance: str,
+    project_name: str,
+    mission_title: str,
+    focus_area: str,
+) -> str:
+    """Return a pre-filtered learnings section for the agent prompt.
+
+    Reads ``{instance}/memory/projects/{project_name}/learnings.md`` and
+    runs Jaccard similarity against the mission text (or ``focus_area`` in
+    autonomous mode) to keep only the most relevant lines plus a small
+    recency hedge. The ``[recall:full]`` tag in the mission title bypasses
+    filtering entirely.
+
+    Returns an empty string when the file is missing, empty, or cannot be
+    read — the agent will still fall back to reading the file directly via
+    the agent.md instructions, so this is purely an enrichment hook.
+
+    Issue #1306.
+    """
+    try:
+        path = Path(instance) / "memory" / "projects" / project_name / "learnings.md"
+        if not path.is_file():
+            return ""
+        content = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[prompt_builder] learnings load failed: %s", e)
+        return ""
+
+    if not content.strip():
+        return ""
+
+    from app.memory_recall import has_recall_full_tag, score_and_select
+
+    # Mission text drives scoring. In autonomous mode (no title) fall back
+    # to the focus area so the filter still does *something* useful.
+    scoring_text = mission_title or focus_area or ""
+
+    if has_recall_full_tag(mission_title):
+        # Operator explicitly asked for everything — preserve the file as-is.
+        body = content.rstrip()
+        kept = body.count("\n") + 1 if body else 0
+        header = (
+            "# Project Learnings (full, [recall:full] override)\n\n"
+            f"Loaded {kept} lines verbatim from learnings.md.\n\n"
+        )
+        return f"\n\n{header}{body}\n"
+
+    max_k, hedge = _load_recall_config()
+    selected, total, dropped = score_and_select(
+        content, scoring_text, max_k=max_k, recent_hedge=hedge,
+    )
+
+    if not selected:
+        return ""
+
+    print(f"[prompt_builder] learnings recall: kept {len(selected)}/{total} (dropped {dropped}, max_k={max_k}, hedge={hedge})", file=sys.stderr)
+
+    header = (
+        "# Project Learnings (filtered)\n\n"
+        f"Showing {len(selected)} of {total} learnings ranked by relevance to "
+        "the current task. Use the `[recall:full]` tag in your mission text "
+        "to bypass filtering and load the full file.\n\n"
+    )
+    body = "\n".join(selected)
+    return f"\n\n{header}{body}\n"
+
+
 def _get_mission_type_section(mission_title: str) -> str:
     """Return type-specific guidance based on mission classification.
 
@@ -245,6 +401,33 @@ def _get_tdd_section(mission_title: str) -> str:
     return load_prompt("tdd-mode")
 
 
+def _get_testing_antipatterns_section(mission_title: str) -> str:
+    """Return the testing anti-patterns reference for test-involving missions.
+
+    Injected when:
+    - Mission is tagged [tdd], OR
+    - Mission title contains keywords that typically require test additions
+
+    Skipped for non-testing missions (docs, reviews, analysis) and for
+    autonomous mode (no mission title) to avoid wasting context.
+    """
+    if not mission_title:
+        return ""
+
+    from app.missions import extract_tdd_tag
+
+    from app.prompts import load_prompt
+
+    if extract_tdd_tag(mission_title):
+        return load_prompt("testing-anti-patterns")
+
+    from app.mission_verifier import expects_tests
+    if expects_tests(mission_title):
+        return load_prompt("testing-anti-patterns")
+
+    return ""
+
+
 def _get_verbose_section(instance: str) -> str:
     """Build the verbose mode section if .koan-verbose exists."""
     koan_root = str(Path(instance).parent)
@@ -273,8 +456,11 @@ def _get_security_flagging_section(mission_title: str, autonomous_mode: str) -> 
 def _build_mission_instruction(mission_title: str, project_name: str) -> str:
     """Build the mission instruction text for the agent prompt."""
     if mission_title:
+        from app.prompt_guard import fence_external_data
+
+        fenced = fence_external_data(mission_title, "mission text")
         return (
-            f"Your assigned mission is: **{mission_title}** "
+            f"Your assigned mission is:\n\n{fenced}\n\n"
             "The mission is already marked In Progress. "
             "Follow the Mission Execution Workflow below."
         )
@@ -283,6 +469,74 @@ def _build_mission_instruction(mission_title: str, project_name: str) -> str:
         f"{project_name} in missions.md (check [project:{project_name}] "
         f"tags and ### project:{project_name} sub-headers). "
         "If none found, proceed to autonomous mode."
+    )
+
+
+def _warn_unresolved_placeholders(text: str, template_name: str) -> None:
+    """Log a warning if any {PLACEHOLDER} tokens remain after substitution."""
+    unresolved = _PLACEHOLDER_RE.findall(text)
+    if unresolved:
+        unique = sorted(set(unresolved))
+        logger.warning(
+            "[prompt_builder] Unresolved placeholders in '%s': %s",
+            template_name,
+            ", ".join(f"{{{p}}}" for p in unique),
+        )
+
+
+def _is_focus_mode() -> bool:
+    """Return True if focus mode is enabled (config-level or file-based).
+
+    Focus mode disables autonomous GitHub issue pickup — the agent prompt
+    replaces the ``GitHub Issue Selection`` section with an explicit
+    instruction to only act on explicitly-queued missions.
+
+    Checks both config.yaml/env (permanent) and .koan-focus file (temporary).
+    """
+    try:
+        from app.config import is_focus_mode
+        if is_focus_mode():
+            return True
+    except (ImportError, OSError, ValueError):
+        pass
+    # Also check file-based focus (.koan-focus from /focus command)
+    try:
+        koan_root = os.environ.get("KOAN_ROOT", "")
+        if koan_root:
+            from app.focus_manager import check_focus
+            return check_focus(koan_root) is not None
+    except (ImportError, OSError, ValueError):
+        pass
+    return False
+
+
+_GITHUB_ISSUE_SECTION_RE = re.compile(
+    r"## GitHub Issue Selection.*?(?=\n# Autonomy\b|\n## |\Z)",
+    re.DOTALL,
+)
+
+
+_FOCUS_MODE_REPLACEMENT = (
+    "## Focus Mode (autonomous GitHub pickup disabled)\n\n"
+    "Kōan is running in **focus mode**. You MUST NOT pick up "
+    "GitHub issues on your own.\n\n"
+    "- Only work on the explicit mission assigned above (if any).\n"
+    "- If no mission is assigned, do nothing autonomously — exit gracefully.\n"
+    "- Do not browse open issues, do not create branches for unassigned work,\n"
+    "  do not open speculative PRs.\n"
+    "- If the assigned mission references a specific GitHub issue, you may\n"
+    "  work on that issue only.\n\n"
+)
+
+
+def _apply_focus_mode_override(prompt: str) -> str:
+    """Replace the GitHub Issue Selection section when focus mode is active."""
+    if not _is_focus_mode():
+        return prompt
+    return _GITHUB_ISSUE_SECTION_RE.sub(
+        _FOCUS_MODE_REPLACEMENT.rstrip(),
+        prompt,
+        count=1,
     )
 
 
@@ -302,7 +556,7 @@ def _load_agent_template(
 
     mission_instruction = _build_mission_instruction(mission_title, project_name)
     branch_prefix = _get_branch_prefix()
-    return load_prompt(
+    result = load_prompt(
         "agent",
         INSTANCE=instance,
         PROJECT_PATH=project_path,
@@ -315,6 +569,9 @@ def _load_agent_template(
         MISSION_INSTRUCTION=mission_instruction,
         BRANCH_PREFIX=branch_prefix,
     )
+    result = _apply_focus_mode_override(result)
+    _warn_unresolved_placeholders(result, "agent")
+    return result
 
 
 def _append_spec(prompt: str, spec_content: str, mission_title: str) -> str:
@@ -369,6 +626,9 @@ def build_agent_prompt(
     # Append mission type guidance (mission-driven runs only)
     prompt += _get_mission_type_section(mission_title)
 
+    # Append task-aware filtered learnings (issue #1306)
+    prompt += _get_learnings_section(instance, project_name, mission_title, focus_area)
+
     # Append merge policy
     prompt += _get_merge_policy(project_name)
 
@@ -397,6 +657,9 @@ def build_agent_prompt(
     # Append TDD mode section if mission is tagged [tdd]
     prompt += _get_tdd_section(mission_title)
 
+    # Append testing anti-patterns reference for [tdd] or test-expecting missions
+    prompt += _get_testing_antipatterns_section(mission_title)
+
     # Append verification gate for mission-driven runs
     prompt += _get_verification_gate_section(mission_title)
 
@@ -405,6 +668,12 @@ def build_agent_prompt(
 
     # Append verbose mode section if active
     prompt += _get_verbose_section(instance)
+
+    # Append caveman output optimization (token reduction in Claude's output)
+    prompt += _get_caveman_section()
+
+    # Append RTK awareness (token reduction in Claude's tool input)
+    prompt += _get_rtk_section(project_name)
 
     # Append language preference (overrides soul.md default)
     prompt += _get_language_section()
@@ -446,6 +715,11 @@ def build_agent_prompt_parts(
     # Append mission type guidance (mission-driven runs only)
     user_prompt += _get_mission_type_section(mission_title)
 
+    # Append task-aware filtered learnings (issue #1306).
+    # Lives in the user prompt because its content varies with each mission
+    # — putting it in the system prompt would defeat prompt caching.
+    user_prompt += _get_learnings_section(instance, project_name, mission_title, focus_area)
+
     # Append staleness warning (all autonomous modes — cheap local read)
     if not mission_title:
         user_prompt += _get_staleness_section(instance, project_name)
@@ -474,6 +748,10 @@ def build_agent_prompt_parts(
     if tdd:
         sys_parts.append(tdd)
 
+    antipatterns = _get_testing_antipatterns_section(mission_title)
+    if antipatterns:
+        sys_parts.append(antipatterns)
+
     verification = _get_verification_gate_section(mission_title)
     if verification:
         sys_parts.append(verification)
@@ -485,6 +763,14 @@ def build_agent_prompt_parts(
     verbose = _get_verbose_section(instance)
     if verbose:
         sys_parts.append(verbose)
+
+    caveman = _get_caveman_section()
+    if caveman:
+        sys_parts.append(caveman)
+
+    rtk = _get_rtk_section(project_name)
+    if rtk:
+        sys_parts.append(rtk)
 
     security = _get_security_flagging_section(mission_title, autonomous_mode)
     if security:
@@ -503,6 +789,7 @@ def build_contemplative_prompt(
     instance: str,
     project_name: str,
     session_info: str,
+    github_nickname: str = "",
 ) -> str:
     """Build the contemplative session prompt from template.
 
@@ -510,6 +797,9 @@ def build_contemplative_prompt(
         instance: Path to instance directory
         project_name: Current project name
         session_info: Context about current session state
+        github_nickname: Bot's GitHub nickname for pre-check instructions.
+            Pass empty string (default) when GitHub is not configured — the
+            prompt's GitHub section will be omitted automatically.
 
     Returns:
         Complete contemplative prompt string
@@ -521,7 +811,28 @@ def build_contemplative_prompt(
         INSTANCE=instance,
         PROJECT_NAME=project_name,
         SESSION_INFO=session_info,
+        GITHUB_NICKNAME=github_nickname,
     )
+
+    # Strip the GitHub pre-check block when no nickname is configured.
+    # The block is delimited by {GITHUB_CHECK_BLOCK_START} / {GITHUB_CHECK_BLOCK_END}
+    # sentinel lines in the template.
+    if not github_nickname:
+        import re
+        prompt = re.sub(
+            r"\{GITHUB_CHECK_BLOCK_START\}.*?\{GITHUB_CHECK_BLOCK_END\}\n?",
+            "",
+            prompt,
+            flags=re.DOTALL,
+        )
+    else:
+        # Remove the sentinel markers, leaving the block content intact.
+        prompt = prompt.replace("{GITHUB_CHECK_BLOCK_START}\n", "")
+        prompt = prompt.replace("{GITHUB_CHECK_BLOCK_END}\n", "")
+        prompt = prompt.replace("{GITHUB_CHECK_BLOCK_START}", "")
+        prompt = prompt.replace("{GITHUB_CHECK_BLOCK_END}", "")
+
+    _warn_unresolved_placeholders(prompt, "contemplative")
 
     # Append language preference (overrides soul.md default)
     prompt += _get_language_section()
@@ -553,6 +864,7 @@ def main():
     contemplate_parser.add_argument("--instance", required=True)
     contemplate_parser.add_argument("--project-name", required=True)
     contemplate_parser.add_argument("--session-info", required=True)
+    contemplate_parser.add_argument("--github-nickname", default="")
 
     args = parser.parse_args()
 
@@ -573,6 +885,7 @@ def main():
             instance=args.instance,
             project_name=args.project_name,
             session_info=args.session_info,
+            github_nickname=args.github_nickname,
         ))
 
 

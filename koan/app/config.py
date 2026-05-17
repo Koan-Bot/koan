@@ -14,6 +14,7 @@ Functions here call it via import to ensure mocks propagate correctly.
 
 import os
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 
@@ -98,7 +99,7 @@ def get_mission_tools(project_name: str = "") -> str:
 
     Missions run with full tool access including Bash for code execution.
 
-    Config key: tools.mission (default: Read, Glob, Grep, Edit, Write, Bash)
+    Config key: tools.mission (default: Read, Glob, Grep, Edit, Write, Bash, Skill)
     Per-project override: projects.yaml tools.mission
 
     Args:
@@ -107,7 +108,7 @@ def get_mission_tools(project_name: str = "") -> str:
     Returns:
         Comma-separated tool names.
     """
-    return _get_tools_for_role("mission", ["Read", "Glob", "Grep", "Edit", "Write", "Bash"], project_name)
+    return _get_tools_for_role("mission", ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "Skill"], project_name)
 
 
 def get_contemplative_tools(project_name: str = "") -> str:
@@ -178,6 +179,104 @@ def get_model_config(project_name: str = "") -> dict:
     return result
 
 
+def get_mcp_configs(project_name: str = "") -> List[str]:
+    """Get MCP server config file paths from config.yaml with per-project overrides.
+
+    Resolution order:
+    1. projects.yaml mcp list for the project (replaces global if set)
+    2. config.yaml mcp list
+    3. Empty list (no MCP servers)
+
+    Args:
+        project_name: Optional project name for per-project overrides.
+
+    Returns:
+        List of file paths to MCP config JSON files.
+    """
+    config = _load_config()
+    result = config.get("mcp", [])
+    if not isinstance(result, list):
+        result = []
+
+    # Per-project override replaces global list entirely
+    project_overrides = _load_project_overrides(project_name)
+    project_mcp = project_overrides.get("mcp")
+    if project_mcp is not None:
+        result = project_mcp if isinstance(project_mcp, list) else []
+
+    return [entry for entry in result if isinstance(entry, str) and entry]
+
+
+# Default tier-to-resource mapping used when complexity_routing is enabled
+# but specific tier values are absent from config.yaml.
+_COMPLEXITY_ROUTING_DEFAULTS: dict = {
+    "trivial": {"model": "haiku", "max_turns": 50, "timeout_multiplier": 0.5},
+    "simple":  {"model": "sonnet", "max_turns": 100, "timeout_multiplier": 0.75},
+    "medium":  {"model": "",       "max_turns": 100, "timeout_multiplier": 1.0},
+    "complex": {"model": "",       "max_turns": 500, "timeout_multiplier": 1.5},
+}
+
+
+def get_complexity_routing_config(project_name: str = "") -> Optional[dict]:
+    """Get complexity routing configuration with per-project overrides.
+
+    Resolution order:
+    1. Per-project ``complexity_routing`` key in projects.yaml (if set).
+       - A bare ``false`` / disabled flag disables routing for that project.
+    2. Global ``complexity_routing`` key in config.yaml.
+    3. Returns ``None`` when routing is disabled or not configured.
+
+    When routing is enabled the returned dict has a ``tiers`` sub-dict
+    mapping tier name → {model, max_turns, timeout_multiplier}.
+
+    An empty model string means "use whatever models.mission resolves to"
+    (no override).
+
+    Args:
+        project_name: Optional project name for per-project overrides.
+
+    Returns:
+        Dict with ``enabled`` and ``tiers`` keys, or ``None`` when disabled.
+    """
+    config = _load_config()
+    global_routing = config.get("complexity_routing", {})
+
+    # Per-project override — resolve before merging with global
+    project_overrides = _load_project_overrides(project_name)
+    project_routing = project_overrides.get("complexity_routing")
+
+    # A bare False or {"enabled": false} at project level disables entirely
+    if project_routing is False or (
+        isinstance(project_routing, dict)
+        and not project_routing.get("enabled", True)
+    ):
+        return None
+
+    # Merge: start with global, apply project-level tier overrides
+    if isinstance(project_routing, dict):
+        routing = {**global_routing, **project_routing}
+    else:
+        routing = global_routing if isinstance(global_routing, dict) else {}
+
+    # Disabled at global level
+    if not routing.get("enabled", False):
+        return None
+
+    # Build merged tier map — fill missing tiers from defaults
+    raw_tiers = routing.get("tiers", {})
+    if not isinstance(raw_tiers, dict):
+        raw_tiers = {}
+
+    tiers: dict = {}
+    for tier_name, tier_defaults in _COMPLEXITY_ROUTING_DEFAULTS.items():
+        override = raw_tiers.get(tier_name, {})
+        if not isinstance(override, dict):
+            override = {}
+        tiers[tier_name] = {**tier_defaults, **override}
+
+    return {"enabled": True, "tiers": tiers}
+
+
 def _safe_int(value, default: int) -> int:
     """Safely convert a config value to int, returning default on failure."""
     try:
@@ -193,6 +292,55 @@ def get_start_on_pause() -> bool:
     """
     config = _load_config()
     return bool(config.get("start_on_pause", False))
+
+
+def is_focus_mode() -> bool:
+    """Check if permanent focus mode is enabled via config.
+
+    Focus mode disables all autonomous work so Kōan only runs missions
+    that were explicitly queued (via Telegram, recurring, or GitHub
+    @mention). No contemplative sessions, no DEEP mode, no exploration
+    fallback.
+
+    This is the config-level permanent switch. The ``/focus`` Telegram
+    command provides time-bounded focus via ``.koan-focus`` file — both
+    mechanisms produce the same runtime behavior.
+
+    Resolution order:
+    1. ``KOAN_FOCUS`` env var (truthy: ``1``, ``true``, ``yes``, ``on``)
+    2. ``focus`` key in ``config.yaml``
+    3. Default: ``False``
+
+    Returns:
+        True when permanent focus mode is active.
+    """
+    env_value = os.environ.get("KOAN_FOCUS", "").strip().lower()
+    if env_value in ("1", "true", "yes", "on"):
+        return True
+    if env_value in ("0", "false", "no", "off"):
+        return False
+    config = _load_config()
+    return bool(config.get("focus", False))
+
+
+def get_start_passive() -> bool:
+    """Check if start_passive is enabled in config.yaml.
+
+    Returns True if koan should boot directly into passive mode
+    (read-only: no missions, no exploration, no Claude CLI calls).
+    """
+    config = _load_config()
+    return bool(config.get("start_passive", False))
+
+
+def get_startup_reflection() -> bool:
+    """Check if startup_reflection is enabled in config.yaml.
+
+    Returns True if koan should run the self-reflection check on startup.
+    Defaults to False to avoid unexpected Claude CLI calls at boot time.
+    """
+    config = _load_config()
+    return bool(config.get("startup_reflection", False))
 
 
 def get_auto_pause() -> bool:
@@ -284,6 +432,24 @@ def get_interval_seconds() -> int:
     return _safe_int(config.get("interval_seconds", 300), 300)
 
 
+def get_same_project_stickiness_percent() -> int:
+    """Get same-project stickiness chance (0-100) for cache reuse.
+
+    When > 0, autonomous exploration may intentionally stay on the same
+    project as the previous run with this probability. This helps keep
+    prompt prefixes cache-hot across consecutive runs on the same project.
+
+    Config key: prompt_caching.same_project_stickiness_percent
+    Default: 0 (disabled, preserves legacy anti-repeat behavior)
+    """
+    config = _load_config()
+    prompt_cfg = config.get("prompt_caching", {})
+    if not isinstance(prompt_cfg, dict):
+        return 0
+    value = _safe_int(prompt_cfg.get("same_project_stickiness_percent", 0), 0)
+    return max(0, min(100, value))
+
+
 def get_fast_reply_model() -> str:
     """Get model to use for fast replies (command handlers like /usage, /sparring).
 
@@ -326,13 +492,13 @@ def get_skill_timeout() -> int:
     killed.  This applies to the heavy-lifting skills that invoke Claude
     with full tool access.
 
-    Config key: skill_timeout (default: 3600 — 60 minutes).
+    Config key: skill_timeout (default: 7200 — 2 hours).
 
     Returns:
         Timeout in seconds.
     """
     config = _load_config()
-    return _safe_int(config.get("skill_timeout", 3600), 3600)
+    return _safe_int(config.get("skill_timeout", 7200), 7200)
 
 
 def get_mission_timeout() -> int:
@@ -351,6 +517,24 @@ def get_mission_timeout() -> int:
     return _safe_int(config.get("mission_timeout", 3600), 3600)
 
 
+def get_first_output_timeout() -> int:
+    """Get timeout in seconds for first output from CLI subprocesses.
+
+    If the Claude CLI produces zero stdout within this window, the
+    process is killed early instead of waiting the full skill/mission
+    timeout. A session that is silent for this long is almost certainly
+    stuck (API hang, network issue, quota wait).
+
+    Config key: first_output_timeout (default: 600 — 10 minutes).
+    Set to 0 to disable.
+
+    Returns:
+        Timeout in seconds.
+    """
+    config = _load_config()
+    return _safe_int(config.get("first_output_timeout", 600), 600)
+
+
 def get_skill_max_turns() -> int:
     """Get max turns for skill execution (fix, implement, incident).
 
@@ -365,6 +549,192 @@ def get_skill_max_turns() -> int:
     """
     config = _load_config()
     return _safe_int(config.get("skill_max_turns", 200), 200)
+
+
+def get_analysis_max_turns() -> int:
+    """Get max turns for read-only analysis skills (dead_code, tech_debt, audit).
+
+    These skills only use read tools (Read, Glob, Grep) and need fewer turns
+    than implementation skills, but the previous hardcoded defaults (25-30)
+    were too tight for non-trivial codebases.
+
+    Config key: analysis_max_turns (default: 75).
+
+    Returns:
+        Maximum number of turns.
+    """
+    config = _load_config()
+    return _safe_int(config.get("analysis_max_turns", 75), 75)
+
+
+def get_post_mission_timeout() -> int:
+    """Get timeout in seconds for the post-mission pipeline.
+
+    Controls the overall deadline for post-mission steps: verification,
+    reflection, PR review learning, and auto-merge.  Without this ceiling,
+    accumulated steps can block the agent loop for too long.
+
+    Config key: post_mission_timeout (default: 300 — 5 minutes).
+
+    Returns:
+        Timeout in seconds.
+    """
+    config = _load_config()
+    return _safe_int(config.get("post_mission_timeout", 300), 300)
+
+
+def get_notify_mission_results() -> bool:
+    """Whether to forward Claude's mission result text to outbox.md.
+
+    When True, the post-mission pipeline appends the Claude session's final
+    result string to outbox.md whenever it indicates an alert outcome
+    (SKIP/FAIL/ERROR/BLOCKED) or comes from a skill that opted in via
+    ``forward_result: true`` in its SKILL.md. Guarantees the user sees the
+    result on Telegram even when the Claude session's sandbox blocked writes
+    to instance/.
+
+    Config key: notify_mission_results (default: True).
+    """
+    config = _load_config()
+    val = config.get("notify_mission_results", True)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() not in ("false", "no", "0", "off")
+    return True
+
+
+# Default effort levels per autonomous mode.
+# Keys are autonomous modes, values are Claude CLI --effort levels.
+# "medium" is the provider default when no flag is passed — omitted here
+# so no flag is emitted unless the user configures an override.
+_DEFAULT_EFFORT_MAP = {
+    "review": "low",
+    "implement": "",
+    "deep": "high",
+}
+
+# Valid effort levels (matches Claude CLI --effort flag).
+_VALID_EFFORT_LEVELS = {"low", "medium", "high", "max", ""}
+
+
+def get_effort_for_mode(autonomous_mode: str = "") -> str:
+    """Get the reasoning effort level for the given autonomous mode.
+
+    Reads ``effort:`` section from config.yaml. Supports per-mode overrides:
+
+        effort:
+          review: low
+          implement: medium
+          deep: high
+
+    Or a single value to apply to all modes:
+
+        effort: high
+
+    Set ``effort: ""`` or omit the section entirely to disable effort
+    control (no ``--effort`` flag will be emitted).
+
+    Args:
+        autonomous_mode: Current mode (review/implement/deep/wait).
+
+    Returns:
+        Effort level string (e.g. "low", "high", "max") or empty string.
+    """
+    config = _load_config()
+    effort_config = config.get("effort")
+
+    if effort_config is None:
+        # No config — use defaults
+        return _DEFAULT_EFFORT_MAP.get(autonomous_mode, "")
+
+    if isinstance(effort_config, str):
+        # Single value for all modes
+        level = effort_config.strip().lower()
+        return level if level in _VALID_EFFORT_LEVELS else ""
+
+    if isinstance(effort_config, dict):
+        # Per-mode overrides
+        level = str(effort_config.get(autonomous_mode, "")).strip().lower()
+        if level in _VALID_EFFORT_LEVELS:
+            return level
+        # Fall back to defaults if mode not in config
+        return _DEFAULT_EFFORT_MAP.get(autonomous_mode, "")
+
+    return ""
+
+
+def get_stagnation_config(project_name: str = "") -> dict:
+    """Get stagnation-monitor configuration.
+
+    The stagnation monitor watches a running Claude CLI mission for a
+    stuck-in-a-loop pattern (identical trailing stdout hash across
+    several samples) and kills the subprocess before the full mission
+    timeout elapses, saving quota.
+
+    Config keys (under ``stagnation:`` in ``config.yaml``):
+        enabled (bool): master switch (default True).
+        check_interval_seconds (int): seconds between samples (default 60).
+        abort_after_cycles (int): consecutive identical samples required
+            to trigger abort. Must be >= 2. Default 3.
+        sample_lines (int): trailing stdout lines hashed each sample
+            (default 50).
+        max_retry_on_stagnation (int): how many times a stagnated mission
+            is re-queued before being marked Failed. ``0`` disables the
+            retry loop entirely (mission is failed on the first stagnation).
+            Default 3.
+
+    Per-project overrides via ``projects.yaml`` ``stagnation:`` take
+    precedence. Setting ``enabled: false`` at project level disables the
+    monitor for that project only. Setting it to the boolean ``false``
+    directly (``stagnation: false``) is also accepted as a shortcut.
+
+    Args:
+        project_name: Optional project name for per-project overrides.
+
+    Returns:
+        Dict with the resolved values — always contains all five keys.
+    """
+    defaults = {
+        "enabled": True,
+        "check_interval_seconds": 60,
+        "abort_after_cycles": 3,
+        "sample_lines": 50,
+        "max_retry_on_stagnation": 3,
+    }
+    config = _load_config()
+    base = config.get("stagnation", {})
+    if base is False:
+        base = {"enabled": False}
+    elif not isinstance(base, dict):
+        base = {}
+
+    project_overrides = _load_project_overrides(project_name)
+    proj = project_overrides.get("stagnation", {})
+    if proj is False:
+        proj = {"enabled": False}
+    elif not isinstance(proj, dict):
+        proj = {}
+
+    merged = {**defaults, **base, **proj}
+
+    abort_after = _safe_int(merged.get("abort_after_cycles"), defaults["abort_after_cycles"])
+    if abort_after < 2:
+        abort_after = 2
+
+    max_retry = _safe_int(merged.get("max_retry_on_stagnation"), defaults["max_retry_on_stagnation"])
+    if max_retry < 0:
+        max_retry = 0
+
+    return {
+        "enabled": bool(merged.get("enabled", defaults["enabled"])),
+        "check_interval_seconds": max(
+            1, _safe_int(merged.get("check_interval_seconds"), defaults["check_interval_seconds"]),
+        ),
+        "abort_after_cycles": abort_after,
+        "sample_lines": max(1, _safe_int(merged.get("sample_lines"), defaults["sample_lines"])),
+        "max_retry_on_stagnation": max_retry,
+    }
 
 
 def get_plan_review_config() -> dict:
@@ -388,6 +758,22 @@ def get_plan_review_config() -> dict:
         "enabled": bool(plan_review.get("enabled", True)),
         "max_rounds": _safe_int(plan_review.get("max_rounds", 3), 3),
     }
+
+
+def get_skill_allowed_hosts() -> List[str]:
+    """Return the optional Git-host allow-list for /skill install.
+
+    Read from ``skills.allowed_hosts`` in config.yaml. Each entry is a
+    ``host`` or ``host/path-prefix`` (e.g. ``github.com/myorg``). An empty
+    or missing list means no host restriction — the approval gate still
+    applies.
+    """
+    config = _load_config()
+    skills_cfg = config.get("skills", {}) or {}
+    hosts = skills_cfg.get("allowed_hosts", []) or []
+    if not isinstance(hosts, list):
+        return []
+    return [str(h).strip() for h in hosts if str(h).strip()]
 
 
 def get_contemplative_chance() -> int:
@@ -487,35 +873,6 @@ def get_cli_provider_name() -> str:
     return get_provider_name()
 
 
-def get_tool_flags_for_shell(tools: str) -> str:
-    """Convert comma-separated tool names to provider-specific flag string.
-
-    Args:
-        tools: Comma-separated Claude tool names (e.g., "Read,Write,Glob,Grep")
-
-    Returns:
-        Space-separated CLI flags for the configured provider.
-    """
-    from app.cli_provider import build_tool_flags
-    tool_list = [t.strip() for t in tools.split(",") if t.strip()]
-    flags = build_tool_flags(allowed_tools=tool_list)
-    return " ".join(flags)
-
-
-def get_output_flags_for_shell(fmt: str) -> str:
-    """Convert output format to provider-specific flag string.
-
-    Args:
-        fmt: Output format (e.g., "json")
-
-    Returns:
-        Space-separated CLI flags for the configured provider.
-    """
-    from app.cli_provider import build_output_flags
-    flags = build_output_flags(fmt)
-    return " ".join(flags)
-
-
 def get_auto_merge_config(config: dict, project_name: str) -> dict:
     """Get auto-merge config with per-project override support.
 
@@ -550,6 +907,32 @@ def get_auto_merge_config(config: dict, project_name: str) -> dict:
     }
 
 
+def get_branch_cleanup_config() -> dict:
+    """Get branch cleanup configuration from config.yaml.
+
+    Controls automatic deletion of merged local and remote branches during
+    git sync. Cleanup runs every ``git_sync_interval`` iterations for each
+    project.
+
+    Config key: branch_cleanup
+      - enabled (bool): Master switch (default: True)
+      - delete_remote_branches (bool): Also push-delete remote branches
+          after local deletion (default: True). Set to False to only
+          clean up local refs without touching the remote.
+
+    Returns:
+        Dict with keys: enabled (bool), delete_remote_branches (bool).
+    """
+    config = _load_config()
+    cleanup_cfg = config.get("branch_cleanup", {})
+    if not isinstance(cleanup_cfg, dict):
+        cleanup_cfg = {}
+    return {
+        "enabled": bool(cleanup_cfg.get("enabled", True)),
+        "delete_remote_branches": bool(cleanup_cfg.get("delete_remote_branches", True)),
+    }
+
+
 def get_prompt_guard_config() -> dict:
     """Get prompt guard configuration.
 
@@ -563,3 +946,247 @@ def get_prompt_guard_config() -> dict:
         "enabled": guard_cfg.get("enabled", True),
         "block_mode": guard_cfg.get("block_mode", False),
     }
+
+
+def get_review_concurrency_config() -> dict:
+    """Get review concurrency configuration from config.yaml.
+
+    Controls parallelism for GitHub API calls during PR reviews. The LLM
+    call (Claude CLI) is always sequential — only GitHub data-fetching is
+    parallelised.
+
+    Config key: review_concurrency
+      - enabled (bool): Enable parallel GitHub API fetches (default: True)
+      - github_workers (int): Max concurrent GitHub API calls (default: 4)
+
+    Returns:
+        Dict with keys:
+          - enabled (bool): Whether parallel fetching is active.
+          - github_workers (int): ThreadPoolExecutor max_workers for gh calls.
+    """
+    config = _load_config()
+    review_cfg = config.get("review_concurrency", {})
+    if not isinstance(review_cfg, dict):
+        review_cfg = {}
+    return {
+        "enabled": bool(review_cfg.get("enabled", True)),
+        "github_workers": _safe_int(review_cfg.get("github_workers", 4), 4),
+    }
+
+
+def get_review_ignore_config() -> dict:
+    """Get review ignore patterns from config.yaml.
+
+    Controls which files are excluded from PR review diffs. Patterns are
+    applied before building the Claude prompt, reducing token spend on
+    generated code, lock files, and vendor directories.
+
+    Config key: review_ignore
+      - glob (list): Glob patterns (e.g. "vendor/**", "*.lock")
+      - regex (list): Regex patterns matched against full path
+
+    Returns:
+        Dict with keys: glob (list), regex (list). Both always present;
+        values default to [].
+    """
+    config = _load_config()
+    review_ignore = config.get("review_ignore", {}) or {}
+    if not isinstance(review_ignore, dict):
+        return {"glob": [], "regex": []}
+
+    globs = review_ignore.get("glob", [])
+    if not isinstance(globs, list):
+        globs = []
+
+    regexes = review_ignore.get("regex", [])
+    if not isinstance(regexes, list):
+        regexes = []
+
+    return {"glob": [str(p) for p in globs], "regex": [str(p) for p in regexes]}
+
+
+def is_caveman_mode() -> bool:
+    """Check if caveman output optimization is enabled.
+
+    When enabled, the agent prompt includes instructions to minimize
+    output tokens — short sentences, no filler, direct answers only.
+
+    Reads ``optimizations.caveman.enabled`` from ``config.yaml``::
+
+        optimizations:
+          caveman:
+            enabled: true
+            include: [rebase, fix]     # opt these skills in (skills are
+                                       # opt-in by default; the agent loop
+                                       # is governed by ``enabled`` alone)
+
+    Default: True (the agent loop receives caveman; skills only do so when
+    they opt in via SKILL.md ``caveman: true`` or this ``include`` list).
+    """
+    enabled = _get_caveman_dict().get("enabled", True)
+    return bool(enabled) if isinstance(enabled, bool) else True
+
+
+def _get_caveman_dict() -> dict:
+    """Return the ``optimizations.caveman`` mapping (or an empty dict).
+
+    Normalises away every malformed shape — missing parent, non-dict
+    optimizations block, scalar caveman value — so callers can treat the
+    result as a plain dict.  Misshapen config falls back to defaults.
+    """
+    config = _load_config()
+    optimizations = config.get("optimizations", {})
+    if not isinstance(optimizations, dict):
+        return {}
+    caveman = optimizations.get("caveman", {})
+    return caveman if isinstance(caveman, dict) else {}
+
+
+def get_caveman_include_list() -> set:
+    """Return canonical skill names that opt in to caveman via ``config.yaml``.
+
+    Reads ``optimizations.caveman.include``.  Resolves aliases via
+    ``app.skill_dispatch._COMMAND_ALIASES`` so callers can match on the
+    canonical name regardless of which alias the user wrote.
+
+    Skills are opt-in: if neither this list nor the skill's SKILL.md
+    ``caveman: true`` flag mentions a skill, caveman does not fire for it.
+    """
+    raw = _get_caveman_dict().get("include", []) or []
+    if not isinstance(raw, list):
+        return set()
+
+    from app.skill_dispatch import _resolve_canonical
+    result = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        name = entry.strip().lstrip("/")
+        if not name:
+            continue
+        result.add(_resolve_canonical(name))
+    return result
+
+
+def _get_rtk_dict() -> dict:
+    """Return the ``optimizations.rtk`` mapping (or an empty dict).
+
+    Mirrors :func:`_get_caveman_dict` — normalises away missing parents,
+    non-dict optimizations blocks, and scalar rtk values so callers can treat
+    the result as a plain dict.
+    """
+    config = _load_config()
+    optimizations = config.get("optimizations", {})
+    if not isinstance(optimizations, dict):
+        return {}
+    rtk = optimizations.get("rtk", {})
+    return rtk if isinstance(rtk, dict) else {}
+
+
+# Canonical accepted values for ``optimizations.rtk.enabled`` and the
+# per-project ``rtk:`` knob.  Single source of truth — :mod:`app.config_validator`
+# imports these so the doc-time validation and runtime parsing never drift.
+RTK_ENABLED_TRUE = frozenset({"true", "yes", "1", "on"})
+RTK_ENABLED_FALSE = frozenset({"false", "no", "0", "off"})
+RTK_ENABLED_AUTO = frozenset({"auto", ""})
+RTK_ENABLED_VALID = RTK_ENABLED_TRUE | RTK_ENABLED_FALSE | RTK_ENABLED_AUTO
+
+
+def coerce_rtk_enabled(raw: object) -> Optional[bool]:
+    """Coerce a config value into ``True`` / ``False`` / ``None`` (= auto).
+
+    Used by both :func:`is_rtk_mode` and
+    :func:`app.projects_config.get_project_rtk_enabled` so the global and
+    per-project knobs accept exactly the same shapes.
+
+    Returns:
+        ``True`` / ``False`` for explicit values, ``None`` to defer to the
+        next layer (binary detection for the global knob, global resolution
+        for the per-project knob).
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in RTK_ENABLED_TRUE:
+            return True
+        if value in RTK_ENABLED_FALSE:
+            return False
+    return None
+
+
+def _rtk_runtime_override() -> Optional[bool]:
+    """Read the runtime override written by ``/rtk on`` / ``/rtk off``.
+
+    Returns ``True`` for any truthy value, ``False`` for any falsy value, or
+    ``None`` when no override file is present or its content is unrecognised
+    (i.e. defer to ``config.yaml``).  The override lives at
+    ``instance/.koan-rtk-override`` so users can flip rtk awareness on the
+    fly without editing config files.
+
+    Accepts the same vocabulary as ``optimizations.rtk.enabled`` —
+    :func:`coerce_rtk_enabled` is the single source of truth.  ``/rtk on``
+    and ``/rtk off`` write ``"on"`` / ``"off"``, but a user who hand-writes
+    ``true`` / ``false`` / ``yes`` / ``no`` gets the same behaviour.
+    """
+    koan_root = os.environ.get("KOAN_ROOT")
+    if not koan_root:
+        return None
+    path = Path(koan_root) / "instance" / ".koan-rtk-override"
+    try:
+        value = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return coerce_rtk_enabled(value)
+
+
+def is_rtk_mode() -> bool:
+    """Check whether the rtk awareness section should be injected.
+
+    Resolution order (highest priority first):
+
+    1.  ``instance/.koan-rtk-override`` (written by ``/rtk on`` / ``/rtk off``).
+    2.  ``optimizations.rtk.enabled`` in ``config.yaml``::
+
+            optimizations:
+              rtk:
+                enabled: auto    # auto | true | false
+
+        - ``auto`` (default): on iff the rtk binary is detected on the host.
+          When the tool is installed the user almost certainly wants Claude
+          to prefer it; when it's missing, the awareness blurb would just
+          be dead context.
+        - ``true``: always on (forces injection even if the binary is
+          missing — useful when the user installs rtk after Kōan boots).
+        - ``false``: always off.
+
+    The detection probe is cached per-process by :mod:`app.rtk_detector`, so
+    this function is safe to call from per-prompt code paths.
+    """
+    override = _rtk_runtime_override()
+    if override is not None:
+        return override
+    explicit = coerce_rtk_enabled(_get_rtk_dict().get("enabled", "auto"))
+    if explicit is not None:
+        return explicit
+    # "auto" (and any unrecognised value) → defer to binary detection.
+    try:
+        from app.rtk_detector import detect_rtk
+        return detect_rtk().installed
+    except Exception as e:
+        print(f"[config] rtk detection failed: {e}", file=sys.stderr)
+        return False
+
+
+def is_rtk_awareness_enabled() -> bool:
+    """Return ``True`` when the awareness section should ship in prompts.
+
+    Two-stage gate: ``optimizations.rtk.enabled`` controls overall rtk
+    integration; ``optimizations.rtk.awareness`` toggles the prompt-injection
+    layer specifically.  Default: ``True`` — if rtk mode is on at all,
+    awareness is part of it unless explicitly disabled.
+    """
+    if not is_rtk_mode():
+        return False
+    raw = _get_rtk_dict().get("awareness", True)
+    return bool(raw) if isinstance(raw, bool) else True

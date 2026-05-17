@@ -19,28 +19,47 @@ CLI:
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from app.github import run_gh
+from app.claude_step import resolve_pr_location
+from app.github import run_gh, sanitize_github_comment, find_bot_comment
+from app.github_url_parser import ISSUE_URL_PATTERN
 from app.prompts import load_prompt_or_skill
 from app.rebase_pr import fetch_pr_context
+from app.review_markers import (
+    SUMMARY_TAG,
+    COMMIT_IDS_START,
+    COMMIT_IDS_END,
+    extract_between_markers,
+    replace_section,
+)
 from app.review_schema import validate_review
 
+_ISSUE_URL_RE = re.compile(ISSUE_URL_PATTERN)
 
-def fetch_repliable_comments(
-    owner: str, repo: str, pr_number: str,
-) -> List[dict]:
-    """Fetch PR comments with their IDs for reply targeting.
 
-    Returns a list of dicts with keys: id, type, user, body, path (for
-    inline comments only). Excludes bot comments and the PR author's own
-    inline comments to reduce noise.
+def _resolve_bot_username() -> str:
+    """Read the bot's GitHub nickname from config.yaml.
+
+    Returns empty string if not configured (filtering is then skipped).
     """
-    full_repo = f"{owner}/{repo}"
-    comments: List[dict] = []
+    try:
+        from app.utils import load_config
+        config = load_config()
+        github = config.get("github") or {}
+        return str(github.get("nickname", "")).strip()
+    except Exception as e:
+        print(f"[review_runner] could not resolve bot username: {e}", file=sys.stderr)
+        return ""
 
-    # Inline review comments (code-level)
+
+def _fetch_inline_review_comments(
+    full_repo: str, pr_number: str, bot_username: str = "",
+) -> List[dict]:
+    """Fetch inline review comments (code-level) for a PR."""
+    results: List[dict] = []
     try:
         raw = run_gh(
             "api", f"repos/{full_repo}/pulls/{pr_number}/comments",
@@ -53,7 +72,10 @@ def fetch_repliable_comments(
                     item = json.loads(line)
                     if item.get("user_type") == "Bot":
                         continue
-                    comments.append({
+                    # Skip bot's own comments to prevent self-reply loops
+                    if bot_username and item["user"].lower() == bot_username.lower():
+                        continue
+                    results.append({
                         "id": item["id"],
                         "type": "review_comment",
                         "user": item["user"],
@@ -65,8 +87,14 @@ def fetch_repliable_comments(
                     continue
     except RuntimeError:
         pass
+    return results
 
-    # Issue-level comments (conversation thread)
+
+def _fetch_issue_comments(
+    full_repo: str, pr_number: str, bot_username: str = "",
+) -> List[dict]:
+    """Fetch issue-level comments (conversation thread) for a PR."""
+    results: List[dict] = []
     try:
         raw = run_gh(
             "api", f"repos/{full_repo}/issues/{pr_number}/comments",
@@ -79,7 +107,10 @@ def fetch_repliable_comments(
                     item = json.loads(line)
                     if item.get("user_type") == "Bot":
                         continue
-                    comments.append({
+                    # Skip bot's own comments to prevent self-reply loops
+                    if bot_username and item["user"].lower() == bot_username.lower():
+                        continue
+                    results.append({
                         "id": item["id"],
                         "type": "issue_comment",
                         "user": item["user"],
@@ -89,6 +120,42 @@ def fetch_repliable_comments(
                     continue
     except RuntimeError:
         pass
+    return results
+
+
+def fetch_repliable_comments(
+    owner: str, repo: str, pr_number: str,
+    parallel: bool = True,
+    bot_username: str = "",
+) -> List[dict]:
+    """Fetch PR comments with their IDs for reply targeting.
+
+    Returns a list of dicts with keys: id, type, user, body, path (for
+    inline comments only). Excludes bot comments and the PR author's own
+    inline comments to reduce noise.
+
+    Args:
+        owner: GitHub owner/org.
+        repo: Repository name.
+        pr_number: PR number as string.
+        parallel: When True (default), fetch inline and issue comments
+            concurrently using two threads. Set to False to force sequential
+            fetching (useful in tests or single-threaded contexts).
+        bot_username: If provided, comments from this user are excluded
+            to prevent self-reply loops.
+    """
+    full_repo = f"{owner}/{repo}"
+    comments: List[dict] = []
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_inline = pool.submit(_fetch_inline_review_comments, full_repo, pr_number, bot_username)
+            f_issue = pool.submit(_fetch_issue_comments, full_repo, pr_number, bot_username)
+            comments.extend(f_inline.result())
+            comments.extend(f_issue.result())
+    else:
+        comments.extend(_fetch_inline_review_comments(full_repo, pr_number, bot_username))
+        comments.extend(_fetch_issue_comments(full_repo, pr_number, bot_username))
 
     return comments
 
@@ -115,17 +182,124 @@ def _format_repliable_comments(comments: List[dict]) -> str:
     return "\n\n".join(lines)
 
 
+def _detect_plan_url(body: str) -> Optional[str]:
+    """Extract the first GitHub issue URL from a PR body.
+
+    Returns the full issue URL string if found, or None.
+    Only matches issue URLs (not PR URLs) — /issues/ not /pull/.
+    """
+    match = _ISSUE_URL_RE.search(body)
+    if not match:
+        return None
+    return match.group(0)
+
+
+def _fetch_plan_body(owner: str, repo: str, issue_number: str) -> str:
+    """Fetch the body of a GitHub issue, checking that it has a 'plan' label.
+
+    Returns the plan text (with footer stripped), or empty string if:
+    - The issue cannot be fetched
+    - The issue does not have a 'plan' label
+
+    Also checks the latest issue comment for an updated plan iteration.
+    If the last comment contains '### Implementation Phases', it is treated
+    as the authoritative plan (newer than the issue body).
+    """
+    full_repo = f"{owner}/{repo}"
+
+    try:
+        raw = run_gh("api", f"repos/{full_repo}/issues/{issue_number}")
+        issue = json.loads(raw)
+    except (RuntimeError, json.JSONDecodeError, ValueError):
+        return ""
+
+    labels = [lbl.get("name", "") for lbl in issue.get("labels", [])]
+    if "plan" not in labels:
+        return ""
+
+    plan_body = issue.get("body", "") or ""
+
+    # Check latest comment for an updated plan iteration
+    try:
+        raw_comments = run_gh(
+            "api", f"repos/{full_repo}/issues/{issue_number}/comments",
+            "--paginate", "--jq",
+            r'.[] | {body: .body}',
+        )
+        if raw_comments.strip():
+            for line in reversed(raw_comments.strip().split("\n")):
+                try:
+                    comment = json.loads(line)
+                    comment_body = comment.get("body", "")
+                    if "### Implementation Phases" in comment_body:
+                        plan_body = comment_body
+                        break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except RuntimeError:
+        pass
+
+    # Strip plan footer added by /plan skill
+    footer_marker = "\n---\n*Generated by Kōan /plan"
+    if footer_marker in plan_body:
+        plan_body = plan_body[:plan_body.index(footer_marker)].rstrip()
+
+    return plan_body
+
+
+def _truncate_plan(plan_body: str) -> str:
+    """Truncate a plan to its key sections (Summary + Implementation Phases).
+
+    Used when the combined plan + diff context is very large (>80K chars).
+    Extracts Summary and Implementation Phases sections; falls back to the
+    first 5000 chars if those sections cannot be found.
+    """
+    sections = []
+    for section_title in ("## Summary", "### Summary", "### Implementation Phases"):
+        idx = plan_body.find(section_title)
+        if idx == -1:
+            continue
+        remaining = plan_body[idx:]
+        # Find next ## heading to delimit the section
+        end_match = re.search(r'\n##\s', remaining[1:])
+        if end_match:
+            sections.append(remaining[:end_match.start() + 1])
+        else:
+            sections.append(remaining)
+
+    if sections:
+        return "\n\n".join(sections)
+    return plan_body[:5000] + "\n\n...(plan truncated)"
+
+
 def build_review_prompt(
     context: dict,
     skill_dir: Optional[Path] = None,
     architecture: bool = False,
     repliable_comments: Optional[List[dict]] = None,
+    plan_body: Optional[str] = None,
 ) -> str:
-    """Build a prompt for Claude to review a PR."""
-    prompt_name = "review-architecture" if architecture else "review"
+    """Build a prompt for Claude to review a PR.
+
+    When plan_body is provided, selects the plan-aware prompt variant
+    (review-with-plan) regardless of the architecture flag. When architecture
+    is True but no plan is present, uses the architecture prompt.
+    """
+    if plan_body:
+        if architecture:
+            print(
+                "[review_runner] --architecture ignored: plan alignment takes priority",
+                file=sys.stderr,
+            )
+        prompt_name = "review-with-plan"
+    elif architecture:
+        prompt_name = "review-architecture"
+    else:
+        prompt_name = "review"
+
     repliable_text = _format_repliable_comments(repliable_comments or [])
-    return load_prompt_or_skill(
-        skill_dir, prompt_name,
+
+    kwargs: dict = dict(
         TITLE=context["title"],
         AUTHOR=context["author"],
         BRANCH=context["branch"],
@@ -138,21 +312,34 @@ def build_review_prompt(
         REPLIABLE_COMMENTS=repliable_text,
     )
 
+    if plan_body:
+        # Truncate plan if combined context would be too large
+        combined_len = len(context.get("diff", "")) + len(plan_body)
+        if combined_len > 80_000:
+            plan_body = _truncate_plan(plan_body)
+        kwargs["PLAN"] = plan_body
 
-def _run_claude_review(prompt: str, project_path: str, timeout: int = 600) -> str:
+    return load_prompt_or_skill(skill_dir, prompt_name, **kwargs)
+
+
+def _run_claude_review(
+    prompt: str, project_path: str, timeout: int = 600,
+) -> Tuple[str, str]:
     """Run Claude CLI with read-only tools and return the output text.
 
     Args:
         prompt: The review prompt.
         project_path: Path to the project for codebase context.
-        timeout: Maximum seconds to wait.
+        timeout: Maximum seconds to wait (default 600s — large PRs need
+                 more time than the old 300s default).
 
     Returns:
-        Claude's review text, or empty string on failure.
+        (output, error) tuple. output is Claude's review text (empty on
+        failure), error is the failure reason (empty on success).
     """
     from app.claude_step import run_claude
     from app.cli_provider import build_full_command
-    from app.config import get_model_config
+    from app.config import get_model_config, get_skill_max_turns
 
     models = get_model_config()
     cmd = build_full_command(
@@ -160,13 +347,25 @@ def _run_claude_review(prompt: str, project_path: str, timeout: int = 600) -> st
         allowed_tools=["Read", "Glob", "Grep"],
         model=models["mission"],
         fallback=models["fallback"],
-        max_turns=15,
+        max_turns=get_skill_max_turns(),
     )
 
     result = run_claude(cmd, project_path, timeout=timeout)
     if result["success"]:
-        return result["output"]
-    return ""
+        return result["output"], ""
+    error = result.get("error", "unknown error")
+    # Log stdout from the failed run — it often contains the actual error
+    # that stderr does not (Claude CLI reports many errors via stdout).
+    stdout = result.get("output", "")
+    if stdout:
+        print(
+            f"[review_runner] Claude review failed: {error}\n"
+            f"[review_runner] stdout from failed run (last 500 chars): {stdout[-500:]}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"[review_runner] Claude review failed: {error}", file=sys.stderr)
+    return "", error
 
 
 def _extract_review_body(raw_output: str) -> str:
@@ -321,8 +520,8 @@ _SEVERITY_HEADING = {
 def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
     """Convert validated review JSON into the markdown format for GitHub.
 
-    Produces the standard ## PR Review format with severity sections,
-    checklist, and summary.
+    Produces the standard ## PR Review format with an optional plan alignment
+    section (when present), followed by severity sections, checklist, and summary.
     """
     comments = review_data["file_comments"]
     summary_data = review_data["review_summary"]
@@ -337,6 +536,32 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
     lines.append("")
     lines.append("---")
     lines.append("")
+
+    # Plan alignment section (only present when review was done with a plan)
+    plan_alignment = review_data.get("plan_alignment")
+    if plan_alignment and isinstance(plan_alignment, dict):
+        lines.append("### Plan Alignment")
+        lines.append("")
+        met = plan_alignment.get("requirements_met") or []
+        missing = plan_alignment.get("requirements_missing") or []
+        out_of_scope = plan_alignment.get("out_of_scope") or []
+        if met:
+            lines.append(f"✅ **Met** ({len(met)})")
+            lines.append("")
+            lines.extend(f"- {req}" for req in met)
+            lines.append("")
+        if missing:
+            lines.append(f"❌ **Missing** ({len(missing)})")
+            lines.append("")
+            lines.extend(f"- {req}" for req in missing)
+            lines.append("")
+        if out_of_scope:
+            lines.append(f"📋 **Out of scope** ({len(out_of_scope)})")
+            lines.append("")
+            lines.extend(f"- {item}" for item in out_of_scope)
+            lines.append("")
+        lines.append("---")
+        lines.append("")
 
     # Group comments by severity
     by_severity: dict = {"critical": [], "warning": [], "suggestion": []}
@@ -354,18 +579,27 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
         lines.append(f"### {emoji} {heading}")
         lines.append("")
         for i, item in enumerate(items, 1):
-            loc = f"`{item['file']}`"
-            if item.get("line_start") and item["line_start"] > 0:
-                loc += f", L{item['line_start']}"
+            has_loc = item.get("line_start") and item["line_start"] > 0
+            if has_loc:
+                loc = f"`{item['file']}`, L{item['line_start']}"
                 if item.get("line_end") and item["line_end"] != item["line_start"]:
                     loc += f"-{item['line_end']}"
-            lines.append(f"**{i}. {item['title']}** ({loc})")
+                summary_line = f"<b>{i}. {item['title']}</b> ({loc})"
+            else:
+                summary_line = f"<b>{i}. {item['title']}</b>"
+            lines.append("<details>")
+            lines.append("<summary>")
+            lines.append(summary_line)
+            lines.append("</summary>")
+            lines.append("")
             lines.append(item["comment"])
             if item.get("code_snippet"):
                 lines.append("")
                 lines.append("```")
                 lines.append(item["code_snippet"])
                 lines.append("```")
+            lines.append("")
+            lines.append("</details>")
             lines.append("")
 
     # Checklist
@@ -377,7 +611,14 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
         lines.append("")
         for ci in checklist:
             mark = "x" if ci["passed"] else " "
-            ref = f" — {ci['finding_ref']}" if ci.get("finding_ref") else ""
+            finding_ref = ci.get("finding_ref", "")
+            if finding_ref:
+                # Replace ASCII # with fullwidth ＃ (U+FF03) to prevent GitHub
+                # from auto-linking cross-references to repository issues/PRs.
+                safe_ref = finding_ref.replace("#", "\uFF03")
+                ref = f" \u2014 {safe_ref}"
+            else:
+                ref = ""
             lines.append(f"- [{mark}] {ci['item']}{ref}")
         lines.append("")
 
@@ -393,8 +634,19 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
 
 def _post_review_comment(
     owner: str, repo: str, pr_number: str, review_text: str,
+    existing_comment: Optional[dict] = None,
+    commit_shas: Optional[List[str]] = None,
 ) -> bool:
-    """Post the review as a comment on the PR.
+    """Post (or update) the review as a comment on the PR.
+
+    Prepends ``SUMMARY_TAG`` so future runs can locate the comment via
+    ``find_bot_comment``.  When ``existing_comment`` is provided the
+    comment is updated via PATCH instead of creating a new one.
+
+    When ``commit_shas`` is provided, embeds them in the body so the
+    incremental-review check can skip already-reviewed commits.  When
+    absent, preserves any COMMIT_IDS block from ``existing_comment`` so
+    a re-review without SHA info doesn't clobber prior state.
 
     Returns True on success.
     """
@@ -405,16 +657,40 @@ def _post_review_comment(
 
     # If body already starts with a ## heading, don't add another
     if review_text.startswith("## "):
-        body = f"{review_text}\n\n---\n_Automated review by Kōan_"
+        body = f"{SUMMARY_TAG}\n{review_text}\n\n---\n_Automated review by Kōan_"
     else:
-        body = f"## Code Review\n\n{review_text}\n\n---\n_Automated review by Kōan_"
+        body = f"{SUMMARY_TAG}\n## Code Review\n\n{review_text}\n\n---\n_Automated review by Kōan_"
+
+    # Embed commit SHAs when provided; otherwise preserve from existing
+    # comment so a re-review doesn't clobber prior incremental state.
+    if commit_shas:
+        body = replace_section(
+            body, COMMIT_IDS_START, COMMIT_IDS_END, "\n".join(commit_shas),
+        )
+    elif existing_comment:
+        existing_body = existing_comment.get("body", "")
+        commits_block = extract_between_markers(
+            existing_body, COMMIT_IDS_START, COMMIT_IDS_END,
+        )
+        if commits_block is not None:
+            body = replace_section(body, COMMIT_IDS_START, COMMIT_IDS_END, commits_block)
 
     try:
-        run_gh(
-            "pr", "comment", pr_number,
-            "--repo", f"{owner}/{repo}",
-            "--body", body,
-        )
+        sanitized = sanitize_github_comment(body)
+        if existing_comment:
+            comment_id = existing_comment["id"]
+            run_gh(
+                "api",
+                f"repos/{owner}/{repo}/issues/comments/{comment_id}",
+                "-X", "PATCH",
+                "-f", f"body={sanitized}",
+            )
+        else:
+            run_gh(
+                "pr", "comment", pr_number,
+                "--repo", f"{owner}/{repo}",
+                "--body", sanitized,
+            )
         return True
     except Exception as e:
         print(f"[review_runner] failed to post comment: {e}", file=sys.stderr)
@@ -460,10 +736,11 @@ def _post_comment_replies(
         try:
             if original["type"] == "review_comment":
                 # Reply to an inline review comment via the API
+                safe_reply = sanitize_github_comment(reply_text)
                 run_gh(
                     "api", f"repos/{full_repo}/pulls/{pr_number}/comments",
                     "-X", "POST",
-                    "-f", f"body={reply_text}",
+                    "-f", f"body={safe_reply}",
                     "-F", f"in_reply_to={comment_id}",
                 )
             else:
@@ -472,7 +749,7 @@ def _post_comment_replies(
                 quote_line = original["body"].split("\n")[0]
                 if len(quote_line) > 100:
                     quote_line = quote_line[:100] + "..."
-                body = f"> @{user}: {quote_line}\n\n{reply_text}"
+                body = sanitize_github_comment(f"> @{user}: {quote_line}\n\n{reply_text}")
                 run_gh(
                     "pr", "comment", pr_number,
                     "--repo", full_repo,
@@ -488,6 +765,91 @@ def _post_comment_replies(
     return posted
 
 
+def _resolve_plan_body(plan_url: Optional[str], pr_body: str) -> str:
+    """Fetch the plan body from an explicit URL or auto-detect from the PR body.
+
+    When plan_url is provided, fetches that issue directly (skipping label check
+    only for explicit URLs, to allow non-labelled issues when the user explicitly
+    specifies them). When plan_url is None, searches the PR body for issue URLs
+    and fetches the first one that has the 'plan' label.
+
+    Returns the plan text, or empty string if no plan is found.
+    """
+    from app.github_url_parser import parse_issue_url
+
+    if plan_url:
+        try:
+            p_owner, p_repo, p_number = parse_issue_url(plan_url)
+        except ValueError:
+            print(
+                f"[review_runner] invalid --plan-url '{plan_url}', skipping plan alignment",
+                file=sys.stderr,
+            )
+            return ""
+        # For explicit URLs, fetch without label requirement
+        try:
+            raw = run_gh("api", f"repos/{p_owner}/{p_repo}/issues/{p_number}")
+            issue = json.loads(raw)
+        except (RuntimeError, json.JSONDecodeError, ValueError):
+            return ""
+        plan_body = issue.get("body", "") or ""
+        # Still check for latest iteration in comments
+        try:
+            raw_comments = run_gh(
+                "api", f"repos/{p_owner}/{p_repo}/issues/{p_number}/comments",
+                "--paginate", "--jq", r'.[] | {body: .body}',
+            )
+            if raw_comments.strip():
+                for line in reversed(raw_comments.strip().split("\n")):
+                    try:
+                        comment = json.loads(line)
+                        comment_body = comment.get("body", "")
+                        if "### Implementation Phases" in comment_body:
+                            plan_body = comment_body
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except RuntimeError:
+            pass
+        footer_marker = "\n---\n*Generated by Kōan /plan"
+        if footer_marker in plan_body:
+            plan_body = plan_body[:plan_body.index(footer_marker)].rstrip()
+        return plan_body
+
+    # Auto-detect from PR body
+    detected_url = _detect_plan_url(pr_body)
+    if not detected_url:
+        return ""
+
+    try:
+        p_owner, p_repo, p_number = parse_issue_url(detected_url)
+    except ValueError:
+        return ""
+
+    return _fetch_plan_body(p_owner, p_repo, p_number)
+
+
+def _fetch_pr_commit_shas(owner: str, repo: str, pr_number: str) -> List[str]:
+    """Return the list of full commit SHAs for a PR (oldest first).
+
+    Returns an empty list on any error so callers can treat absence as
+    "no prior state" rather than crashing.
+    """
+    try:
+        raw = run_gh(
+            "api",
+            f"repos/{owner}/{repo}/pulls/{pr_number}/commits",
+            "--paginate",
+            "--jq", r".[].sha",
+        )
+        if not raw.strip():
+            return []
+        return [line.strip() for line in raw.strip().splitlines() if line.strip()]
+    except RuntimeError:
+        return []
+
+
+
 def run_review(
     owner: str,
     repo: str,
@@ -496,6 +858,7 @@ def run_review(
     notify_fn=None,
     skill_dir: Optional[Path] = None,
     architecture: bool = False,
+    plan_url: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[dict]]:
     """Execute a read-only code review on a PR.
 
@@ -507,6 +870,8 @@ def run_review(
         notify_fn: Optional callback for progress notifications.
         skill_dir: Optional path to the review skill directory for prompts.
         architecture: If True, use architecture-focused review prompt.
+        plan_url: Optional explicit GitHub issue URL for the plan to check
+            alignment against. When None, auto-detection from PR body is used.
 
     Returns:
         (success, summary, review_data) tuple. review_data is the validated
@@ -516,32 +881,107 @@ def run_review(
         from app.notify import send_telegram
         notify_fn = send_telegram
 
+    # ── Step 0: Resolve actual PR location (cross-owner support) ──────
+    try:
+        owner, repo = resolve_pr_location(owner, repo, pr_number, project_path)
+    except RuntimeError as e:
+        return False, str(e), None
+
+    from app.config import get_review_concurrency_config
+    concurrency_cfg = get_review_concurrency_config()
+    github_workers = concurrency_cfg["github_workers"]
+    concurrency_enabled = concurrency_cfg["enabled"]
+
     full_repo = f"{owner}/{repo}"
 
-    # Step 1: Fetch PR context
+    # Resolve bot username to exclude own comments from repliable list
+    bot_username = _resolve_bot_username()
+
+    # Step 1: Fetch PR context and repliable comments in parallel
     notify_fn(f"Reviewing PR #{pr_number} ({full_repo})...")
-    try:
-        context = fetch_pr_context(owner, repo, pr_number)
-    except Exception as e:
-        return False, f"Failed to fetch PR context: {e}", None
+    if concurrency_enabled and github_workers > 1:
+        with ThreadPoolExecutor(max_workers=min(2, github_workers)) as pool:
+            f_context = pool.submit(fetch_pr_context, owner, repo, pr_number)
+            f_comments = pool.submit(
+                fetch_repliable_comments, owner, repo, pr_number, True, bot_username,
+            )
+            try:
+                context = f_context.result()
+            except Exception as e:
+                return False, f"Failed to fetch PR context: {e}", None
+            repliable_comments = f_comments.result()
+    else:
+        try:
+            context = fetch_pr_context(owner, repo, pr_number)
+        except Exception as e:
+            return False, f"Failed to fetch PR context: {e}", None
+        repliable_comments = fetch_repliable_comments(
+            owner, repo, pr_number, parallel=False, bot_username=bot_username,
+        )
+
+    # Step 1a: Apply review_ignore filters to the diff (from config.yaml)
+    from app.config import get_review_ignore_config
+    from app.utils import filter_diff_by_ignore
+
+    _review_ignore = get_review_ignore_config()
+    _glob_pats = _review_ignore.get("glob", [])
+    _regex_pats = _review_ignore.get("regex", [])
+    if _glob_pats or _regex_pats:
+        filtered_diff, skipped = filter_diff_by_ignore(
+            context.get("diff", ""),
+            _glob_pats,
+            _regex_pats,
+        )
+        if skipped:
+            print(
+                f"[review_runner] Ignoring {len(skipped)} file(s): {skipped}",
+                file=sys.stderr,
+            )
+        context = {**context, "diff": filtered_diff}
 
     if not context.get("diff"):
         return False, f"PR #{pr_number} has no diff — nothing to review.", None
 
-    # Step 1b: Fetch repliable comments (with IDs for reply targeting)
-    repliable_comments = fetch_repliable_comments(owner, repo, pr_number)
+    # Step 1b: Detect and fetch plan body for alignment checking
+    plan_body = _resolve_plan_body(plan_url, context.get("body", ""))
+
+    # Step 1c: Look up any existing bot summary comment (Phase 3)
+    existing_comment = find_bot_comment(owner, repo, pr_number, SUMMARY_TAG)
+
+    # Step 1d: Fetch current PR commit SHAs (Phase 5 — incremental review)
+    current_shas = _fetch_pr_commit_shas(owner, repo, pr_number)
+
+    # Step 1e: Extract previously reviewed SHAs from existing comment (Phase 5)
+    prior_shas: List[str] = []
+    if existing_comment:
+        raw_prior = extract_between_markers(
+            existing_comment.get("body", ""),
+            COMMIT_IDS_START,
+            COMMIT_IDS_END,
+        )
+        if raw_prior:
+            prior_shas = [s.strip() for s in raw_prior.splitlines() if s.strip()]
+
+    # If all current commits were already reviewed, skip
+    if current_shas and prior_shas and set(current_shas) == set(prior_shas):
+        return (
+            True,
+            f"PR #{pr_number} has no new commits since last review — skipping.",
+            None,
+        )
 
     # Step 2: Build review prompt
     prompt = build_review_prompt(
         context, skill_dir=skill_dir, architecture=architecture,
-        repliable_comments=repliable_comments,
+        repliable_comments=repliable_comments, plan_body=plan_body or None,
     )
 
     # Step 3: Run Claude review (read-only)
     notify_fn(f"Analyzing code changes on `{context['branch']}`...")
-    raw_output = _run_claude_review(prompt, project_path)
+    raw_output, error = _run_claude_review(prompt, project_path)
     if not raw_output:
-        return False, f"Claude review produced no output for PR #{pr_number}.", None
+        detail = f" ({error})" if error else ""
+        return False, f"Claude review failed for PR #{pr_number}{detail}.", None
 
     # Step 4: Parse structured JSON review (with retry)
     review_data = _parse_review_json(raw_output)
@@ -553,7 +993,7 @@ def run_review(
             "You MUST respond with ONLY a valid JSON object matching the "
             "schema described above. No markdown, no text, just JSON."
         )
-        retry_output = _run_claude_review(retry_prompt, project_path)
+        retry_output, _ = _run_claude_review(retry_prompt, project_path)
         if retry_output:
             review_data = _parse_review_json(retry_output)
 
@@ -570,9 +1010,13 @@ def run_review(
         )
         review_body = _extract_review_body(raw_output)
 
-    # Step 6: Post review comment
+    # Step 6: Post (or update) review comment (Phase 3 — idempotent upsert)
+    # Commit SHAs are embedded in the body upfront to avoid extra API calls.
     notify_fn(f"Posting review on PR #{pr_number}...")
-    posted = _post_review_comment(owner, repo, pr_number, review_body)
+    posted = _post_review_comment(
+        owner, repo, pr_number, review_body, existing_comment,
+        commit_shas=current_shas or None,
+    )
 
     # Step 7: Post replies to user comments
     reply_count = 0
@@ -622,6 +1066,11 @@ def main(argv=None):
         "--architecture", action="store_true",
         help="Use architecture-focused review (SOLID, layering, coupling)",
     )
+    parser.add_argument(
+        "--plan-url",
+        help="GitHub issue URL for the plan to check alignment against. "
+             "When omitted, auto-detects from the PR body.",
+    )
     cli_args = parser.parse_args(argv)
 
     try:
@@ -636,6 +1085,7 @@ def main(argv=None):
         owner, repo, pr_number, cli_args.project_path,
         skill_dir=skill_dir,
         architecture=cli_args.architecture,
+        plan_url=cli_args.plan_url,
     )
     print(summary)
     return 0 if success else 1

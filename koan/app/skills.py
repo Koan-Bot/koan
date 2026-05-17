@@ -26,13 +26,18 @@ SKILL.md format:
     ...
 """
 
+import importlib
 import importlib.util
 import logging
+import os
 import re
+import subprocess
+import sys
+import time
 from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 # Returned by _execute_handler() on unhandled exceptions so callers can
 # distinguish handler crashes from intentional error responses.
@@ -77,6 +82,27 @@ class Skill:
     github_context_aware: bool = False
     cli_skill: Optional[str] = None
     group: str = ""
+    emoji: str = ""
+    # ``caveman_enabled`` follows the SKILL.md frontmatter ``caveman:`` flag.
+    # Default ``False`` (opt-in): a skill must declare ``caveman: true`` in
+    # its frontmatter (or be listed in ``optimizations.caveman.include`` in
+    # ``config.yaml``) for the caveman directive to be appended.  Skills
+    # are also free to keep an explicit ``caveman: false`` to document
+    # intent, even though it matches the default.
+    caveman_enabled: bool = False
+    # ``forward_result_enabled`` follows the SKILL.md frontmatter
+    # ``forward_result:`` flag. When True, the post-mission pipeline forwards
+    # the Claude session's result text to outbox.md so the user sees the
+    # response to their slash command / @mention. Auto-derived markers
+    # (slash-command forms of every command + alias, plus ``/{scope}.{name}``)
+    # are matched against the mission title in addition to any explicit
+    # ``title_markers``.
+    forward_result_enabled: bool = False
+    # ``title_markers`` — optional list of additional mission-title substrings
+    # that should also flag a mission as belonging to this skill, for the case
+    # where a handler emits plain-text titles without the slash command.
+    title_markers: List[str] = field(default_factory=list)
+    requirements: List[str] = field(default_factory=list)
 
     @property
     def qualified_name(self) -> str:
@@ -176,7 +202,7 @@ def _parse_inline_list(s: str) -> List[str]:
 
 def _parse_bool_flag(meta: Dict[str, Any], key: str) -> bool:
     """Parse a boolean flag from SKILL.md frontmatter metadata.
-    
+
     Accepts: "true", "yes", "1" (case-insensitive) as truthy values.
     Returns False for any other value or if key is missing.
     """
@@ -206,17 +232,16 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
         return None
 
     # Parse commands
-    commands = []
-    for cmd_data in meta.get("commands", []):
-        if isinstance(cmd_data, dict) and "name" in cmd_data:
-            commands.append(
-                SkillCommand(
-                    name=cmd_data["name"],
-                    description=cmd_data.get("description", ""),
-                    aliases=cmd_data.get("aliases", []),
-                    usage=cmd_data.get("usage", ""),
-                )
-            )
+    commands = [
+        SkillCommand(
+            name=cmd_data["name"],
+            description=cmd_data.get("description", ""),
+            aliases=cmd_data.get("aliases", []),
+            usage=cmd_data.get("usage", ""),
+        )
+        for cmd_data in meta.get("commands", [])
+        if isinstance(cmd_data, dict) and "name" in cmd_data
+    ]
 
     # Resolve handler path (always record declared path; has_handler() checks existence)
     handler_path = None
@@ -226,10 +251,21 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
 
     skill_dir = path.parent
 
-    # Parse boolean flags
+    # Parse boolean flags — caveman is opt-in (defaults to False).
     worker = _parse_bool_flag(meta, "worker")
     github_enabled = _parse_bool_flag(meta, "github_enabled")
     github_context_aware = _parse_bool_flag(meta, "github_context_aware")
+    caveman_enabled = _parse_bool_flag(meta, "caveman")
+    forward_result_enabled = _parse_bool_flag(meta, "forward_result")
+
+    # Parse title_markers (optional inline list or comma-separated scalar).
+    title_markers_raw = meta.get("title_markers", [])
+    if isinstance(title_markers_raw, list):
+        title_markers = [str(m).strip() for m in title_markers_raw if str(m).strip()]
+    elif isinstance(title_markers_raw, str) and title_markers_raw.strip():
+        title_markers = [s.strip() for s in title_markers_raw.split(",") if s.strip()]
+    else:
+        title_markers = []
 
     # Parse audience (default: "bridge" for backward compatibility)
     audience = meta.get("audience", DEFAULT_AUDIENCE).lower()
@@ -241,6 +277,15 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
 
     # Parse group (for /help grouping)
     group = meta.get("group", "")
+
+    # Parse emoji (for /list display)
+    emoji = meta.get("emoji", "")
+
+    # Parse requirements (for auto-install)
+    requirements_raw = meta.get("requirements", [])
+    if isinstance(requirements_raw, str):
+        requirements_raw = [requirements_raw] if requirements_raw else []
+    requirements = [r for r in requirements_raw if r]
 
     return Skill(
         name=meta["name"],
@@ -257,6 +302,11 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
         github_context_aware=github_context_aware,
         cli_skill=cli_skill,
         group=group,
+        emoji=emoji,
+        caveman_enabled=caveman_enabled,
+        forward_result_enabled=forward_result_enabled,
+        title_markers=title_markers,
+        requirements=requirements,
     )
 
 
@@ -289,25 +339,35 @@ class SkillRegistry:
         """Register a skill and build command lookup."""
         key = skill.qualified_name
 
-        # Reject skills whose command names or aliases contain hyphens.
+        # Reject individual commands/aliases whose names contain hyphens.
         # Hyphens break Telegram command parsing (treated as word boundary).
         # See CLAUDE.md "No hyphens in skill names or aliases".
+        # Only the offending command/alias is skipped — the rest of the skill
+        # is still registered.
+        valid_commands: List[SkillCommand] = []
         for cmd in skill.commands:
             if "-" in cmd.name:
-                _log.warning(
+                _log.error(
                     "Skill %s: command '%s' contains a hyphen — "
-                    "skipping registration. Use underscores instead.",
+                    "skipping this command. Use underscores instead.",
                     key, cmd.name,
                 )
-                return
-            for alias in cmd.aliases:
-                if "-" in alias:
-                    _log.warning(
-                        "Skill %s: alias '%s' contains a hyphen — "
-                        "skipping registration. Use underscores instead.",
-                        key, alias,
-                    )
-                    return
+                continue
+            # Filter out hyphenated aliases, keep the rest
+            bad_aliases = [a for a in cmd.aliases if "-" in a]
+            if bad_aliases:
+                _log.error(
+                    "Skill %s: alias(es) %s contain a hyphen — "
+                    "skipping these aliases. Use underscores instead.",
+                    key, ", ".join(repr(a) for a in bad_aliases),
+                )
+            clean_aliases = [a for a in cmd.aliases if "-" not in a]
+            valid_commands.append(SkillCommand(
+                name=cmd.name,
+                description=cmd.description,
+                aliases=clean_aliases,
+                usage=cmd.usage,
+            ))
 
         self._skills[key] = skill
 
@@ -320,11 +380,24 @@ class SkillRegistry:
                 key,
             )
 
-        # Map each command name and alias to this skill
-        for cmd in skill.commands:
+        # Map each valid command name and alias to this skill
+        for cmd in valid_commands:
+            self._check_collision(cmd.name, skill, is_alias=False)
             self._command_map[cmd.name] = skill
             for alias in cmd.aliases:
+                self._check_collision(alias, skill, is_alias=True)
                 self._command_map[alias] = skill
+
+    def _check_collision(self, name: str, skill: Skill, *, is_alias: bool) -> None:
+        """Log a warning if *name* is already registered by a different skill."""
+        existing = self._command_map.get(name)
+        if existing is not None and existing.qualified_name != skill.qualified_name:
+            kind = "alias" if is_alias else "command"
+            _log.warning(
+                "Skill %s: %s '%s' collides with skill %s — "
+                "the earlier registration will be overwritten.",
+                skill.qualified_name, kind, name, existing.qualified_name,
+            )
 
     def get(self, scope: str, name: str) -> Optional[Skill]:
         return self._skills.get(f"{scope}.{name}")
@@ -352,7 +425,7 @@ class SkillRegistry:
         if extra_commands:
             candidates.extend(extra_commands)
 
-        matches = difflib.get_close_matches(command_name, candidates, n=1, cutoff=0.6)
+        matches = difflib.get_close_matches(command_name, candidates, n=1, cutoff=0.5)
         return matches[0] if matches else None
 
     def list_all(self) -> List[Skill]:
@@ -369,6 +442,15 @@ class SkillRegistry:
         """Return core skills belonging to the given help group."""
         return [s for s in self._skills.values()
                 if s.scope == "core" and s.group == group]
+
+    def list_by_group_any_scope(self, group: str) -> List[Skill]:
+        """Return all skills in the given group, regardless of scope.
+
+        Used for the ``integrations`` help group, which is deliberately
+        reserved for non-core skills (e.g. skills under
+        ``instance/skills/<scope>/``).
+        """
+        return [s for s in self._skills.values() if s.group == group]
 
     def groups(self) -> List[str]:
         """Return sorted list of distinct help groups from core skills."""
@@ -426,6 +508,35 @@ class SkillRegistry:
         return qualified_name in self._skills
 
 
+def collect_forward_result_markers(registry: "SkillRegistry") -> List[str]:
+    """Return mission-title substrings for every skill that opted into result forwarding.
+
+    For each skill with ``forward_result_enabled``:
+      - emit ``/{cmd.name}`` and ``/{alias}`` for every command + alias,
+      - emit ``/{scope}.{name}`` (the scoped form used when a project tag is
+        present — see ``command_handlers._queue_cli_skill_mission``),
+      - emit every entry from ``title_markers`` (for handler-composed
+        plain-text mission titles).
+
+    All markers are lower-cased and deduplicated so the caller can do a flat
+    case-insensitive substring check against the mission title.
+    """
+    markers: set[str] = set()
+    for skill in registry.list_all():
+        if not skill.forward_result_enabled:
+            continue
+        markers.add(f"/{skill.scope}.{skill.name}".lower())
+        for cmd in skill.commands:
+            markers.add(f"/{cmd.name}".lower())
+            for alias in cmd.aliases:
+                markers.add(f"/{alias}".lower())
+        for raw in skill.title_markers:
+            text = (raw or "").strip().lower()
+            if text:
+                markers.add(text)
+    return sorted(markers)
+
+
 # ---------------------------------------------------------------------------
 # Skill execution
 # ---------------------------------------------------------------------------
@@ -458,13 +569,155 @@ def execute_skill(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillE
     return None
 
 
+# Captured at import time so first-time observations in
+# _refresh_stale_app_modules can tell whether a module's source file has been
+# rewritten by auto-update since this process started (Python had no chance to
+# pick up the new content because sys.modules still holds the pre-update copy).
+_PROCESS_START_TIME: float = time.time()
+# mtime cache: module_name -> last-seen mtime (float)
+_module_mtimes: Dict[str, float] = {}
+
+# Track which skills have already had their requirements satisfied this session
+_requirements_satisfied: Set[str] = set()
+
+
+def _reset_requirements_cache() -> None:
+    """Clear the per-session requirements cache (used by tests)."""
+    _requirements_satisfied.clear()
+
+
+def ensure_requirements(skill: Skill) -> Optional[str]:
+    """Check and install missing Python packages declared in a skill's requirements.
+
+    Returns None on success, or an error message string on failure.
+    """
+    if not skill.requirements:
+        return None
+
+    # Skip if already checked this session
+    if skill.qualified_name in _requirements_satisfied:
+        return None
+
+    # Reject entries that look like pip CLI flags (e.g. --index-url)
+    for pkg in skill.requirements:
+        if pkg.startswith("-"):
+            return f"Invalid requirement '{pkg}' for skill {skill.qualified_name}: flags not allowed"
+
+    missing = []
+    for pkg in skill.requirements:
+        # Normalize: pip package names use hyphens, but import names use underscores
+        # Split on any PEP 440 version operator (~=, >=, <=, !=, ===, ==, >, <)
+        import_name = re.split(r'[><=!~]', pkg)[0].replace("-", "_").strip()
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            missing.append(pkg)
+
+    if not missing:
+        _requirements_satisfied.add(skill.qualified_name)
+        return None
+
+    # Install missing packages
+    _log.info(
+        "[skills] auto-installing %s for skill %s",
+        ", ".join(missing), skill.qualified_name,
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            error_msg = (
+                f"Failed to install requirements for skill {skill.qualified_name}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            _log.error(error_msg)
+            return error_msg
+
+        _requirements_satisfied.add(skill.qualified_name)
+        return None
+    except subprocess.TimeoutExpired:
+        error_msg = f"Timeout installing requirements for skill {skill.qualified_name}"
+        _log.error(error_msg)
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error installing requirements for skill {skill.qualified_name}: {e}"
+        _log.error(error_msg)
+        return error_msg
+
+
+def _refresh_stale_app_modules() -> None:
+    """Reload app.* modules whose source files changed on disk.
+
+    Skill handlers are loaded fresh via exec_module() each invocation, but
+    their ``import app.foo`` statements resolve from sys.modules.  After an
+    auto-update the cached entry may be stale (missing new functions/args),
+    causing TypeErrors at call sites.
+
+    Instead of maintaining a hardcoded list of modules to refresh, this
+    checks the mtime of every loaded ``app.*`` module's source file.  Only
+    modules whose file actually changed are reloaded — typically zero on
+    most invocations, making this cheap in the common case.
+
+    If reload fails (e.g. partial write during update), the stale entry is
+    evicted so the handler's own ``import`` fetches a fresh copy from disk.
+    """
+    for name in list(sys.modules):
+        if not name.startswith("app."):
+            continue
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        source = getattr(mod, "__file__", None)
+        if source is None:
+            continue
+        try:
+            current_mtime = os.path.getmtime(source)
+        except OSError:
+            continue
+        cached_mtime = _module_mtimes.get(name)
+        if cached_mtime is not None and current_mtime == cached_mtime:
+            continue
+        # Reload when either: (a) we have a baseline and the file changed, or
+        # (b) this is the first observation but the file was modified after the
+        # process started — i.e. auto-update rewrote it before we built a baseline.
+        should_reload = (
+            cached_mtime is not None
+            or current_mtime > _PROCESS_START_TIME
+        )
+        if should_reload:
+            try:
+                importlib.reload(mod)
+                _log.debug("Reloaded stale module %s", name)
+            except Exception as e:
+                _log.debug("Failed to reload %s, evicting: %s", name, e)
+                sys.modules.pop(name, None)
+                _module_mtimes.pop(name, None)
+                continue
+        _module_mtimes[name] = current_mtime
+
+
 def _execute_handler(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillError]]:
     """Load and execute a Python handler."""
     handler_path = skill.handler_path
     if handler_path is None:
         return None
 
+    # Auto-install declared requirements before first execution
+    req_error = ensure_requirements(skill)
+    if req_error:
+        return SkillError(
+            skill_name=skill.qualified_name,
+            exception=RuntimeError(req_error),
+            message=req_error,
+        )
+
     try:
+        _refresh_stale_app_modules()
+
         spec = importlib.util.spec_from_file_location(
             f"skill_handler_{skill.qualified_name}",
             str(handler_path),
@@ -510,15 +763,24 @@ def build_registry(extra_dirs: Optional[List[Path]] = None) -> SkillRegistry:
 
     Args:
         extra_dirs: Additional directories to scan (e.g., instance/skills/).
+
+    Skills under ``extra_dirs`` are filtered through the approval gate:
+    any SKILL.md whose own directory or an ancestor up to the extra dir
+    carries a ``.koan-pending`` marker is silently skipped so the bridge
+    cannot exec a handler that has not been approved.
     """
     registry = SkillRegistry(get_default_skills_dir())
 
     if extra_dirs:
+        from app.skill_approval import find_pending_ancestor
         for d in extra_dirs:
-            if d.is_dir():
-                for skill_md in sorted(d.rglob("SKILL.md")):
-                    skill = parse_skill_md(skill_md)
-                    if skill:
-                        registry._register(skill)
+            if not d.is_dir():
+                continue
+            for skill_md in sorted(d.rglob("SKILL.md")):
+                if find_pending_ancestor(skill_md, d) is not None:
+                    continue
+                skill = parse_skill_md(skill_md)
+                if skill:
+                    registry._register(skill)
 
     return registry

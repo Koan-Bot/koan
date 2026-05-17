@@ -93,7 +93,7 @@ Pending  →  In Progress  →  Done ✓
 ```
 
 1. **Pending** — Queued and waiting. Kōan picks missions from the top of the queue.
-2. **In Progress** — Kōan is actively working on it via Claude Code CLI.
+2. **In Progress** — Kōan is actively working on it via the configured CLI provider.
 3. **Done** — Completed successfully. Code is in a `koan/*` branch, often with a draft PR.
 4. **Failed** — Something went wrong. Kōan logs the reason and moves on.
 
@@ -141,6 +141,11 @@ If Kōan misclassifies your message, use `/chat` to force chat mode:
 - `/cancel auth` — Cancel the mission matching "auth"
 </details>
 
+**`/abort`** — Abort the current in-progress mission and move to the next one.
+
+- **Usage:** `/abort`
+- The running Claude subprocess is killed, the mission is moved to Failed, and the agent loop picks the next pending item.
+
 **`/priority`** — Move a pending mission to a different position in the queue.
 
 - **Usage:** `/priority <n>` (move to top) or `/priority <n> <position>`
@@ -177,22 +182,40 @@ If Kōan misclassifies your message, use `/chat` to force chat mode:
 - `/live` — Check what Kōan is doing right now during a long mission
 </details>
 
-**`/logs`** — Show the last 10 lines from run.log and awake.log, formatted in code blocks.
+**`/logs [run|awake|all]`** — Show the last 20 lines from log files, formatted in code blocks.
+
+- **Default:** Shows only `run.log`. Use `awake` for bridge logs, `all` for both.
 
 <details>
 <summary>Use cases</summary>
 
-- `/logs` — Quick check of recent agent and bridge output without SSH access
+- `/logs` — Quick check of recent agent output (run.log only)
+- `/logs awake` — Check bridge/Telegram polling output
+- `/logs all` — See both run and awake logs
 </details>
 
-**`/quota`** — Check remaining API quota (live, no cache).
+**`/quota [remaining_%]`** — Check remaining API quota (live, no cache), or override the internal estimate.
 
 - **Aliases:** `/q`
 
 <details>
 <summary>Use cases</summary>
 
-- `/quota` — See how much API budget is left before adding heavy missions
+- `/quota` — See how much API budget is left before adding heavy missions, plus the rolling burn rate (%/h) and estimated time to exhaustion
+- `/quota 32` — Tell Kōan it has 32% remaining (fixes drift when internal estimate is wrong)
+- If Kōan is paused due to quota but the API is actually available, `/quota 50` will correct the estimate and clear the pause
+- When the burn rate predicts session exhaustion in less than 30 min, the autonomous mode is automatically downgraded one tier (deep→implement→review). A Telegram alert fires once when projected exhaustion is under 60 min and the next quota reset is still more than 2 h away.
+</details>
+
+**`/check_notifications`** — Force an immediate check of GitHub and Jira notifications, bypassing the exponential backoff timer.
+
+- **Aliases:** `/read`
+
+<details>
+<summary>Use cases</summary>
+
+- `/read` — When the queue is empty and you know there are pending notifications
+- `/check_notifications` — After posting a GitHub comment that should trigger a mission
 </details>
 
 **`/verbose`** / **`/silent`** — Toggle real-time progress updates. When verbose is on, Kōan sends progress messages as it works.
@@ -253,6 +276,63 @@ Kōan can manage multiple projects simultaneously. It rotates between them based
 - `/unfocus` — "OK, back to normal"
 </details>
 
+**`/passive`** — Enter passive (read-only) mode. The agent loop keeps running (heartbeat, GitHub notification polling, Telegram commands) but never executes missions or autonomous work. Missions accumulate as Pending.
+
+- **Usage:** `/passive [duration]` — no duration = indefinite
+- **Examples:** `/passive`, `/passive 4h`, `/passive 2h30m`
+
+**`/active`** — Exit passive mode and resume normal execution. Queued missions drain naturally.
+
+<details>
+<summary>Use cases</summary>
+
+- `/passive` — "I'm at the desk, don't touch anything"
+- `/passive 4h` — "Hands off for the next 4 hours"
+- `/active` — "I'm done, you can work again"
+</details>
+
+### Permanent Focus Mode
+
+Focus mode can be made permanent via config, turning Kōan into a pure mission executor. When enabled, the agent only runs missions you explicitly queue — it never picks up GitHub issues autonomously, never runs contemplative reflection, and never enters DEEP mode. The loop keeps polling Telegram, GitHub notifications, and recurring schedules, so it still wakes up the moment you queue something.
+
+This extends the `/focus` Telegram command (which is time-bounded) into a permanent config-level switch.
+
+- **Enable globally in `instance/config.yaml`:**
+  ```yaml
+  focus: true
+  ```
+- **Or via environment variable:** `KOAN_FOCUS=1` (takes precedence over `config.yaml`).
+- **Per-project in `projects.yaml`:**
+  ```yaml
+  defaults:
+    focus: true          # All projects focused by default
+  projects:
+    myapp:
+      focus: false       # Override: allow autonomous work on myapp
+  ```
+- **Disable:** set back to `false`, or `KOAN_FOCUS=0`.
+
+What continues to run under focus mode:
+
+- Missions queued via `/mission`, GitHub `@mention` commands, and recurring schedules.
+- Heartbeat, auto-update, Telegram polling, GitHub notification polling, CI queue drain.
+
+What is disabled:
+
+- DEEP mode (capped at `implement`).
+- Contemplative sessions (random reflection rolls are skipped).
+- Autonomous exploration (the loop idles with wake-on-mission when no mission is pending).
+- The agent prompt's `GitHub Issue Selection` section is replaced with an explicit "do not pick up issues" instruction.
+
+**How it differs from `/passive`:** passive mode blocks all execution (missions sit as Pending until you `/active`). Focus mode keeps the executor running for any mission you queue — it only gates *autonomous work selection*.
+
+**When to use:**
+
+- You want Kōan to act strictly on demand, no surprises on the PR list.
+- You're handing off mission dispatch to another system (CI, a team workflow) and want Kōan to be a quiet executor.
+- Multi-bot setups where only one instance should pick up issues autonomously.
+- Per-project: focus some repos while allowing exploration on others.
+
 ---
 
 ## Intermediate — Productivity Workflows
@@ -261,7 +341,42 @@ These features turn Kōan from a task runner into a full development workflow pa
 
 ### Code Operations
 
-**`/brainstorm`** — Decompose a broad topic into multiple linked GitHub issues grouped under a master tracking issue.
+**`/brainstorm`** — Decompose a broad topic into 3-8 high-leverage GitHub sub-issues grouped under a master tracking issue.
+
+The decomposer runs as a senior-engineer-style ideation pass: it explores the codebase (if provided) or external source, hunts for compounding improvements, and refuses to pad with generic refactors. Every sub-issue body follows this template:
+
+```markdown
+## Why This Matters
+<leverage rationale — why this is unusual or high-leverage>
+
+## Approach
+<concrete implementation strategy, grounded in real files and patterns>
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Risks & Caveats
+<hidden complexity, operational risk, maintenance burden>
+
+## Scores
+- Impact:          ████████░░ 8/10
+- Difficulty:      ██████░░░░ 6/10
+- Short-Term ROI:  ███████░░░ 7/10
+- Long-Term Value: █████████░ 9/10
+
+## Priority
+Immediate | Prototype First | Research Further | Skip
+
+## Dependencies
+<SUB-N references to other sub-issues, or "None">
+```
+
+The master tracking issue then synthesizes the set with three optional sections:
+
+- **Top Ranked** — sub-issues ordered by ROI / feasibility / strategic value, each with a one-line rationale.
+- **Fast Wins** — bucketed by horizon: `< 1 day`, `< 1 week`, `< 1 month`.
+- **Overall Assessment** — short critical verdict on whether the initiative is worth pursuing and what to prioritize.
 
 - **Usage:** `/brainstorm <topic>`, `/brainstorm <project> <topic>`, `/brainstorm <topic> --tag <label>`
 - **GitHub @mention:** `@koan-bot /brainstorm <topic>` on an issue
@@ -285,6 +400,27 @@ These features turn Kōan from a task runner into a full development workflow pa
 - `/plan Add WebSocket support for real-time notifications` — Get a phased plan before writing any code
 - `/plan https://github.com/org/repo/issues/42` — Iterate on an existing issue's plan
 - `/plan webapp Add rate limiting to public API endpoints` — Target a specific project
+</details>
+
+**`/deepplan`** — Spec-first design with Socratic exploration of 2-3 approaches before planning. For complex missions where design matters more than speed.
+
+- **Usage:** `/deepplan <idea>`, `/deepplan <project> <idea>`, `/deepplan <github-issue-url>`
+- **Aliases:** `/deeplan`
+- **GitHub @mention:** `@koan-bot /deepplan <idea>` on an issue
+
+The workflow: (1) explores your codebase and surfaces 2-3 distinct design approaches with trade-offs, (2) runs a spec review loop (up to 5 iterations) to ensure the spec is concrete and complete, (3) posts the approved spec as a GitHub issue, (4) queues a `/plan <issue-url>` mission for your review and approval.
+
+When given a GitHub issue URL, the project is automatically detected from the repository and the issue title, body, and all comments are fetched to provide full context for the design exploration.
+
+Use this before `/plan` when the idea is architecturally complex, when you want to explore alternatives before committing, or when design mistakes would be expensive to fix later.
+
+<details>
+<summary>Use cases</summary>
+
+- `/deepplan Refactor the auth middleware to support OAuth2` — Explore design approaches before writing any code
+- `/deepplan koan Add multi-tenant project isolation` — Target a specific project with spec-first design
+- `/deepplan https://github.com/org/repo/issues/42` — Deep plan from an existing GitHub issue with full context
+- `/deepplan Redesign the mission queue for concurrent execution` — Surface trade-offs for a complex architectural change
 </details>
 
 **`/implement`** — Queue an implementation mission for a GitHub issue.
@@ -362,10 +498,43 @@ These features turn Kōan from a task runner into a full development workflow pa
 - **Aliases:** `/rb`
 - **GitHub @mention:** `@koan-bot /rebase` on a PR
 
+After completion, Kōan posts a structured comment on the PR with these sections:
+
+1. **Summary** — Classifies the rebase (simple / with adjustments / with conflict resolution)
+2. **Changes applied** — List of modifications beyond the rebase itself (review feedback, conflict resolution, CI fixes)
+3. **Stats** — Diff summary (files changed, insertions, deletions)
+4. **Actions performed** — Pipeline steps in a collapsible `<details>` block
+5. **CI status** — Test/CI outcome
+
 <details>
 <summary>Use cases</summary>
 
 - `/rebase https://github.com/org/repo/pull/42` — Resolve conflicts and update the PR
+</details>
+
+**`/reviewrebase`** — Review a PR then rebase it, so review insights feed the rebase.
+
+- **Usage:** `/reviewrebase <pr-url>`
+- **Aliases:** `/rr`
+- **GitHub @mention:** `@koan-bot /rr` on a PR
+
+<details>
+<summary>Use cases</summary>
+
+- `/rr https://github.com/org/repo/pull/42` — Queues `/review` then `/rebase` in sequence
+- Extra context after the URL is passed to the review step (e.g., `/rr <url> focus on error handling`)
+</details>
+
+**`/squash`** — Squash all PR commits into a single clean commit.
+
+- **Usage:** `/squash <pr-url>`
+- **Aliases:** `/sq`
+- **GitHub @mention:** `@koan-bot /squash` on a PR
+
+<details>
+<summary>Use cases</summary>
+
+- `/squash https://github.com/org/repo/pull/42` — Clean up messy commit history before merge
 </details>
 
 **`/recreate`** — Re-implement a PR from scratch on a fresh branch. Useful when a PR has diverged too far.
@@ -390,15 +559,50 @@ These features turn Kōan from a task runner into a full development workflow pa
 - `/pr https://github.com/org/repo/pull/55` — Review a PR and apply updates
 </details>
 
+**`/branches`** — List koan branches and open PRs with recommended merge order and stats.
+
+- **Usage:** `/branches [project_name]`
+- **Aliases:** `/br`, `/prs`
+
+<details>
+<summary>Use cases</summary>
+
+- `/branches` — Show all koan branches for the default project with merge recommendations
+- `/branches koan` — Show branches for a specific project
+</details>
+
 **`/check`** — Run project health checks on a PR or issue (rebase, review, plan as needed).
 
 - **Usage:** `/check <pr-or-issue-url>`
 - **Aliases:** `/inspect`
 
+The check loop also **auto-forwards unresolved human review comments** on Kōan-created PRs. When a reviewer leaves comments, `/check` detects them and creates a mission to address the feedback — no explicit @mention required. Fingerprint-based deduplication (SHA-256 of sorted comment IDs) prevents re-dispatching the same set of comments across repeated checks. Bot comments (Codecov, Dependabot, etc.) are filtered out automatically.
+
+Configure this behavior in `config.yaml`:
+
+```yaml
+review_dispatch:
+  include_drafts: true   # Also dispatch for draft PRs (default: true)
+```
+
 <details>
 <summary>Use cases</summary>
 
 - `/check https://github.com/org/repo/pull/42` — Let Kōan decide what a PR needs
+- Reviewer leaves comments on a PR → next `/check` run creates a mission to address them
+</details>
+
+**`/ci_check`** — Check and fix CI failures on a GitHub PR using Claude.
+
+- **Usage:** `/ci_check <pr-url>`
+
+Usually auto-triggered when CI fails after a `/rebase`, but can also be invoked manually. Fetches failure logs, checks out the PR branch, and runs Claude to attempt a fix. If the fix produces a commit, it force-pushes and re-enqueues the PR for CI monitoring.
+
+<details>
+<summary>Use cases</summary>
+
+- `/ci_check https://github.com/org/repo/pull/42` — Attempt to fix CI failures on a PR
+- Auto-injected by the CI queue when a post-rebase CI run fails
 </details>
 
 **`/gh_request`** — Route a natural-language GitHub request to the appropriate action.
@@ -582,7 +786,7 @@ Kōan automatically adapts its work intensity based on remaining API quota:
 | **REVIEW** | <15% | Read-only analysis, code audits, lightweight tasks |
 | **WAIT** | <5% | Graceful pause until quota resets |
 
-You don't need to manage this — Kōan adjusts automatically. Use `/quota` to see the current mode.
+You don't need to manage this — Kōan adjusts automatically. Use `/quota` to see the current mode. If the internal estimate drifts from reality, use `/quota <N>` to override (e.g., `/quota 50` tells Kōan it has 50% remaining).
 
 ### Exploration Mode
 
@@ -757,11 +961,97 @@ schedule:
 skill_timeout: 3600           # Max seconds for /fix, /implement, /incident
 skill_max_turns: 200          # Max agentic turns for heavy skills
 
+# Stagnation detection — kill Claude sessions stuck in a loop early
+# (identical trailing stdout hash across `abort_after_cycles` samples).
+# Prevents quota burn when Claude keeps retrying the same failing tool.
+# Stagnated missions are re-queued for retry up to `max_retry_on_stagnation`
+# times before being marked Failed, since a fresh start often unsticks Claude.
+stagnation:
+  enabled: true               # Set false to disable globally
+  check_interval_seconds: 60  # How often to sample subprocess stdout
+  abort_after_cycles: 3       # Identical samples required to kill (min 2)
+  sample_lines: 50            # Trailing lines hashed each sample
+  max_retry_on_stagnation: 3  # Stagnation requeues before marking Failed (0 disables retry)
+
 # Prompt guard (content safety)
 prompt_guard: true            # Enable prompt injection detection
+
+# Output optimizations — caveman directive ("no filler, 3–6 word sentences,
+# direct answers"). ``enabled`` controls the agent loop (default true);
+# skills are opt-in via SKILL.md ``caveman: true`` or this ``include`` list.
+optimizations:
+  caveman:
+    enabled: true
+    include: []                # canonical skill names, aliases auto-resolved
+
+# Review ignore — exclude files from /review PR diffs
+# Reduces token spend on generated/vendored code
+# review_ignore:
+#   glob:
+#     - "vendor/**"    # all files under vendor/
+#     - "*.lock"       # lock files at any depth
+#   regex:
+#     - '.*\.pb\.go$'  # protobuf-generated files (full path regex)
 ```
 
 See `instance.example/config.yaml` for all available options.
+
+**`/config_check`** — Detect drift between your `instance/config.yaml` and the template at `instance.example/config.yaml`. Reports two things:
+
+- **Missing keys** — in the template but absent from your config. These are new features released since you last synced and are probably worth reviewing.
+- **Extra keys** — in your config but absent from the template. These are usually deprecated/removed settings (or typos).
+
+Run it after every Kōan update to stay in sync:
+
+```
+/config_check
+```
+
+The same check runs automatically as part of `/doctor` — use `/config_check` when you only want the config slice without the rest of the diagnostic report.
+
+### Caveman Output Optimization
+
+Caveman appends a "no filler, 3–6 word sentences, direct answers" directive to Claude prompts to reduce output tokens.
+
+**Where it applies by default:**
+
+- **Agent loop (regular missions)** — caveman is on by default. This is the highest-volume Claude entry point, so the directive yields the most savings here.
+- **Skills and chat — opt-in.** A skill receives caveman only when it explicitly says so. New skills (core or custom) inherit *no* caveman until the author or operator turns it on.
+
+**Core skills shipping with caveman opted in (`caveman: true`)** — these produce terse, status-style output where the directive helps:
+
+| Skill | Why caveman fits |
+|-------|------------------|
+| `/rebase`, `/recreate`, `/squash` | Git-plumbing skills; output is mostly status |
+| `/fix` | Focused issue-fix flow |
+| `/ci_check` | Diagnostic, action-oriented |
+| `/check` | PR/issue check report |
+| `/implement` | Mission narration during implementation |
+
+**Core skills shipping with caveman opted out (`caveman: false`)** — terseness directly hurts these (kept explicit for clarity, even though it matches the default):
+
+`/plan`, `/deepplan`, `/review`, `/security_audit`, `/audit`, `/brainstorm`, `/sparring`, `/incident`, `/claudemd`, `/chat`.
+
+**Operator override — the `include:` list:**
+
+```yaml
+optimizations:
+  caveman:
+    enabled: true
+    include: [my_custom_skill, deeplan]   # aliases auto-resolved → deepplan
+```
+
+Names match **canonical command names**; aliases declared in `koan/app/skill_dispatch.py` (`deeplan` → `deepplan`, `security`/`secu` → `security_audit`, …) resolve automatically. The operator's `include:` list overrides a SKILL.md `caveman: false`, giving instance owners the final say.
+
+**Switching the global flag off** disables caveman everywhere — agent loop included:
+
+```yaml
+optimizations:
+  caveman:
+    enabled: false
+```
+
+**Custom skill authors:** add `caveman: true` to your SKILL.md frontmatter when your skill produces terse output that benefits from the directive — see `koan/skills/README.md`.
 
 ### Per-Project Overrides
 
@@ -789,7 +1079,7 @@ projects:
 ```
 
 Key per-project settings:
-- **`cli_provider`** — `claude`, `copilot`, or `local`
+- **`cli_provider`** — `claude`, `codex`, `copilot`, `local`, or `ollama-launch`
 - **`models`** — Override model selection per role
 - **`tools`** — Restrict available tools
 - **`git_auto_merge`** — Auto-merge completed PRs (strategy: squash/merge/rebase)
@@ -803,8 +1093,24 @@ Kōan's skill system is fully extensible. Install skills from Git repos or creat
 **Install from Git:**
 ```
 /skill install https://github.com/your-org/koan-skills.git
+/skill approve <scope> <fingerprint>
 /skill update <scope>
 /skill remove <scope>
+```
+
+Freshly installed and scaffolded skills are **quarantined** until you approve
+them. Kōan replies with a short hex fingerprint of the on-disk files; loaded
+handlers are skipped by the registry until you run `/skill approve` with that
+fingerprint. This blocks blind / prompt-injected installs from running code in
+the bridge process. Inspect the files in `instance/skills/<scope>/` first.
+
+Optional `config.yaml` allow-list to refuse clones outside trusted hosts
+(defense-in-depth; the approval gate still applies if you do not set it):
+
+```yaml
+skills:
+  allowed_hosts:
+    - github.com/your-org
 ```
 
 **Create your own:** Add a `SKILL.md` file in `instance/skills/<scope>/<name>/`:
@@ -858,6 +1164,7 @@ Ten skills can be triggered by commenting `@koan-bot <command>` on GitHub issues
 | `/fix` | `@koan-bot /fix` on an issue |
 | `/review` | `@koan-bot /review` on a PR |
 | `/rebase` | `@koan-bot /rebase` on a PR |
+| `/reviewrebase` | `@koan-bot /rr` on a PR |
 | `/recreate` | `@koan-bot /recreate` on a PR |
 | `/refactor` | `@koan-bot /refactor` on a PR or issue |
 | `/plan` | `@koan-bot /plan <idea>` on an issue |
@@ -872,6 +1179,7 @@ Kōan supports multiple CLI backends. Configure globally via `KOAN_CLI_PROVIDER`
 | Provider | Best for | Docs |
 |----------|----------|------|
 | **Claude Code** (default) | Full-featured agent, best reasoning | [provider-claude.md](provider-claude.md) |
+| **OpenAI Codex** | ChatGPT users who want Codex models | [provider-codex.md](provider-codex.md) |
 | **GitHub Copilot** | Teams with existing Copilot licenses | [provider-copilot.md](provider-copilot.md) |
 | **Local LLM** | Offline, privacy, zero API cost | [provider-local.md](provider-local.md) |
 
@@ -925,15 +1233,18 @@ Kōan supports multiple CLI backends. Configure globally via `KOAN_CLI_PROVIDER`
 - `/shutdown` — Gracefully stop everything (e.g., before system maintenance)
 </details>
 
-**`/update`** — Pull the latest Kōan code from upstream and restart.
+**`/update`** — Finish the current mission, pull updates, and restart.
 
 - **Aliases:** `/upgrade`
-- Only restarts when new code is pulled. Use `/restart` to force a restart without pulling.
+- Graceful update: waits for the current mission to complete before pulling and restarting.
+- If the update fails, Kōan still restarts (you asked for it).
+- Use `/restart` if you just need a fresh start without pulling code.
 
 <details>
 <summary>Use cases</summary>
 
-- `/update` — Get the latest features and fixes
+- `/update` — "Finish what you're doing, update yourself, and come back"
+- `/upgrade` — Same as `/update`
 </details>
 
 **`/restart`** — Restart both agent and bridge processes without pulling new code.
@@ -962,6 +1273,28 @@ Kōan maintains persistent memory across sessions through several interconnected
 - **`soul.md`** — Agent personality definition (see [Personality Customization](#personality-customization))
 
 Memory is automatically compacted over time. Kōan uses it to build context for each mission, remembering past decisions, patterns, and mistakes.
+
+#### Memory Compaction
+
+Kōan runs automatic memory maintenance every 24 hours (configurable) during the startup cleanup cycle:
+
+1. **Learnings dedup** — Removes exact-duplicate lines from `learnings.md` files
+2. **Semantic compaction** — Uses Claude (lightweight model) to merge redundant entries, remove references to deleted code, and consolidate by topic. Cross-references the project's file tree to identify obsolete entries.
+3. **Hard cap** — Safety-net truncation that keeps only the most recent entries if the file is still too large after compaction
+4. **Global memory rotation** — Truncates append-only files (`personality-evolution.md`, `emotional-memory.md`) to prevent unbounded growth
+
+Configure thresholds in `config.yaml`:
+
+```yaml
+memory:
+  learnings_max_lines: 100        # Target after semantic compaction
+  learnings_hard_cap: 200         # Absolute max (safety net)
+  global_personality_max: 150     # Max lines for personality-evolution.md
+  global_emotional_max: 100       # Max lines for emotional-memory.md
+  compaction_interval_hours: 24   # How often cleanup runs
+```
+
+Manual compaction via CLI: `python3 memory_manager.py <instance_dir> compact-learnings [project]`
 
 ### Personality Customization
 
@@ -1010,6 +1343,20 @@ See [docs/auto-update.md](auto-update.md) for details.
 - `/del myrepo` — Same, using short alias
 </details>
 
+### Renaming Projects
+
+**`/rename`** — Rename a project across all configuration and instance files.
+
+- **Usage:** `/rename <old_name> <new_name>`
+- **Aliases:** `/rename_project`
+
+<details>
+<summary>Use cases</summary>
+
+- `/rename anantys-back aback` — Rename a project everywhere (projects.yaml, memory, journals, instance files)
+- `/rename my-long-project mlp` — Shorten a project name for easier typing
+</details>
+
 ### Performance Profiling
 
 **`/profile`** — Queue a performance profiling mission for a project.
@@ -1055,6 +1402,66 @@ See [docs/auto-update.md](auto-update.md) for details.
 - `/dead_code` — Scan the default project
 </details>
 
+### Codebase Audit
+
+**`/audit`** — Audit a project for optimizations, simplifications, and potential issues. Creates a GitHub issue for each finding with detailed problem description, impact analysis, suggested fix, and severity/effort classification.
+
+- **Usage:** `/audit <project-name> [extra context] [limit=N]`
+- **GitHub @mention:** `@koan-bot /audit` on an issue or PR
+- Default: top 5 most important findings. Use `limit=N` to override.
+
+<details>
+<summary>Use cases</summary>
+
+- `/audit koan` — Full audit of the koan project (top 5 findings)
+- `/audit webapp focus on the auth module` — Audit with specific focus
+- `/audit mylib look for performance bottlenecks limit=10` — Targeted audit with custom limit
+</details>
+
+Each finding becomes a GitHub issue with:
+- **Problem** — What's wrong and why it matters
+- **Why This Matters** — Impact on bugs, performance, or maintainability
+- **Suggested Fix** — Concrete description of what to change
+- **Details table** — Severity, category, location, and effort estimate
+
+### Security Audit
+
+**`/security_audit`** — Perform a security-focused SDLC audit of a project. Searches for critical vulnerabilities (injection, auth flaws, secrets exposure, path traversal, SSRF, insecure deserialization, etc.) and creates a GitHub issue for each finding.
+
+- **Usage:** `/security_audit <project-name> [extra context] [limit=N]`
+- **Aliases:** `/security`, `/secu`
+- **GitHub @mention:** `@koan-bot /security_audit` on an issue or PR
+- Default: top 5 most critical findings. Use `limit=N` to override.
+
+<details>
+<summary>Use cases</summary>
+
+- `/security_audit koan` — Full security audit (top 5 critical findings)
+- `/security myapp focus on the API endpoints` — Security audit with specific focus
+- `/secu webapp limit=3` — Quick security scan with custom limit
+</details>
+
+Each finding becomes a GitHub issue with:
+- **Problem** — The vulnerability and how it could be exploited
+- **Why This Matters** — Real-world impact (data breach, RCE, privilege escalation)
+- **Suggested Fix** — Concrete remediation steps
+- **Details table** — Severity, category, location, and effort estimate
+
+**Private Vulnerability Reporting (PVRS):** When the target repository has GitHub's Private Vulnerability Reporting enabled, critical and high severity findings are automatically submitted as private security advisories instead of public issues. This prevents disclosure of exploitable vulnerabilities before a fix is applied. Lower-severity findings still create public issues.
+
+Configure PVRS behavior per-project in `projects.yaml`:
+
+```yaml
+defaults:
+  security:
+    pvrs: auto          # auto (detect), true (force), false (public only)
+    pvrs_threshold: high # minimum severity for PVRS (critical, high, medium, low)
+projects:
+  myapp:
+    security:
+      pvrs: false  # always use public issues for this project
+```
+
 ### Incident Triage
 
 **`/incident`** — Triage a production error from a stack trace or log snippet. Kōan will parse the error, identify the root cause, propose a fix with tests, and submit a draft PR.
@@ -1097,33 +1504,43 @@ All commands at a glance. **Tier:** B = Beginner, I = Intermediate, P = Power Us
 | `/mission <text>` | — | B | Queue a new mission (`--now` for top priority) |
 | `/list` | `/queue`, `/ls` | B | List pending and in-progress missions |
 | `/cancel <n>` | `/remove`, `/clear` | B | Cancel a pending mission |
+| `/abort` | — | B | Abort current mission, pick next pending |
 | `/priority <n>` | — | B | Reorder a pending mission in the queue |
 | `/status` | `/st` | B | Quick status overview |
 | `/ping` | — | B | Check if the agent loop is alive |
 | `/usage` | — | B | Detailed quota and progress |
 | `/metrics` | — | B | Mission success rates and reliability stats |
 | `/live` | `/progress` | B | Show live progress of current mission |
-| `/logs` | — | B | Show last 10 lines from run and awake logs |
-| `/quota` | `/q` | B | Check LLM quota (live) |
+| `/logs [run\|awake\|all]` | — | B | Show last 20 lines from logs (default: run) |
+| `/check_notifications` | `/read` | B | Force immediate GitHub + Jira notification check |
+| `/quota [N]` | `/q` | B | Check LLM quota (live), or override remaining % |
 | `/chat <msg>` | — | B | Force chat mode (bypass mission detection) |
 | `/verbose` | — | B | Enable real-time progress updates |
 | `/silent` | — | B | Disable real-time progress updates |
 | `/projects` | `/proj` | B | List configured projects |
 | `/focus [duration]` | — | B | Lock agent to one project |
 | `/unfocus` | — | B | Exit focus mode |
+| `/passive [duration]` | — | B | Enter read-only passive mode |
+| `/active` | — | B | Exit passive mode, resume execution |
 | `/brainstorm <topic>` | — | I | Decompose topic into linked sub-issues + master issue |
 | `/plan <desc>` | — | I | Create a structured implementation plan |
+| `/deepplan <idea\|issue-url>` | `/deeplan` | I | Spec-first design: explore approaches, post spec, queue /plan |
 | `/implement <issue>` | `/impl` | I | Implement a GitHub issue |
 | `/fix <issue>` | — | I | Full bug-fix pipeline (understand → plan → test → fix → PR) |
 | `/review <PR> [--architecture]` | `/rv` | I | Review a pull request |
 | `/refactor <desc>` | `/rf` | I | Targeted refactoring mission |
 | `/ask <comment-url>` | — | I | Ask a question about a PR/issue — posts AI reply to GitHub |
 | `/rebase <PR>` | `/rb` | I | Rebase a PR onto its base branch |
+| `/reviewrebase <PR>` | `/rr` | I | Review then rebase a PR (combo) |
+| `/squash <PR>` | `/sq` | I | Squash all PR commits into one clean commit |
 | `/recreate <PR>` | `/rc` | I | Re-implement a PR from scratch |
 | `/pr <PR>` | — | I | Review and update a GitHub PR |
+| `/branches [project]` | `/br`, `/prs` | B | List koan branches + PRs with merge order |
 | `/check <url>` | `/inspect` | I | Run project health checks on a PR/issue |
+| `/ci_check <PR>` | — | I | Check and fix CI failures on a PR |
 | `/gh_request <url> <text>` | — | I | Route natural-language GitHub request to the right skill |
 | `/claudemd [project]` | `/claude`, `/claude.md`, `/claude_md` | I | Refresh a project's CLAUDE.md |
+| `/config_check` | `/cfgcheck`, `/configcheck` | P | Detect config.yaml drift against instance.example template |
 | `/gha_audit [project]` | `/gha` | I | Audit GitHub Actions for security issues |
 | `/changelog [project]` | `/changes` | I | Generate changelog from commits/journal |
 | `/daily <text>` | — | I | Schedule a daily recurring mission |
@@ -1149,19 +1566,23 @@ All commands at a glance. **Tier:** B = Beginner, I = Intermediate, P = Power Us
 | `/pause` | `/sleep` | P | Pause mission processing |
 | `/resume` | `/work`, `/awake`, `/run`, `/start` | P | Resume mission processing |
 | `/shutdown` | — | P | Shutdown all processes |
-| `/update` | `/upgrade` | P | Update Kōan and restart |
+| `/update` | `/upgrade` | P | Finish mission, update, restart |
 | `/restart` | — | P | Restart processes (no code pull) |
 | `/snapshot` | — | P | Export memory state |
 | `/add_project <url>` | `/add_project` | P | Add a project from GitHub |
 | `/delete_project <name>` | `/delete`, `/del` | P | Remove a project from workspace |
+| `/rename <old> <new>` | `/rename_project` | P | Rename a project everywhere |
 | `/profile <project>` | `/perf`, `/benchmark` | P | Performance profiling mission |
+| `/audit <project> [ctx] [limit=N]` | — | P | Audit project, create GitHub issues (top N, default 5) |
+| `/security_audit <project> [ctx] [limit=N]` | `/security`, `/secu` | P | Security audit, find critical vulnerabilities (top N, default 5) |
 | `/tech_debt [project]` | `/td`, `/debt` | P | Scan project for tech debt |
 | `/dead_code [project]` | `/dc` | P | Scan for unused code |
 | `/incident <error>` | — | P | Triage a production error |
 | `/scaffold_skill <scope> <name> <desc>` | `/scaffold`, `/new_skill` | P | Generate SKILL.md + handler.py for a new custom skill |
+| `/rtk [setup\|uninstall\|gain\|on\|off]` | — | P | Manage optional [rtk](https://github.com/rtk-ai/rtk) integration for compressed tool output (60-90 % token savings on Bash commands). See [docs/rtk.md](rtk.md). |
 
-Skills marked with GitHub @mention support: `/brainstorm`, `/plan`, `/implement`, `/fix`, `/review`, `/rebase`, `/recreate`, `/refactor`, `/profile`, `/gh_request`. See [GitHub Commands](github-commands.md) for details.
+Skills marked with GitHub @mention support: `/audit`, `/security_audit`, `/brainstorm`, `/plan`, `/implement`, `/fix`, `/review`, `/rebase`, `/recreate`, `/refactor`, `/profile`, `/gh_request`. See [GitHub Commands](github-commands.md) for details.
 
 ---
 
-*This manual covers all 41 core skills. For the full command reference with tabular format, see [docs/skills.md](skills.md). For skill authoring, see [koan/skills/README.md](../koan/skills/README.md).*
+*This manual covers all 43 core skills. For the full command reference with tabular format, see [docs/skills.md](skills.md). For skill authoring, see [koan/skills/README.md](../koan/skills/README.md).*

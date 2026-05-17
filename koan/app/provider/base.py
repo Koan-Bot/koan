@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 # Claude Code tool names (canonical, used throughout koan codebase)
-CLAUDE_TOOLS = {"Bash", "Read", "Write", "Glob", "Grep", "Edit"}
+CLAUDE_TOOLS = {"Bash", "Read", "Write", "Glob", "Grep", "Edit", "Skill"}
 
 # Mapping from Kōan canonical tool names to OpenAI-style function names.
 # Used by Copilot provider (--allow-tool) and local LLM runner (function calling).
@@ -20,6 +20,7 @@ TOOL_NAME_MAP = {
     "Edit": "edit_file",
     "Glob": "glob",
     "Grep": "grep",
+    "Skill": "skill",
 }
 
 
@@ -63,6 +64,24 @@ class CLIProvider:
         Base implementation prepends system prompt to the user prompt by
         returning empty — callers must handle the fallback. Providers that
         support a dedicated system prompt flag should override this.
+        """
+        return []
+
+    def supports_system_prompt_file(self) -> bool:
+        """Return True if the provider accepts a system prompt via file path.
+
+        File-based delivery keeps large prompts out of ``argv`` — they no
+        longer appear in ``ps`` listings or process supervisors, and they
+        sidestep ``ARG_MAX``.  Providers that opt in must also override
+        :meth:`build_system_prompt_file_args`.
+        """
+        return False
+
+    def build_system_prompt_file_args(self, path: str) -> List[str]:
+        """Build args for passing a system prompt via an on-disk file.
+
+        Only consulted when :meth:`supports_system_prompt_file` returns
+        True. Base implementation returns empty.
         """
         return []
 
@@ -110,6 +129,18 @@ class CLIProvider:
         """
         return []
 
+    def build_effort_args(self, effort: str = "") -> List[str]:
+        """Build args for reasoning effort control.
+
+        Args:
+            effort: Effort level (e.g. "low", "medium", "high", "max").
+                Empty string means no override (use provider default).
+
+        Returns:
+            CLI flags list. Base implementation returns empty (no-op).
+        """
+        return []
+
     def build_permission_args(self, skip_permissions: bool = False) -> List[str]:
         """Build args for permission skipping.
 
@@ -130,6 +161,8 @@ class CLIProvider:
         plugin_dirs: Optional[List[str]] = None,
         skip_permissions: bool = False,
         system_prompt: str = "",
+        system_prompt_file: str = "",
+        effort: str = "",
     ) -> List[str]:
         """Build a complete CLI command from generic parameters.
 
@@ -138,14 +171,27 @@ class CLIProvider:
             system_prompt: Optional system prompt text. When provided and the
                 provider supports it, sent via a dedicated flag (e.g.,
                 ``--append-system-prompt``). Otherwise prepended to *prompt*.
+            system_prompt_file: Optional path to a file containing the system
+                prompt. When set and the provider supports it (see
+                :meth:`supports_system_prompt_file`), takes precedence over
+                ``system_prompt`` and is sent via a file-based flag (e.g.,
+                ``--append-system-prompt-file``).  Keeps large prompts out
+                of argv so they don't leak via ``ps``.  Empty string falls
+                back to the in-argv path.
+            effort: Reasoning effort level (e.g. "low", "medium", "high", "max").
+                Empty string means no override.
 
         Returns a list of strings suitable for subprocess.run().
         """
-        # If system_prompt is set but provider doesn't support it natively,
-        # prepend to user prompt as fallback.
-        sys_args = self.build_system_prompt_args(system_prompt) if system_prompt else []
-        if system_prompt and not sys_args:
-            prompt = system_prompt + "\n\n" + prompt
+        # File-mode system prompt takes precedence over inline content.
+        sys_args: List[str] = []
+        if system_prompt_file and self.supports_system_prompt_file():
+            sys_args = self.build_system_prompt_file_args(system_prompt_file)
+        elif system_prompt:
+            sys_args = self.build_system_prompt_args(system_prompt)
+            if not sys_args:
+                # Provider doesn't support a dedicated flag — prepend to user prompt.
+                prompt = system_prompt + "\n\n" + prompt
 
         cmd = [self.binary()]
         cmd.extend(self.build_permission_args(skip_permissions))
@@ -157,6 +203,7 @@ class CLIProvider:
         cmd.extend(self.build_max_turns_args(max_turns))
         cmd.extend(self.build_mcp_args(mcp_configs))
         cmd.extend(self.build_plugin_args(plugin_dirs))
+        cmd.extend(self.build_effort_args(effort))
         return cmd
 
     def check_quota_available(self, project_path: str, timeout: int = 15) -> Tuple[bool, str]:

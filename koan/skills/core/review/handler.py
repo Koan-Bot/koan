@@ -4,6 +4,7 @@ import re
 from typing import Optional, Tuple
 
 from app.github_url_parser import parse_github_url
+from app.missions import extract_now_flag
 from app.github_skill_helpers import (
     handle_github_skill,
     resolve_project_for_repo,
@@ -79,6 +80,10 @@ def handle(ctx):
     """
     args = ctx.args.strip() if ctx.args else ""
 
+    # Extract --now flag for priority queuing
+    urgent, args = extract_now_flag(args)
+    ctx.args = args
+
     # Check for batch mode: repo URL without issue/PR number
     repo_match = _parse_repo_url(args)
     if repo_match:
@@ -91,6 +96,7 @@ def handle(ctx):
         url_type="pr-or-issue",
         parse_func=parse_github_url,
         success_prefix="Review queued",
+        urgent=urgent,
     )
 
 
@@ -113,12 +119,14 @@ def _handle_batch(ctx, args: str, repo_match: Tuple[str, str, str]) -> str:
     if not prs:
         return f"No open PRs found in {owner}/{repo}."
 
-    # Queue a /review mission for each PR
+    # Queue a /review mission for each PR (skip duplicates)
     queued = 0
     for pr in prs:
         pr_url = pr.get("url") or f"https://github.com/{owner}/{repo}/pull/{pr['number']}"
-        queue_github_mission(ctx, "review", pr_url, project_name)
-        queued += 1
+        if queue_github_mission(ctx, "review", pr_url, project_name):
+            queued += 1
 
     limit_note = f" (limited to {limit})" if limit else ""
+    if queued == 0:
+        return f"All PRs from {owner}/{repo} already queued or running{limit_note}."
     return f"Queued {queued} /review missions for {owner}/{repo}{limit_note}."

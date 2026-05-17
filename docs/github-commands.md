@@ -50,13 +50,26 @@ Kōan will:
 
 ## Available Commands
 
+Any skill with `github_enabled: true` in its `SKILL.md` can be triggered via @mentions. Currently **16 commands** are available:
+
 | Command | Aliases | What it does | Context-aware |
 |---------|---------|--------------|---------------|
-| `rebase` | `rb` | Rebase a PR onto latest upstream | No |
-| `recreate` | `rc` | Recreate a diverged PR from scratch | No |
-| `review` | `rv` | Queue a code review for a PR or issue | No |
+| `ask` | — | Ask Koan a question about a PR or issue | **Yes** |
+| `audit` | — | Audit a project codebase and create issues for findings | **Yes** |
+| `brainstorm` | — | Decompose a topic into linked GitHub issues | **Yes** |
+| `deepplan` | `deeplan` | Spec-first design with Socratic exploration | **Yes** |
+| `fix` | — | Fix a GitHub issue end-to-end, or batch-queue all open issues | **Yes** |
+| `gh_request` | — | Natural-language GitHub request dispatch | **Yes** |
 | `implement` | `impl` | Implement a GitHub issue | **Yes** |
-| `refactor` | `rf` | Queue a refactoring mission | No |
+| `plan` | — | Deep-think and create a structured plan | **Yes** |
+| `profile` | `perf`, `benchmark` | Queue a performance profiling mission | **Yes** |
+| `rebase` | `rb` | Rebase a PR onto latest upstream | **Yes** |
+| `recreate` | `rc` | Recreate a diverged PR from scratch | **Yes** |
+| `refactor` | `rf` | Queue a refactoring mission | **Yes** |
+| `review` | `rv` | Queue a code review for a PR or issue | **Yes** |
+| `reviewrebase` | `rr` | Review then rebase combo for a PR | **Yes** |
+| `security_audit` | `security`, `secu` | Security-focused audit of a codebase | **Yes** |
+| `squash` | `sq` | Squash all PR commits into one clean commit | **Yes** |
 
 ### Context-aware commands
 
@@ -95,9 +108,23 @@ github:
 - **`authorized_users`**: Controls who can trigger commands. Even with `["*"]`, Kōan always verifies the user has **write access** to the repository via the GitHub API. This prevents drive-by command injection from random commenters.
 - **`max_age_hours`**: Notifications older than this are silently discarded. Protects against processing a backlog of stale mentions after downtime.
 
+#### AI reply settings
+
+When `reply_enabled: true`, Kōan responds to non-command @mentions with AI-generated replies. Two additional settings control who can trigger replies and how often:
+
+```yaml
+github:
+  reply_enabled: true
+  reply_authorized_users: ["*"]    # Who can trigger AI replies (default: uses authorized_users)
+  reply_rate_limit: 5              # Max replies per user per hour (default: 5, min: 1)
+```
+
+- **`reply_authorized_users`**: Separate from command `authorized_users` — allows a broader audience for read-only replies without granting command execution. `["*"]` means anyone can trigger replies (no permission check at all, unlike command wildcard which still checks GitHub write access). Omit to fall back to `authorized_users`. Set `[]` to disable replies entirely.
+- **`reply_rate_limit`**: Prevents API quota abuse when replies are open broadly. Tracks per-user reply counts over a rolling 1-hour window. Default: 5, minimum: 1.
+
 ### Per-project overrides (`projects.yaml`)
 
-Override `authorized_users` for specific repositories:
+Override `authorized_users` and `reply_authorized_users` for specific repositories:
 
 ```yaml
 projects:
@@ -105,9 +132,10 @@ projects:
     path: "/path/to/sensitive-repo"
     github:
       authorized_users: ["alice", "bob"]  # Only these users, not the global wildcard
+      reply_authorized_users: ["*"]       # But allow AI replies for anyone
 ```
 
-This is useful when the global config allows `["*"]` but a specific repo needs tighter control.
+This is useful when the global config allows `["*"]` but a specific repo needs tighter control for commands, or vice versa for replies.
 
 ### Environment variables
 
@@ -203,8 +231,9 @@ Any skill can opt into GitHub @mention triggering by adding flags to its `SKILL.
 ```yaml
 ---
 name: my-skill
-github_enabled: true              # Allow triggering via @mentions
+github_enabled: true              # Allow triggering via @mentions (also enables Jira)
 github_context_aware: true        # Pass extra text as context (optional)
+group: integrations               # Groups the skill under "Integrations" in help
 commands:
   - name: my-command
     description: "Does something useful"
@@ -212,7 +241,21 @@ handler: handler.py
 ---
 ```
 
-The skill's handler receives the same `SkillContext` whether triggered from Telegram or GitHub. The mission format is identical: `/my-command <url> [context]`.
+The skill's handler receives the same `SkillContext` whether triggered from Telegram, GitHub, or Jira. The mission format for core skills is `/my-command <url> [context]`.
+
+### In-process dispatch for custom skills
+
+Skills under `instance/skills/<scope>/` with a `handler.py` follow a shorter path: the GitHub/Jira bridges call `execute_skill(skill, ctx)` directly at notification time — the same entry point Telegram uses — instead of queueing a slash mission that has no registered runner in `skill_dispatch._SKILL_RUNNERS`. This keeps custom skills self-contained: the handler can queue whatever mission it needs via `insert_pending_mission`.
+
+The helper is `app.external_skill_dispatch.try_dispatch_custom_handler`. It also **auto-feeds a Jira key** into `ctx.args` when the author omitted one:
+
+- **Jira source**: the issue the comment is on.
+- **GitHub source**: the first `FOO-123`-style key found in the issue title, then body.
+- If the author already typed a key (e.g. `@bot myfix PROJ-1`), it's passed through verbatim.
+
+### Help grouping: the `integrations` group
+
+Non-core skills should set `group: integrations` so they render in a dedicated **Integrations** section at the bottom of `@bot help`, separate from the core command groups (code, pr, missions, …).
 
 See [koan/skills/README.md](../koan/skills/README.md) for the full skill authoring guide.
 
@@ -265,10 +308,23 @@ The repo must be configured in `projects.yaml` with a valid `path`. Kōan resolv
 
 Expected behavior when Kōan was interrupted between mission creation and reaction. The duplicate will be harmless — the agent detects already-completed missions.
 
+## Co-existence with Jira
+
+GitHub and Jira integrations can run simultaneously. Both dispatch the same set of commands (any skill with `github_enabled: true`) but serve different roles:
+
+- **GitHub**: Code-centric actions — PR rebases, code reviews, issue implementation with direct diff access.
+- **Jira**: Project-level planning — feature planning, audits, and implementation from Jira tickets.
+
+Missions from GitHub are marked with 📬, missions from Jira with 🎫. Both enter the same mission queue.
+
+See [Jira Integration](jira-integration.md) for full setup instructions and the combined configuration guide.
+
 ## Related
 
+- [Jira Integration](jira-integration.md) — Jira @mention integration (complementary)
 - [Skills README](../koan/skills/README.md) — Skill authoring guide with `github_enabled` flag documentation
 - [Messaging: Telegram](messaging-telegram.md) — Alternative command interface via Telegram
 - [Messaging: Slack](messaging-slack.md) — Alternative command interface via Slack
+- [Messaging: Matrix](messaging-matrix.md) — Alternative command interface via Matrix
 - [PR #251](https://github.com/sukria/koan/pull/251) — Original implementation
 - [Issue #243](https://github.com/sukria/koan/issues/243) — Feature request and design plan

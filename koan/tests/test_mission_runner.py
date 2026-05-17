@@ -16,7 +16,7 @@ class TestBuildMissionCommand:
     def test_basic_command(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="Do something")
+        cmd, _ = build_mission_command(prompt="Do something")
         # Provider-agnostic: check for prompt and output format, not specific binary
         assert "-p" in cmd or any("Do something" in arg for arg in cmd)
         assert "--output-format" in cmd or any("json" in arg for arg in cmd)
@@ -25,7 +25,7 @@ class TestBuildMissionCommand:
     def test_includes_allowed_tools(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test")
         # Tools should be present in the command (format depends on provider)
         cmd_str = " ".join(cmd)
         # Either Claude format (--allowedTools Read,Write,...) or converted to provider format
@@ -35,7 +35,7 @@ class TestBuildMissionCommand:
     def test_extra_flags_appended(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test", extra_flags="--model opus")
+        cmd, _ = build_mission_command(prompt="test", extra_flags="--model opus")
         assert "--model" in cmd
         assert "opus" in cmd
 
@@ -43,16 +43,16 @@ class TestBuildMissionCommand:
     def test_empty_extra_flags_ignored(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test", extra_flags="")
-        base = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test", extra_flags="")
+        base, _ = build_mission_command(prompt="test")
         assert len(cmd) == len(base)
 
     @patch("app.cli_provider.get_provider_name", return_value="claude")
     def test_whitespace_extra_flags_ignored(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test", extra_flags="   ")
-        base = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test", extra_flags="   ")
+        base, _ = build_mission_command(prompt="test")
         assert len(cmd) == len(base)
 
     @patch.dict("os.environ", {"KOAN_CLI_PROVIDER": "copilot"})
@@ -63,7 +63,7 @@ class TestBuildMissionCommand:
 
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test")
         # When copilot is configured, should use gh copilot
         assert "gh" in cmd or "copilot" in cmd[0]
 
@@ -74,7 +74,7 @@ class TestBuildMissionCommand:
     def test_plugin_dirs_forwarded(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(
+        cmd, _ = build_mission_command(
             prompt="test",
             plugin_dirs=["/tmp/koan-plugins"],
         )
@@ -86,7 +86,7 @@ class TestBuildMissionCommand:
     def test_plugin_dirs_none_excluded(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test")
         assert "--plugin-dir" not in cmd
 
 
@@ -159,6 +159,74 @@ class TestParseClaudeOutput:
 
         raw = json.dumps({"status": "ok", "data": "test"})
         assert parse_claude_output(raw) == raw.strip()
+
+
+class TestCheckJsonSuccess:
+    """Test check_json_success — detects successful sessions from JSON output."""
+
+    def test_is_error_false_means_success(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"type": "result", "is_error": False, "result": "done"}))
+        assert check_json_success(str(f)) is True
+
+    def test_is_error_true_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"type": "result", "is_error": True}))
+        assert check_json_success(str(f)) is False
+
+    def test_subtype_success_means_success(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"type": "result", "subtype": "success"}))
+        assert check_json_success(str(f)) is True
+
+    def test_empty_file_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text("")
+        assert check_json_success(str(f)) is False
+
+    def test_missing_file_means_failure(self):
+        from app.mission_runner import check_json_success
+
+        assert check_json_success("/nonexistent/path") is False
+
+    def test_invalid_json_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text("not json at all")
+        assert check_json_success(str(f)) is False
+
+    def test_no_relevant_keys_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"status": "ok"}))
+        assert check_json_success(str(f)) is False
+
+    def test_real_world_success_output(self, tmp_path):
+        """Reproduce the exact pattern from the run 2 failure."""
+        from app.mission_runner import check_json_success
+
+        output = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "duration_ms": 529131,
+            "result": "Mission complete.",
+            "stop_reason": "end_turn",
+            "total_cost_usd": 1.88,
+        }
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps(output))
+        assert check_json_success(str(f)) is True
 
 
 class TestArchivePending:
@@ -438,6 +506,43 @@ class TestRunPostMission:
         mock_archive.assert_not_called()
         mock_reflect.assert_not_called()
         mock_merge.assert_not_called()
+
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    def test_unreliable_quota_check_does_not_crash(
+        self, mock_usage, mock_archive, mock_reflect, mock_merge, tmp_path
+    ):
+        """Regression: QUOTA_CHECK_UNRELIABLE path called undefined log() function.
+
+        When handle_quota_exhaustion returns QUOTA_CHECK_UNRELIABLE (both log
+        files unreadable), the code must log via _log_runner — not bare log()
+        which raises NameError.
+        """
+        from app.mission_runner import run_post_mission
+        from app.quota_handler import QUOTA_CHECK_UNRELIABLE
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        with patch(
+            "app.quota_handler.handle_quota_exhaustion",
+            return_value=QUOTA_CHECK_UNRELIABLE,
+        ):
+            result = run_post_mission(
+                instance_dir=instance_dir,
+                project_name="koan",
+                project_path=str(tmp_path),
+                run_num=5,
+                exit_code=0,
+                stdout_file="/tmp/out.json",
+                stderr_file="/tmp/err.txt",
+            )
+
+        # Pipeline continues — quota is NOT flagged as exhausted
+        assert result["quota_exhausted"] is False
+        assert result["success"] is True
 
     @patch("app.mission_runner.check_auto_merge", return_value=None)
     @patch("app.mission_runner.trigger_reflection", return_value=False)
@@ -929,6 +1034,16 @@ class TestReadPendingContent:
             content = _read_pending_content(str(tmp_path))
         assert content == ""
 
+    def test_no_toctou_race_on_missing_file(self, tmp_path):
+        """File gone before read_text — handled without exists() check."""
+        from app.mission_runner import _read_pending_content
+
+        journal_dir = tmp_path / "journal"
+        journal_dir.mkdir()
+        # No pending.md created — read_text hits FileNotFoundError directly
+        content = _read_pending_content(str(tmp_path))
+        assert content == ""
+
 
 class TestReadStdoutSummary:
     """Test _read_stdout_summary — fallback content for session classification."""
@@ -1020,7 +1135,7 @@ class TestRecordSessionOutcome:
         # Should not raise
         _record_session_outcome(str(tmp_path), "koan", "deep", 30, "text")
         captured = capsys.readouterr()
-        assert "Session outcome recording failed" in captured.err
+        assert "Session outcome recording failed" in (captured.err + captured.out)
 
 
 class TestRunPostMissionDuration:
@@ -1227,7 +1342,7 @@ class TestCheckAutoMergeErrors:
         result = check_auto_merge(str(tmp_path), "koan", str(tmp_path))
         assert result is None
         captured = capsys.readouterr()
-        assert "Auto-merge check failed" in captured.err
+        assert "Auto-merge check failed" in (captured.err + captured.out)
 
     @patch("app.git_sync.run_git", side_effect=Exception("git error"))
     def test_returns_none_on_git_error(self, mock_git, tmp_path, capsys):
@@ -1236,7 +1351,7 @@ class TestCheckAutoMergeErrors:
         result = check_auto_merge(str(tmp_path), "koan", str(tmp_path))
         assert result is None
         captured = capsys.readouterr()
-        assert "Auto-merge check failed" in captured.err
+        assert "Auto-merge check failed" in (captured.err + captured.out)
 
 
 class TestTriggerReflectionErrors:
@@ -1249,7 +1364,7 @@ class TestTriggerReflectionErrors:
         result = trigger_reflection(str(tmp_path), "audit", 60, project_name="koan")
         assert result is False
         captured = capsys.readouterr()
-        assert "Reflection failed" in captured.err
+        assert "Reflection failed" in (captured.err + captured.out)
 
 
 class TestParseClaudeOutputEdgeCases:
@@ -1336,7 +1451,7 @@ class TestBuildMissionCommandReviewMode:
     def test_review_mode_uses_read_only_tools(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="review code", autonomous_mode="review")
+        cmd, _ = build_mission_command(prompt="review code", autonomous_mode="review")
         cmd_str = " ".join(cmd)
         # Review mode must include Read, Glob, Grep
         assert "Read" in cmd_str
@@ -1357,7 +1472,7 @@ class TestBuildMissionCommandReviewMode:
             "review_mode": "haiku",
             "fallback": "sonnet",
         }):
-            cmd = build_mission_command(
+            cmd, _ = build_mission_command(
                 prompt="review code", autonomous_mode="review"
             )
             cmd_str = " ".join(cmd)
@@ -1373,7 +1488,7 @@ class TestBuildMissionCommandReviewMode:
             "review_mode": "",
             "fallback": "sonnet",
         }):
-            cmd = build_mission_command(
+            cmd, _ = build_mission_command(
                 prompt="review code", autonomous_mode="review"
             )
             cmd_str = " ".join(cmd)
@@ -1386,7 +1501,7 @@ class TestBuildMissionCommandReviewMode:
         from app.mission_runner import build_mission_command
 
         for mode in ("implement", "deep"):
-            cmd = build_mission_command(prompt="code", autonomous_mode=mode)
+            cmd, _ = build_mission_command(prompt="code", autonomous_mode=mode)
             cmd_str = " ".join(cmd)
             # Non-review modes get the full toolset from config
             assert "Bash" in cmd_str or "Read" in cmd_str
@@ -1421,7 +1536,7 @@ class TestBuildMissionCommandProjectOverrides:
         """Multiple plugin dirs should all appear as --plugin-dir flags."""
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(
+        cmd, _ = build_mission_command(
             prompt="test",
             plugin_dirs=["/tmp/plugin-a", "/tmp/plugin-b"],
         )
@@ -1954,7 +2069,7 @@ class TestTriggerReflectionEdgeCases:
         result = trigger_reflection(str(tmp_path), "audit", 60, project_name="koan")
         assert result is False
         captured = capsys.readouterr()
-        assert "Reflection failed" in captured.err
+        assert "Reflection failed" in (captured.err + captured.out)
 
     @patch("app.post_mission_reflection.write_to_journal")
     @patch("app.post_mission_reflection.run_reflection", return_value="insight")
@@ -2252,7 +2367,11 @@ class TestPipelineTracker:
         result = tracker.run_step("bad_step", failing)
         assert result is None
         assert tracker.steps["bad_step"]["status"] == "fail"
-        assert "boom" in tracker.steps["bad_step"]["detail"]
+        detail = tracker.steps["bad_step"]["detail"]
+        assert "boom" in detail
+        # Elapsed time is included in failure detail
+        assert detail.startswith("failed after ")
+        assert "s: " in detail
 
     def test_run_step_timeout(self):
         from app.mission_runner import _PipelineTracker
@@ -2265,6 +2384,23 @@ class TestPipelineTracker:
         result = tracker.run_step("timed_out", lambda: 1, pipeline_expired=expired)
         assert result is None
         assert tracker.steps["timed_out"]["status"] == "timeout"
+
+    def test_skipped_status_for_unreliable_quota_check(self):
+        """Regression: quota_check used 'warning' status which is not in VALID_STATUSES.
+
+        The unreliable quota check path in run_post_mission must use 'skipped'
+        (a valid status) instead of 'warning' (which raises ValueError).
+        """
+        from app.mission_runner import _PipelineTracker
+
+        tracker = _PipelineTracker()
+        # This must not raise — 'skipped' is valid
+        tracker.record("quota_check", "skipped", "unreliable — log files unreadable")
+        assert tracker.steps["quota_check"]["status"] == "skipped"
+
+        # Confirm 'warning' is still invalid
+        with pytest.raises(ValueError, match="Invalid status"):
+            tracker.record("other", "warning", "not a valid status")
 
 
 class TestPipelineStepsInResult:
@@ -2476,7 +2612,7 @@ class TestNotifyPipelineFailures:
         outbox.write_text("")
         _notify_pipeline_failures(tracker, "", str(tmp_path))
         msg = outbox.read_text()
-        assert msg.startswith("⚠️ Pipeline issues:")
+        assert "⚠️ Pipeline issues:" in msg
         assert "✗ verification (verify crash)" in msg
 
     def test_notification_failure_does_not_raise(self, tmp_path):
@@ -2537,3 +2673,44 @@ class TestNotifyPipelineFailures:
         msg = outbox.read_text()
         assert "reflection" in msg
         assert "test pipeline notify" in msg
+
+
+class TestExtractCacheLine:
+    """Test _extract_cache_line helper for pipeline summary."""
+
+    def test_returns_cache_line_with_data(self, tmp_path):
+        from app.mission_runner import _extract_cache_line
+
+        json_file = tmp_path / "output.json"
+        json_file.write_text(json.dumps({
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "model": "opus",
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 0,
+            },
+        }))
+        result = _extract_cache_line(str(json_file))
+        assert "hit" in result
+        assert "read" in result
+
+    def test_returns_empty_for_no_cache(self, tmp_path):
+        from app.mission_runner import _extract_cache_line
+
+        json_file = tmp_path / "output.json"
+        json_file.write_text(json.dumps({
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "model": "opus",
+        }))
+        result = _extract_cache_line(str(json_file))
+        assert result == ""
+
+    def test_returns_empty_for_missing_file(self):
+        from app.mission_runner import _extract_cache_line
+
+        result = _extract_cache_line("/nonexistent/file.json")
+        assert result == ""

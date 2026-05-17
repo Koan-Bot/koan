@@ -11,6 +11,10 @@ from app.review_runner import (
     build_review_prompt,
     fetch_repliable_comments,
     run_review,
+    _detect_plan_url,
+    _fetch_plan_body,
+    _truncate_plan,
+    _resolve_plan_body,
     _extract_review_body,
     _format_repliable_comments,
     _parse_review_json,
@@ -18,6 +22,7 @@ from app.review_runner import (
     _extract_json_text,
     _post_review_comment,
     _post_comment_replies,
+    _fetch_pr_commit_shas,
 )
 
 
@@ -55,6 +60,20 @@ def review_skill_dir(tmp_path):
         "Issue: {ISSUE_COMMENTS}\n"
         "Repliable: {REPLIABLE_COMMENTS}\n"
     )
+    return tmp_path
+
+
+@pytest.fixture
+def plan_review_skill_dir(tmp_path):
+    """Create a skill dir with both review.md and review-with-plan.md prompts."""
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    base = (
+        "{TITLE}\n{AUTHOR}\n{BRANCH}\n{BASE}\n{BODY}\n{DIFF}\n"
+        "{REVIEWS}\n{REVIEW_COMMENTS}\n{ISSUE_COMMENTS}\n{REPLIABLE_COMMENTS}\n"
+    )
+    (prompts_dir / "review.md").write_text("Review PR: " + base)
+    (prompts_dir / "review-with-plan.md").write_text("Plan Review: {PLAN}\n" + base)
     return tmp_path
 
 
@@ -369,6 +388,9 @@ class TestFormatReviewAsMarkdown:
         assert "`auth.py`" in md
         assert "L42" in md
         assert "### Summary" in md
+        assert "<details>" in md
+        assert "<summary>" in md
+        assert "</details>" in md
 
     def test_lgtm_review(self):
         md = _format_review_as_markdown(LGTM_REVIEW_JSON)
@@ -414,7 +436,35 @@ class TestFormatReviewAsMarkdown:
         }
         md = _format_review_as_markdown(data)
         assert "- [x] No secrets" in md
-        assert "- [ ] Input validated — critical #1" in md
+        # #N refs must use fullwidth ＃ (U+FF03) to prevent GitHub auto-linking
+        assert "- [ ] Input validated \u2014 critical \uff031" in md
+        assert "#1" not in md
+
+    def test_checklist_finding_refs_escape_hash(self):
+        """All #N cross-references in checklist use fullwidth ＃ to prevent GitHub auto-linking."""
+        data = {
+            "file_comments": [],
+            "review_summary": {
+                "lgtm": False,
+                "summary": "Issues found.",
+                "checklist": [
+                    {"item": "Return type matches interface", "passed": False, "finding_ref": "warning #1"},
+                    {"item": "Null check present", "passed": False, "finding_ref": "warning #2"},
+                    {"item": "No duplicated validation", "passed": False, "finding_ref": "suggestion #1"},
+                    {"item": "No secrets", "passed": True, "finding_ref": ""},
+                ],
+            },
+        }
+        md = _format_review_as_markdown(data)
+        # Fullwidth ＃ must appear in refs
+        assert "\uff031" in md
+        assert "\uff032" in md
+        # ASCII # must NOT appear after the em dash (in finding refs)
+        checklist_lines = [l for l in md.splitlines() if l.startswith("- [")]
+        for line in checklist_lines:
+            if "\u2014" in line:  # em dash separates the ref
+                ref_part = line.split("\u2014", 1)[1]
+                assert "#" not in ref_part, f"ASCII # found in ref: {line!r}"
 
     def test_code_snippet_in_output(self):
         data = {
@@ -471,12 +521,15 @@ class TestPostReviewComment:
     @patch("app.review_runner.run_gh")
     def test_no_double_heading_for_structured_review(self, mock_gh):
         """Reviews starting with ## don't get an extra ## Code Review header."""
+        from app.review_markers import SUMMARY_TAG
         review = "## PR Review — Fix auth\n\nLGTM"
         _post_review_comment("owner", "repo", "42", review)
         call_args = mock_gh.call_args[0]
         body = [a for a in call_args if isinstance(a, str) and "LGTM" in a][0]
         assert "## Code Review" not in body
-        assert body.startswith("## PR Review")
+        assert "## PR Review" in body
+        # SUMMARY_TAG is prepended to enable idempotent upserts
+        assert SUMMARY_TAG in body
 
     @patch("app.review_runner.run_gh")
     def test_legacy_review_gets_heading(self, mock_gh):
@@ -493,17 +546,19 @@ class TestPostReviewComment:
 # ---------------------------------------------------------------------------
 
 class TestRunReview:
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
     @patch("app.review_runner.fetch_repliable_comments", return_value=[])
     @patch("app.review_runner.run_gh")
     @patch("app.review_runner._run_claude_review")
     @patch("app.review_runner.fetch_pr_context")
     def test_full_pipeline_with_json(
-        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
         pr_context, review_skill_dir,
     ):
         """Full review pipeline with JSON output: fetch -> claude -> parse -> post."""
         mock_fetch.return_value = pr_context
-        mock_claude.return_value = json.dumps(LGTM_REVIEW_JSON)
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
         mock_notify = MagicMock()
 
         success, summary, review_data = run_review(
@@ -521,12 +576,14 @@ class TestRunReview:
         mock_gh.assert_called_once()  # post comment
         assert mock_notify.call_count >= 2
 
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
     @patch("app.review_runner.fetch_repliable_comments", return_value=[])
     @patch("app.review_runner.run_gh")
     @patch("app.review_runner._run_claude_review")
     @patch("app.review_runner.fetch_pr_context")
     def test_fallback_to_markdown_on_invalid_json(
-        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
         pr_context, review_skill_dir,
     ):
         """Falls back to regex extraction when JSON parsing fails twice."""
@@ -535,7 +592,8 @@ class TestRunReview:
         mock_claude.return_value = (
             "## PR Review — Fix auth bypass\n\n"
             "Solid fix. No issues found.\n\n---\n\n"
-            "### Summary\n\nMerge-ready."
+            "### Summary\n\nMerge-ready.",
+            "",
         )
         mock_notify = MagicMock()
 
@@ -563,8 +621,8 @@ class TestRunReview:
         mock_fetch.return_value = pr_context
         # First call returns markdown, second returns JSON
         mock_claude.side_effect = [
-            "Not JSON at all",
-            json.dumps(VALID_REVIEW_JSON),
+            ("Not JSON at all", ""),
+            (json.dumps(VALID_REVIEW_JSON), ""),
         ]
         mock_notify = MagicMock()
 
@@ -617,7 +675,7 @@ class TestRunReview:
     ):
         """Returns failure when Claude produces no output."""
         mock_fetch.return_value = pr_context
-        mock_claude.return_value = ""
+        mock_claude.return_value = ("", "Timeout (300s)")
         mock_notify = MagicMock()
 
         success, summary, _rd = run_review(
@@ -627,7 +685,29 @@ class TestRunReview:
         )
 
         assert success is False
-        assert "no output" in summary
+        assert "failed" in summary.lower()
+        assert "Timeout" in summary
+
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_claude_failure_without_error_detail(
+        self, mock_fetch, mock_claude, pr_context, review_skill_dir,
+    ):
+        """Failure without error detail still reports cleanly."""
+        mock_fetch.return_value = pr_context
+        mock_claude.return_value = ("", "")
+        mock_notify = MagicMock()
+
+        success, summary, _rd = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=mock_notify,
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is False
+        assert "failed" in summary.lower()
+        # No error detail — message should not contain "()"
+        assert "()" not in summary
 
     @patch("app.review_runner.fetch_repliable_comments", return_value=[])
     @patch("app.review_runner.run_gh", side_effect=RuntimeError("post fail"))
@@ -639,7 +719,7 @@ class TestRunReview:
     ):
         """Handles comment posting failure."""
         mock_fetch.return_value = pr_context
-        mock_claude.return_value = "## PR Review — Fix auth bypass\n\nGood code"
+        mock_claude.return_value = ("## PR Review — Fix auth bypass\n\nGood code", "")
         mock_notify = MagicMock()
 
         success, summary, _rd = run_review(
@@ -650,6 +730,93 @@ class TestRunReview:
 
         assert success is False
         assert "failed to post" in summary.lower()
+
+
+# ---------------------------------------------------------------------------
+# _run_claude_review
+# ---------------------------------------------------------------------------
+
+class TestRunClaudeReview:
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--test"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f"})
+    def test_success_returns_output_and_empty_error(
+        self, mock_config, mock_build, mock_claude,
+    ):
+        """On success, returns (output, empty error)."""
+        from app.review_runner import _run_claude_review
+
+        mock_claude.return_value = {"success": True, "output": "review text", "error": ""}
+        output, error = _run_claude_review("prompt", "/tmp/project")
+        assert output == "review text"
+        assert error == ""
+
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--test"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f"})
+    def test_failure_returns_error_detail(
+        self, mock_config, mock_build, mock_claude,
+    ):
+        """On failure, returns empty output and error detail."""
+        from app.review_runner import _run_claude_review
+
+        mock_claude.return_value = {
+            "success": False, "output": "", "error": "Timeout (300s)",
+        }
+        output, error = _run_claude_review("prompt", "/tmp/project")
+        assert output == ""
+        assert "Timeout" in error
+
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--test"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f"})
+    def test_failure_logs_to_stderr(
+        self, mock_config, mock_build, mock_claude, capsys,
+    ):
+        """Failure is logged to stderr for diagnostics."""
+        from app.review_runner import _run_claude_review
+
+        mock_claude.return_value = {
+            "success": False, "output": "", "error": "Exit code 1: model error",
+        }
+        _run_claude_review("prompt", "/tmp/project")
+        captured = capsys.readouterr()
+        assert "Claude review failed" in captured.err
+        assert "Exit code 1" in captured.err
+
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--test"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f"})
+    def test_failure_logs_stdout_to_stderr(
+        self, mock_config, mock_build, mock_claude, capsys,
+    ):
+        """When CLI fails with stdout content, it is logged for diagnostics."""
+        from app.review_runner import _run_claude_review
+
+        mock_claude.return_value = {
+            "success": False,
+            "output": "Error: context window exceeded",
+            "error": "Exit code 1: no stderr | stdout: Error: context window exceeded",
+        }
+        _run_claude_review("prompt", "/tmp/project")
+        captured = capsys.readouterr()
+        assert "stdout from failed run" in captured.err
+        assert "context window exceeded" in captured.err
+
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--test"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f"})
+    def test_default_timeout_is_600(
+        self, mock_config, mock_build, mock_claude,
+    ):
+        """Default timeout increased from 300 to 600 for large PRs."""
+        from app.review_runner import _run_claude_review
+
+        mock_claude.return_value = {"success": True, "output": "ok", "error": ""}
+        _run_claude_review("prompt", "/tmp/project")
+        # Verify run_claude was called with timeout=600
+        _, kwargs = mock_claude.call_args
+        assert kwargs.get("timeout") == 600
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +840,7 @@ class TestMainCli:
             "owner", "repo", "42", "/tmp/project",
             skill_dir=Path(__file__).resolve().parent.parent / "skills" / "core" / "review",
             architecture=False,
+            plan_url=None,
         )
 
     @patch("app.review_runner.run_review")
@@ -766,12 +934,14 @@ class TestArchitectureFlag:
         assert "Review PR:" in prompt
         assert "{TITLE}" not in prompt
 
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
     @patch("app.review_runner.fetch_repliable_comments", return_value=[])
     @patch("app.review_runner.run_gh")
     @patch("app.review_runner._run_claude_review")
     @patch("app.review_runner.fetch_pr_context")
     def test_run_review_passes_architecture_to_prompt(
-        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
         pr_context, tmp_path,
     ):
         """run_review with architecture=True uses architecture prompt."""
@@ -788,7 +958,7 @@ class TestArchitectureFlag:
         )
 
         mock_fetch.return_value = pr_context
-        mock_claude.return_value = "## PR Review — Fix auth bypass\n\nGood"
+        mock_claude.return_value = ("## PR Review — Fix auth bypass\n\nGood", "")
         mock_notify = MagicMock()
 
         run_review(
@@ -1075,12 +1245,14 @@ class TestPostCommentReplies:
 # ---------------------------------------------------------------------------
 
 class TestRunReviewWithReplies:
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
     @patch("app.review_runner.fetch_repliable_comments")
     @patch("app.review_runner.run_gh")
     @patch("app.review_runner._run_claude_review")
     @patch("app.review_runner.fetch_pr_context")
     def test_posts_replies_when_present(
-        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
         pr_context, review_skill_dir,
     ):
         """Posts replies to user comments when review includes comment_replies."""
@@ -1091,7 +1263,7 @@ class TestRunReviewWithReplies:
                 {"comment_id": 100, "reply": "Good question — the reason is X."},
             ],
         }
-        mock_claude.return_value = json.dumps(review_with_replies)
+        mock_claude.return_value = (json.dumps(review_with_replies), "")
         mock_repliable.return_value = [
             {"id": 100, "type": "review_comment", "user": "alice", "body": "Why?"},
         ]
@@ -1108,17 +1280,19 @@ class TestRunReviewWithReplies:
         # run_gh called: 1 for post_review_comment + 1 for reply
         assert mock_gh.call_count == 2
 
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
     @patch("app.review_runner.fetch_repliable_comments", return_value=[])
     @patch("app.review_runner.run_gh")
     @patch("app.review_runner._run_claude_review")
     @patch("app.review_runner.fetch_pr_context")
     def test_no_replies_when_no_repliable_comments(
-        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
         pr_context, review_skill_dir,
     ):
         """No reply posting when there are no repliable comments."""
         mock_fetch.return_value = pr_context
-        mock_claude.return_value = json.dumps(LGTM_REVIEW_JSON)
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
         mock_notify = MagicMock()
 
         success, summary, _ = run_review(
@@ -1130,3 +1304,1057 @@ class TestRunReviewWithReplies:
         assert success is True
         assert "Replied" not in summary
         mock_gh.assert_called_once()  # Only the review comment post
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — _detect_plan_url
+# ---------------------------------------------------------------------------
+
+class TestDetectPlanUrl:
+    def test_finds_issue_url_in_body(self):
+        """Extracts the first GitHub issue URL from a PR body."""
+        body = "Implements https://github.com/owner/repo/issues/42 as requested."
+        result = _detect_plan_url(body)
+        assert result == "https://github.com/owner/repo/issues/42"
+
+    def test_returns_none_when_no_issue_url(self):
+        """Returns None when the PR body has no issue URL."""
+        body = "This PR fixes a bug. No linked issue."
+        assert _detect_plan_url(body) is None
+
+    def test_ignores_pr_urls(self):
+        """PR URLs (/pull/) are not matched — only issue URLs."""
+        body = "Closes https://github.com/owner/repo/pull/10 and updates docs."
+        assert _detect_plan_url(body) is None
+
+    def test_returns_first_issue_url_when_multiple(self):
+        """Returns the first issue URL when multiple are present."""
+        body = (
+            "From https://github.com/owner/repo/issues/10 "
+            "and https://github.com/owner/repo/issues/20"
+        )
+        result = _detect_plan_url(body)
+        assert result == "https://github.com/owner/repo/issues/10"
+
+    def test_empty_body(self):
+        """Empty PR body returns None."""
+        assert _detect_plan_url("") is None
+
+    def test_closes_shorthand_not_matched(self):
+        """'Closes #42' shorthand (no full URL) returns None."""
+        body = "Closes #42."
+        assert _detect_plan_url(body) is None
+
+    def test_issue_url_in_multiline_body(self):
+        """Finds issue URL in a multi-line PR body."""
+        body = (
+            "## Summary\n\n"
+            "This PR implements the plan.\n\n"
+            "Closes https://github.com/acme/app/issues/99\n\n"
+            "## Changes\n\n- Added feature\n"
+        )
+        result = _detect_plan_url(body)
+        assert result == "https://github.com/acme/app/issues/99"
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — _fetch_plan_body
+# ---------------------------------------------------------------------------
+
+class TestFetchPlanBody:
+    @patch("app.review_runner.run_gh")
+    def test_returns_empty_when_no_plan_label(self, mock_gh):
+        """Returns empty string if the issue has no 'plan' label."""
+        mock_gh.return_value = json.dumps({
+            "body": "This is a regular issue.",
+            "labels": [{"name": "bug"}, {"name": "enhancement"}],
+        })
+        result = _fetch_plan_body("owner", "repo", "42")
+        assert result == ""
+
+    @patch("app.review_runner.run_gh")
+    def test_returns_body_when_plan_label(self, mock_gh):
+        """Returns issue body when 'plan' label is present."""
+        mock_gh.side_effect = [
+            json.dumps({
+                "body": "## Summary\n\nPlan content here.",
+                "labels": [{"name": "plan"}],
+            }),
+            "",  # No comments
+        ]
+        result = _fetch_plan_body("owner", "repo", "42")
+        assert result == "## Summary\n\nPlan content here."
+
+    @patch("app.review_runner.run_gh")
+    def test_strips_plan_footer(self, mock_gh):
+        """Strips the Kōan /plan footer from the returned body."""
+        mock_gh.side_effect = [
+            json.dumps({
+                "body": "## Summary\n\nPlan text.\n---\n*Generated by Kōan /plan — iteration 1*",
+                "labels": [{"name": "plan"}],
+            }),
+            "",  # No comments
+        ]
+        result = _fetch_plan_body("owner", "repo", "42")
+        assert result == "## Summary\n\nPlan text."
+        assert "Generated by Kōan" not in result
+
+    @patch("app.review_runner.run_gh")
+    def test_uses_latest_comment_with_implementation_phases(self, mock_gh):
+        """Uses the last comment body if it contains '### Implementation Phases'."""
+        comment_line = json.dumps({"body": "### Implementation Phases\n\nUpdated plan."})
+        mock_gh.side_effect = [
+            json.dumps({
+                "body": "Original plan body.",
+                "labels": [{"name": "plan"}],
+            }),
+            comment_line,
+        ]
+        result = _fetch_plan_body("owner", "repo", "42")
+        assert "Updated plan." in result
+        assert "Original plan body." not in result
+
+    @patch("app.review_runner.run_gh")
+    def test_returns_empty_on_fetch_error(self, mock_gh):
+        """Returns empty string if the GitHub API call fails."""
+        mock_gh.side_effect = RuntimeError("API error")
+        result = _fetch_plan_body("owner", "repo", "42")
+        assert result == ""
+
+    @patch("app.review_runner.run_gh")
+    def test_returns_empty_on_json_error(self, mock_gh):
+        """Returns empty string if the API response is not valid JSON."""
+        mock_gh.return_value = "not json"
+        result = _fetch_plan_body("owner", "repo", "42")
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — _truncate_plan
+# ---------------------------------------------------------------------------
+
+class TestTruncatePlan:
+    def test_extracts_summary_section(self):
+        """Extracts ## Summary section from the plan."""
+        plan = (
+            "## Background\n\nSome history.\n\n"
+            "## Summary\n\nThis is the summary.\n\n"
+            "## Next Steps\n\nFuture work."
+        )
+        result = _truncate_plan(plan)
+        assert "This is the summary." in result
+
+    def test_extracts_implementation_phases_section(self):
+        """Extracts ### Implementation Phases section."""
+        plan = (
+            "## Summary\n\nBrief.\n\n"
+            "### Implementation Phases\n\n#### Phase 1\nDo this.\n\n"
+            "### Open Questions\n\nTBD."
+        )
+        result = _truncate_plan(plan)
+        assert "Phase 1" in result
+
+    def test_fallback_to_first_5000_chars(self):
+        """Falls back to first 5000 chars when no sections are found."""
+        plan = "x" * 10000
+        result = _truncate_plan(plan)
+        assert len(result) <= 5000 + 30  # 30 chars for the truncation note
+        assert "...(plan truncated)" in result
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — build_review_prompt with plan
+# ---------------------------------------------------------------------------
+
+class TestBuildReviewPromptWithPlan:
+    def test_selects_plan_prompt_when_plan_body_provided(self, pr_context, tmp_path):
+        """Selects review-with-plan.md when plan_body is provided."""
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "review.md").write_text("Standard review: {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {DIFF} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+        (prompts_dir / "review-with-plan.md").write_text("Plan review: {PLAN} {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {DIFF} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+
+        prompt = build_review_prompt(pr_context, skill_dir=tmp_path, plan_body="The plan content.")
+        assert "Plan review:" in prompt
+        assert "The plan content." in prompt
+
+    def test_selects_standard_prompt_when_no_plan(self, pr_context, tmp_path):
+        """Selects review.md when no plan_body is provided."""
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "review.md").write_text("Standard review: {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {DIFF} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+        (prompts_dir / "review-with-plan.md").write_text("Plan review: {PLAN} {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {DIFF} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+
+        prompt = build_review_prompt(pr_context, skill_dir=tmp_path, plan_body=None)
+        assert "Standard review:" in prompt
+        assert "Plan review:" not in prompt
+
+    def test_plan_overrides_architecture_flag(self, pr_context, tmp_path):
+        """Plan alignment takes priority over --architecture flag."""
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "review-architecture.md").write_text("Architecture review: {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {DIFF} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+        (prompts_dir / "review-with-plan.md").write_text("Plan review: {PLAN} {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {DIFF} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+
+        prompt = build_review_prompt(
+            pr_context, skill_dir=tmp_path,
+            architecture=True, plan_body="The plan.",
+        )
+        assert "Plan review:" in prompt
+        assert "Architecture review:" not in prompt
+
+    def test_truncates_large_plan(self, pr_context, tmp_path):
+        """Plan is truncated when combined plan+diff context exceeds 80K chars."""
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "review-with-plan.md").write_text("Plan: {PLAN} Diff: {DIFF} Title: {TITLE} {AUTHOR} {BRANCH} {BASE} {BODY} {REVIEWS} {REVIEW_COMMENTS} {ISSUE_COMMENTS} {REPLIABLE_COMMENTS}")
+
+        large_plan = "## Summary\n\nShort summary.\n\n" + "x" * 90_000
+        pr_context["diff"] = "small diff"
+        prompt = build_review_prompt(pr_context, skill_dir=tmp_path, plan_body=large_plan)
+        # The plan should have been truncated — not 90K chars
+        assert len(prompt) < 90_000 + 5000
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — _format_review_as_markdown with plan_alignment
+# ---------------------------------------------------------------------------
+
+class TestFormatReviewWithPlanAlignment:
+    def test_renders_plan_alignment_section(self):
+        """Renders ### Plan Alignment section when plan_alignment is present."""
+        review_data = {
+            **LGTM_REVIEW_JSON,
+            "plan_alignment": {
+                "requirements_met": ["Phase 1: _detect_plan_url added"],
+                "requirements_missing": ["Phase 3: --plan-url flag missing"],
+                "out_of_scope": [],
+            },
+        }
+        result = _format_review_as_markdown(review_data)
+        assert "### Plan Alignment" in result
+        assert "✅ **Met**" in result
+        assert "_detect_plan_url added" in result
+        assert "❌ **Missing**" in result
+        assert "--plan-url flag missing" in result
+
+    def test_plan_alignment_before_severity_sections(self):
+        """Plan alignment section appears before severity sections."""
+        review_data = {
+            **VALID_REVIEW_JSON,
+            "plan_alignment": {
+                "requirements_met": ["Req 1"],
+                "requirements_missing": [],
+                "out_of_scope": [],
+            },
+        }
+        result = _format_review_as_markdown(review_data)
+        plan_pos = result.find("### Plan Alignment")
+        severity_pos = result.find("### 🔴 Blocking")
+        assert plan_pos != -1
+        assert severity_pos != -1
+        assert plan_pos < severity_pos
+
+    def test_no_plan_alignment_section_when_absent(self):
+        """No Plan Alignment section when plan_alignment is not in data."""
+        result = _format_review_as_markdown(LGTM_REVIEW_JSON)
+        assert "### Plan Alignment" not in result
+
+    def test_renders_out_of_scope_items(self):
+        """Out-of-scope items are rendered when present."""
+        review_data = {
+            **LGTM_REVIEW_JSON,
+            "plan_alignment": {
+                "requirements_met": [],
+                "requirements_missing": [],
+                "out_of_scope": ["Extra helper added"],
+            },
+        }
+        result = _format_review_as_markdown(review_data)
+        assert "📋 **Out of scope**" in result
+        assert "Extra helper added" in result
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — run_review auto-detection
+# ---------------------------------------------------------------------------
+
+class TestRunReviewPlanAlignment:
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_auto_detects_plan_from_pr_body(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
+        plan_review_skill_dir,
+    ):
+        """Auto-detects plan URL from PR body and includes plan in prompt."""
+        context = {
+            "title": "Implement plan",
+            "body": "Implements https://github.com/owner/repo/issues/10 per spec.",
+            "branch": "feature/plan",
+            "base": "main",
+            "state": "OPEN",
+            "author": "dev",
+            "url": "https://github.com/owner/repo/pull/5",
+            "diff": "--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n+x = 1",
+            "review_comments": "",
+            "reviews": "",
+            "issue_comments": "",
+        }
+        mock_fetch.return_value = context
+
+        # First gh call: detect plan (gh api repos/.../issues/10)
+        # Then comment post
+        plan_issue = json.dumps({
+            "body": "## Summary\n\nPlan here.",
+            "labels": [{"name": "plan"}],
+        })
+        mock_gh.side_effect = [
+            plan_issue,  # _fetch_plan_body: issue
+            "",          # _fetch_plan_body: comments
+            "posted",    # _post_review_comment
+        ]
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        success, summary, _ = run_review(
+            "owner", "repo", "5", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=plan_review_skill_dir,
+        )
+        assert success is True
+        # Verify that plan fetching was attempted (gh api called for issues/10)
+        assert mock_gh.call_count >= 2
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_no_plan_when_no_issue_in_body(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
+        pr_context, review_skill_dir,
+    ):
+        """No plan alignment when PR body has no linked issue URL."""
+        pr_context["body"] = "Refactoring pass. No linked issue."
+        mock_fetch.return_value = pr_context
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        success, _, _ = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+        assert success is True
+        # run_gh only called once: to post the review comment
+        assert mock_gh.call_count == 1
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_explicit_plan_url_overrides_auto_detection(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
+        pr_context, plan_review_skill_dir,
+    ):
+        """Explicit --plan-url fetches the specified issue, skipping auto-detect."""
+        pr_context["body"] = "No issue URLs here."
+        mock_fetch.return_value = pr_context
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        plan_issue = json.dumps({
+            "body": "## Summary\n\nExplicit plan.",
+            "labels": [],  # No 'plan' label — explicit URLs skip label check
+        })
+        mock_gh.side_effect = [
+            plan_issue,  # _resolve_plan_body: explicit issue fetch
+            "",          # comments
+            "posted",    # _post_review_comment
+        ]
+
+        success, _, _ = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=plan_review_skill_dir,
+            plan_url="https://github.com/owner/repo/issues/99",
+        )
+        assert success is True
+        # Ensure plan issue was fetched
+        first_call_args = mock_gh.call_args_list[0]
+        assert "issues/99" in " ".join(str(a) for a in first_call_args[0])
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — CLI --plan-url flag
+# ---------------------------------------------------------------------------
+
+class TestPlanUrlCliFlag:
+    @patch("app.review_runner.run_review")
+    def test_cli_passes_plan_url(self, mock_run):
+        """--plan-url is parsed and passed to run_review."""
+        from app.review_runner import main
+
+        mock_run.return_value = (True, "Review posted.", None)
+        exit_code = main([
+            "https://github.com/owner/repo/pull/42",
+            "--project-path", "/tmp/project",
+            "--plan-url", "https://github.com/owner/repo/issues/10",
+        ])
+
+        assert exit_code == 0
+        _, kwargs = mock_run.call_args
+        assert kwargs["plan_url"] == "https://github.com/owner/repo/issues/10"
+
+    @patch("app.review_runner.run_review")
+    def test_cli_plan_url_defaults_to_none(self, mock_run):
+        """--plan-url defaults to None when not provided."""
+        from app.review_runner import main
+
+        mock_run.return_value = (True, "Review posted.", None)
+        main([
+            "https://github.com/owner/repo/pull/42",
+            "--project-path", "/tmp/project",
+        ])
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["plan_url"] is None
+
+
+# ---------------------------------------------------------------------------
+# Plan alignment — skill_dispatch --plan-url passthrough
+# ---------------------------------------------------------------------------
+
+class TestSkillDispatchPlanUrl:
+    def test_passes_plan_url_to_review_cmd(self):
+        """_build_review_cmd passes --plan-url when present in args."""
+        from app.skill_dispatch import dispatch_skill_mission
+
+        with patch("app.skill_dispatch.is_known_project", return_value=False):
+            cmd = dispatch_skill_mission(
+                "/review https://github.com/owner/repo/pull/5 "
+                "--plan-url https://github.com/owner/repo/issues/3",
+                project_name="myproject",
+                project_path="/tmp/proj",
+                koan_root="/tmp/koan",
+                instance_dir="/tmp/instance",
+            )
+
+        assert cmd is not None
+        assert "--plan-url" in cmd
+        idx = cmd.index("--plan-url")
+        assert cmd[idx + 1] == "https://github.com/owner/repo/issues/3"
+
+    def test_no_plan_url_when_absent(self):
+        """_build_review_cmd does not add --plan-url when not in args."""
+        from app.skill_dispatch import dispatch_skill_mission
+
+        with patch("app.skill_dispatch.is_known_project", return_value=False):
+            cmd = dispatch_skill_mission(
+                "/review https://github.com/owner/repo/pull/5",
+                project_name="myproject",
+                project_path="/tmp/proj",
+                koan_root="/tmp/koan",
+                instance_dir="/tmp/instance",
+            )
+
+        assert cmd is not None
+        assert "--plan-url" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: fetch_repliable_comments parallel parameter
+# ---------------------------------------------------------------------------
+
+class TestFetchRepliableCommentsParallel:
+    """Tests for the parallel=False / parallel=True modes of fetch_repliable_comments."""
+
+    @patch("app.review_runner._fetch_issue_comments")
+    @patch("app.review_runner._fetch_inline_review_comments")
+    def test_sequential_mode_calls_helpers_in_order(
+        self, mock_inline, mock_issue,
+    ):
+        """parallel=False calls the two fetch helpers sequentially."""
+        mock_inline.return_value = [{"id": 1, "type": "review_comment"}]
+        mock_issue.return_value = [{"id": 2, "type": "issue_comment"}]
+
+        comments = fetch_repliable_comments("owner", "repo", "42", parallel=False)
+
+        mock_inline.assert_called_once_with("owner/repo", "42", "")
+        mock_issue.assert_called_once_with("owner/repo", "42", "")
+        assert len(comments) == 2
+        # Inline results come first in sequential mode
+        assert comments[0]["id"] == 1
+        assert comments[1]["id"] == 2
+
+    @patch("app.review_runner._fetch_issue_comments")
+    @patch("app.review_runner._fetch_inline_review_comments")
+    def test_parallel_mode_collects_both_result_sets(
+        self, mock_inline, mock_issue,
+    ):
+        """parallel=True still collects results from both helpers."""
+        mock_inline.return_value = [{"id": 10, "type": "review_comment"}]
+        mock_issue.return_value = [{"id": 20, "type": "issue_comment"}]
+
+        comments = fetch_repliable_comments("owner", "repo", "99", parallel=True)
+
+        assert len(comments) == 2
+        ids = {c["id"] for c in comments}
+        assert ids == {10, 20}
+
+    @patch("app.review_runner._fetch_issue_comments")
+    @patch("app.review_runner._fetch_inline_review_comments")
+    def test_empty_results_from_both_helpers(self, mock_inline, mock_issue):
+        """Returns empty list when both helpers return nothing."""
+        mock_inline.return_value = []
+        mock_issue.return_value = []
+
+        comments = fetch_repliable_comments("owner", "repo", "1", parallel=False)
+        assert comments == []
+
+
+# ---------------------------------------------------------------------------
+# Self-reply prevention: bot_username filtering
+# ---------------------------------------------------------------------------
+
+class TestSelfReplyPrevention:
+    """Tests that bot's own comments are excluded when bot_username is provided."""
+
+    @patch("app.review_runner.run_gh")
+    def test_inline_comments_exclude_bot_username(self, mock_gh):
+        """_fetch_inline_review_comments filters by bot_username."""
+        from app.review_runner import _fetch_inline_review_comments
+
+        mock_gh.return_value = "\n".join([
+            json.dumps({"id": 1, "user": "human", "body": "fix this", "path": "a.py", "line": 10, "user_type": "User"}),
+            json.dumps({"id": 2, "user": "koan-bot", "body": "done", "path": "a.py", "line": 10, "user_type": "User"}),
+            json.dumps({"id": 3, "user": "other", "body": "lgtm", "path": "b.py", "line": 5, "user_type": "User"}),
+        ])
+
+        result = _fetch_inline_review_comments("owner/repo", "1", bot_username="koan-bot")
+        assert len(result) == 2
+        assert {c["id"] for c in result} == {1, 3}
+
+    @patch("app.review_runner.run_gh")
+    def test_issue_comments_exclude_bot_username(self, mock_gh):
+        """_fetch_issue_comments filters by bot_username."""
+        from app.review_runner import _fetch_issue_comments
+
+        mock_gh.return_value = "\n".join([
+            json.dumps({"id": 10, "user": "human", "body": "question", "user_type": "User"}),
+            json.dumps({"id": 11, "user": "Koan-Bot", "body": "my reply", "user_type": "User"}),
+        ])
+
+        # Case-insensitive match
+        result = _fetch_issue_comments("owner/repo", "1", bot_username="koan-bot")
+        assert len(result) == 1
+        assert result[0]["id"] == 10
+
+    @patch("app.review_runner.run_gh")
+    def test_no_filtering_when_bot_username_empty(self, mock_gh):
+        """Without bot_username, no extra filtering occurs."""
+        from app.review_runner import _fetch_inline_review_comments
+
+        mock_gh.return_value = json.dumps(
+            {"id": 1, "user": "koan-bot", "body": "x", "path": "a.py", "line": 1, "user_type": "User"}
+        )
+
+        result = _fetch_inline_review_comments("owner/repo", "1", bot_username="")
+        assert len(result) == 1
+
+    @patch("app.review_runner._fetch_issue_comments")
+    @patch("app.review_runner._fetch_inline_review_comments")
+    def test_fetch_repliable_passes_bot_username(self, mock_inline, mock_issue):
+        """fetch_repliable_comments forwards bot_username to helpers."""
+        mock_inline.return_value = []
+        mock_issue.return_value = []
+
+        fetch_repliable_comments("o", "r", "1", parallel=False, bot_username="mybot")
+
+        mock_inline.assert_called_once_with("o/r", "1", "mybot")
+        mock_issue.assert_called_once_with("o/r", "1", "mybot")
+
+
+# ---------------------------------------------------------------------------
+# Concurrency config: get_review_concurrency_config
+# ---------------------------------------------------------------------------
+
+class TestReviewConcurrencyConfig:
+    """Tests for get_review_concurrency_config() in app.config."""
+
+    def test_defaults_when_no_config(self):
+        """Returns sensible defaults when review_concurrency is absent from config."""
+        from app.config import get_review_concurrency_config
+
+        with patch("app.config._load_config", return_value={}):
+            cfg = get_review_concurrency_config()
+
+        assert cfg["enabled"] is True
+        assert cfg["github_workers"] == 4
+
+    def test_reads_enabled_flag(self):
+        """Reads enabled flag from config."""
+        from app.config import get_review_concurrency_config
+
+        with patch("app.config._load_config", return_value={
+            "review_concurrency": {"enabled": False, "github_workers": 2},
+        }):
+            cfg = get_review_concurrency_config()
+
+        assert cfg["enabled"] is False
+        assert cfg["github_workers"] == 2
+
+    def test_invalid_workers_falls_back_to_default(self):
+        """Non-integer github_workers falls back to 4."""
+        from app.config import get_review_concurrency_config
+
+        with patch("app.config._load_config", return_value={
+            "review_concurrency": {"github_workers": "not-a-number"},
+        }):
+            cfg = get_review_concurrency_config()
+
+        assert cfg["github_workers"] == 4
+
+    def test_non_dict_config_uses_defaults(self):
+        """A non-dict review_concurrency value uses defaults."""
+        from app.config import get_review_concurrency_config
+
+        with patch("app.config._load_config", return_value={
+            "review_concurrency": "invalid",
+        }):
+            cfg = get_review_concurrency_config()
+
+        assert cfg["enabled"] is True
+        assert cfg["github_workers"] == 4
+
+
+# Phase 3: SUMMARY_TAG + idempotent upsert (_post_review_comment)
+# ---------------------------------------------------------------------------
+
+class TestPostReviewCommentIdempotent:
+    """Phase 3 — SUMMARY_TAG is prepended; PATCH used when existing comment found."""
+
+    @patch("app.review_runner.run_gh")
+    def test_summary_tag_prepended_on_new_post(self, mock_gh):
+        """SUMMARY_TAG is always prepended to a newly posted review comment."""
+        from app.review_markers import SUMMARY_TAG
+        _post_review_comment("owner", "repo", "42", "LGTM")
+        body_arg = [a for a in mock_gh.call_args[0] if isinstance(a, str) and "LGTM" in a][0]
+        assert body_arg.startswith(SUMMARY_TAG)
+
+    @patch("app.review_runner.run_gh")
+    def test_patch_used_when_existing_comment_found(self, mock_gh):
+        """When existing_comment is provided, PATCH endpoint is used not POST."""
+        existing = {"id": 555, "body": "old body", "user": "koan-bot"}
+        _post_review_comment("owner", "repo", "42", "New review", existing)
+        call_args = mock_gh.call_args[0]
+        # Should use PATCH via 'api' endpoint, not 'pr comment'
+        assert "api" in call_args
+        assert "PATCH" in call_args
+        assert "issues/comments/555" in " ".join(str(a) for a in call_args)
+
+    @patch("app.review_runner.run_gh")
+    def test_post_used_when_no_existing_comment(self, mock_gh):
+        """Without existing_comment, the standard 'pr comment' POST is used."""
+        _post_review_comment("owner", "repo", "42", "Review", None)
+        call_args = mock_gh.call_args[0]
+        assert "pr" in call_args
+        assert "comment" in call_args
+
+    @patch("app.review_runner.run_gh")
+    def test_preserves_commit_ids_from_existing_comment(self, mock_gh):
+        """Existing COMMIT_IDS block is carried forward into the updated body."""
+        from app.review_markers import SUMMARY_TAG, COMMIT_IDS_START, COMMIT_IDS_END
+        sha_block = f"{COMMIT_IDS_START}abc123\ndef456{COMMIT_IDS_END}"
+        existing = {"id": 99, "body": f"{SUMMARY_TAG}\nold review\n{sha_block}", "user": "koan-bot"}
+        _post_review_comment("owner", "repo", "42", "New review text", existing)
+        body_arg = [a for a in mock_gh.call_args[0] if isinstance(a, str) and "New review" in a][0]
+        assert "abc123" in body_arg
+        assert COMMIT_IDS_START in body_arg
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Reviewed-commit SHAs (_fetch_pr_commit_shas, run_review)
+# ---------------------------------------------------------------------------
+
+class TestFetchPrCommitShas:
+    @patch("app.review_runner.run_gh", return_value="abc123\ndef456\n")
+    def test_returns_list_of_shas(self, mock_gh):
+        result = _fetch_pr_commit_shas("owner", "repo", "42")
+        assert result == ["abc123", "def456"]
+
+    @patch("app.review_runner.run_gh", return_value="")
+    def test_returns_empty_list_on_no_output(self, mock_gh):
+        assert _fetch_pr_commit_shas("owner", "repo", "42") == []
+
+    @patch("app.review_runner.run_gh", side_effect=RuntimeError("API error"))
+    def test_returns_empty_list_on_error(self, mock_gh):
+        assert _fetch_pr_commit_shas("owner", "repo", "42") == []
+
+    @patch("app.review_runner.run_gh", return_value="abc123\ndef456\n")
+    def test_calls_correct_endpoint(self, mock_gh):
+        _fetch_pr_commit_shas("owner", "repo", "42")
+        call_args = mock_gh.call_args[0]
+        assert "repos/owner/repo/pulls/42/commits" in " ".join(str(a) for a in call_args)
+        assert "--paginate" in call_args
+
+
+class TestIncrementalReview:
+    """Phase 5 — commit SHAs embedded in comment; second run skips known commits."""
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=["abc", "def"])
+
+    @patch("app.review_runner.find_bot_comment")
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_skips_review_when_all_shas_already_reviewed(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        mock_find_bot, _mock_shas, pr_context, review_skill_dir,
+    ):
+        """When prior SHA block matches current commits exactly, review is skipped."""
+        from app.review_markers import SUMMARY_TAG, COMMIT_IDS_START, COMMIT_IDS_END
+
+        mock_fetch.return_value = pr_context
+        sha_block = f"{COMMIT_IDS_START}\nabc\ndef\n{COMMIT_IDS_END}"
+        prior_comment = {
+            "id": 42,
+            "body": f"{SUMMARY_TAG}\n## Review\n\n{sha_block}",
+            "user": "koan-bot",
+        }
+        mock_find_bot.return_value = prior_comment
+
+        success, summary, _ = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is True
+        assert "no new commits" in summary.lower()
+        # Claude should NOT have been called — review was skipped
+        mock_claude.assert_not_called()
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=["abc", "def", "ghi"])
+
+    @patch("app.review_runner.find_bot_comment")
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_proceeds_when_new_commits_present(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        mock_find_bot, _mock_shas, pr_context, review_skill_dir,
+    ):
+        """When there are new commits beyond prior SHAs, review proceeds."""
+        from app.review_markers import SUMMARY_TAG, COMMIT_IDS_START, COMMIT_IDS_END
+
+        mock_fetch.return_value = pr_context
+        # Prior comment only has 2 SHAs; current has 3 → one new commit
+        sha_block = f"{COMMIT_IDS_START}\nabc\ndef\n{COMMIT_IDS_END}"
+        prior_comment = {"id": 42, "body": f"{SUMMARY_TAG}\n{sha_block}", "user": "koan-bot"}
+        mock_find_bot.return_value = prior_comment
+
+        # After posting the review, find_bot_comment is called again to get updated comment
+        updated_comment = {"id": 42, "body": f"{SUMMARY_TAG}\n## Review\n\nLGTM", "user": "koan-bot"}
+        mock_find_bot.side_effect = [prior_comment, updated_comment]
+
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        success, summary, _ = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is True
+        mock_claude.assert_called_once()
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=["abc", "def"])
+
+    @patch("app.review_runner.find_bot_comment")
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_sha_block_written_to_comment_after_review(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable,
+        mock_find_bot, _mock_shas, pr_context, review_skill_dir,
+    ):
+        """Commit SHAs are embedded in the initial comment body (no extra PATCH)."""
+        from app.review_markers import COMMIT_IDS_START, COMMIT_IDS_END
+
+        mock_fetch.return_value = pr_context
+        mock_find_bot.return_value = None  # No prior comment
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        success, summary, _ = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is True
+        # SHAs are now embedded in the initial post — find the body arg
+        # from the `pr comment` call (new comment creation).
+        comment_calls = [
+            c for c in mock_gh.call_args_list
+            if "comment" in c[0]
+        ]
+        assert len(comment_calls) >= 1
+        body_arg = " ".join(str(a) for a in comment_calls[0][0])
+        assert COMMIT_IDS_START in body_arg
+        assert "abc" in body_arg
+        assert "def" in body_arg
+        # No separate PATCH call should exist for SHA embedding
+        patch_calls = [
+            c for c in mock_gh.call_args_list
+            if len(c[0]) > 1 and "PATCH" in c[0]
+        ]
+        assert len(patch_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Review ignore config: get_review_ignore_config
+# ---------------------------------------------------------------------------
+
+class TestReviewIgnoreConfig:
+    """Tests for get_review_ignore_config() in app.config."""
+
+    def test_defaults_when_no_config(self):
+        """Returns empty lists when review_ignore is absent from config."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={}):
+            cfg = get_review_ignore_config()
+
+        assert cfg == {"glob": [], "regex": []}
+
+    def test_reads_glob_and_regex(self):
+        """Reads glob and regex lists from config."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={
+            "review_ignore": {
+                "glob": ["vendor/**", "*.lock"],
+                "regex": [r".*\.pb\.go$"],
+            },
+        }):
+            cfg = get_review_ignore_config()
+
+        assert cfg["glob"] == ["vendor/**", "*.lock"]
+        assert cfg["regex"] == [r".*\.pb\.go$"]
+
+    def test_partial_config_glob_only(self):
+        """Only glob patterns configured, regex defaults to []."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={
+            "review_ignore": {"glob": ["*.min.js"]},
+        }):
+            cfg = get_review_ignore_config()
+
+        assert cfg["glob"] == ["*.min.js"]
+        assert cfg["regex"] == []
+
+    def test_partial_config_regex_only(self):
+        """Only regex patterns configured, glob defaults to []."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={
+            "review_ignore": {"regex": [r"^docs/"]},
+        }):
+            cfg = get_review_ignore_config()
+
+        assert cfg["glob"] == []
+        assert cfg["regex"] == [r"^docs/"]
+
+    def test_non_dict_config_returns_empty(self):
+        """A non-dict review_ignore value returns empty lists."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={
+            "review_ignore": "invalid",
+        }):
+            cfg = get_review_ignore_config()
+
+        assert cfg == {"glob": [], "regex": []}
+
+    def test_non_list_glob_returns_empty(self):
+        """A non-list glob value returns empty list."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={
+            "review_ignore": {"glob": "not-a-list"},
+        }):
+            cfg = get_review_ignore_config()
+
+        assert cfg["glob"] == []
+
+    def test_coerces_values_to_strings(self):
+        """Non-string patterns are coerced to strings."""
+        from app.config import get_review_ignore_config
+
+        with patch("app.config._load_config", return_value={
+            "review_ignore": {"glob": [123, True]},
+        }):
+            cfg = get_review_ignore_config()
+
+        assert cfg["glob"] == ["123", "True"]
+
+
+# ---------------------------------------------------------------------------
+# run_review with review_ignore filtering (from config.yaml)
+# ---------------------------------------------------------------------------
+
+_MULTI_FILE_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "index abc..def 100644\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -1 +1,2 @@\n"
+    " x = 1\n"
+    "+y = 2\n"
+    "diff --git a/vendor/lodash.js b/vendor/lodash.js\n"
+    "index 111..222 100644\n"
+    "--- a/vendor/lodash.js\n"
+    "+++ b/vendor/lodash.js\n"
+    "@@ -1 +1,2 @@\n"
+    " // vendored\n"
+    "+// updated\n"
+    "diff --git a/package-lock.json b/package-lock.json\n"
+    "index 333..444 100644\n"
+    "--- a/package-lock.json\n"
+    "+++ b/package-lock.json\n"
+    "@@ -1 +1 @@\n"
+    "-{}\n"
+    '+{"v": 2}\n'
+)
+
+
+class TestRunReviewWithIgnoreFilter:
+    """Tests that review_ignore from config.yaml is applied in run_review()."""
+
+    def _make_pr_context(self, diff=None):
+        return {
+            "title": "Test PR",
+            "body": "",
+            "branch": "feature",
+            "base": "main",
+            "state": "OPEN",
+            "author": "dev",
+            "url": "https://github.com/owner/repo/pull/1",
+            "diff": diff or _MULTI_FILE_DIFF,
+            "review_comments": "",
+            "reviews": "",
+            "issue_comments": "",
+        }
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
+    @patch("app.review_runner.find_bot_comment", return_value=None)
+    @patch("app.config.get_review_ignore_config", return_value={"glob": ["vendor/**", "*.json"], "regex": []})
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_review_ignore_glob_filters_diff_before_prompt(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, mock_ignore,
+        mock_find_bot, _mock_shas, review_skill_dir,
+    ):
+        """Files matching review_ignore.glob are stripped from the diff before Claude."""
+        mock_fetch.return_value = self._make_pr_context()
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        run_review(
+            "owner", "repo", "1", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        # The prompt passed to Claude should not contain vendor or lock files
+        call_args = mock_claude.call_args
+        prompt_sent = call_args[0][0]  # first positional arg
+        assert "vendor/lodash.js" not in prompt_sent
+        assert "package-lock.json" not in prompt_sent
+        assert "src/app.py" in prompt_sent
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+    @patch("app.review_runner.find_bot_comment", return_value=None)
+    @patch("app.config.get_review_ignore_config", return_value={"glob": ["**"], "regex": []})
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_all_files_ignored_returns_nothing_to_review(
+        self, mock_fetch, mock_claude, mock_repliable, mock_ignore,
+        mock_find_bot, _mock_shas, review_skill_dir,
+    ):
+        """When all files are ignored the review returns early with 'nothing to review'."""
+        mock_fetch.return_value = self._make_pr_context()
+
+        success, summary, _ = run_review(
+            "owner", "repo", "1", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is False
+        assert "nothing to review" in summary.lower()
+        mock_claude.assert_not_called()
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
+    @patch("app.review_runner.find_bot_comment", return_value=None)
+    @patch("app.config.get_review_ignore_config", return_value={"glob": [], "regex": []})
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_no_ignore_config_no_filtering(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, mock_ignore,
+        mock_find_bot, _mock_shas, review_skill_dir,
+    ):
+        """Without review_ignore patterns, the full diff reaches Claude unchanged."""
+        mock_fetch.return_value = self._make_pr_context()
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        run_review(
+            "owner", "repo", "1", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        prompt_sent = mock_claude.call_args[0][0]
+        assert "vendor/lodash.js" in prompt_sent
+        assert "package-lock.json" in prompt_sent
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+
+    @patch("app.review_runner.find_bot_comment", return_value=None)
+    @patch("app.config.get_review_ignore_config", return_value={"glob": [], "regex": []})
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_empty_ignore_patterns_no_filtering(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, mock_ignore,
+        mock_find_bot, _mock_shas, review_skill_dir,
+    ):
+        """Empty review_ignore lists leaves diff unchanged."""
+        mock_fetch.return_value = self._make_pr_context()
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+
+        run_review(
+            "owner", "repo", "1", "/tmp/project",
+            notify_fn=MagicMock(),
+            skill_dir=review_skill_dir,
+        )
+
+        prompt_sent = mock_claude.call_args[0][0]
+        assert "vendor/lodash.js" in prompt_sent

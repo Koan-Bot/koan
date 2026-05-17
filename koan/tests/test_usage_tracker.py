@@ -1,9 +1,12 @@
 """Tests for usage_tracker.py — Usage parsing and autonomous mode decisions."""
 
 import logging
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from pathlib import Path
 from unittest.mock import patch
+from app import burn_rate
 from app.usage_tracker import UsageTracker, _get_budget_mode, MALFORMED_DEFAULT_PCT
 
 
@@ -435,6 +438,75 @@ class TestBudgetMode:
         tracker = UsageTracker(usage, runs_completed=5, budget_mode="session_only")
         # available = min(60, 90) = 60
         assert tracker.can_afford_run("deep") is True
+
+
+class TestBurnRateDowngrade:
+    """_downgrade_if_burning_fast drops one tier when projected exhaustion is near."""
+
+    @staticmethod
+    def _seed_burn_rate(tmp_path, pct_per_min):
+        """Seed rolling buffer for a desired observed burn rate.
+
+        Records 5 samples evenly spaced so total_cost / span = pct_per_min.
+        """
+        base = datetime(2026, 5, 15, 12, 0, tzinfo=timezone.utc)
+        # 5 samples × pct_per_min each over 4 minutes spread.
+        # Total = 5 * pct_per_min, span = 4 → rate = 5/4 * pct_per_min.
+        # Use cost = (4/5) * pct_per_min so total/span = pct_per_min.
+        per_sample = pct_per_min * 4.0 / 5.0
+        for i in range(5):
+            burn_rate.record_run(
+                tmp_path,
+                cost_pct=per_sample,
+                timestamp=base + timedelta(minutes=i),
+            )
+
+    def test_downgrades_deep_to_implement_when_exhaustion_imminent(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        self._seed_burn_rate(tmp_path, pct_per_min=5.0)
+        # 50% remaining at 5%/min, deep multiplier 2.0 → ~5 min → downgrade
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=50.0, mode="deep",
+        )
+        assert mode == "implement"
+        assert downgraded_from == "deep"
+
+    def test_no_downgrade_with_slow_burn(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        self._seed_burn_rate(tmp_path, pct_per_min=0.1)
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=10.0, mode="deep",
+        )
+        assert mode == "deep"
+        assert downgraded_from is None
+
+    def test_no_downgrade_when_history_too_short(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        burn_rate.record_run(tmp_path, cost_pct=10.0)
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=50.0, mode="deep",
+        )
+        assert mode == "deep"
+        assert downgraded_from is None
+
+    def test_wait_mode_not_downgraded(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        self._seed_burn_rate(tmp_path, pct_per_min=5.0)
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=95.0, mode="wait",
+        )
+        assert mode == "wait"
+        assert downgraded_from is None
+
+    def test_get_decision_reason_unchanged(self, tmp_path):
+        """UsageTracker.get_decision_reason no longer carries burn-rate text."""
+        usage = tmp_path / "usage.md"
+        usage.write_text(
+            "Session (5hr) : 50% (reset in 4h)\nWeekly (7 day) : 20% (Resets in 5d)"
+        )
+        tracker = UsageTracker(usage, budget_mode="session_only")
+        reason = tracker.get_decision_reason("implement")
+        assert "burn-rate" not in reason.lower()
 
 
 class TestGetBudgetMode:

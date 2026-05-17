@@ -51,7 +51,7 @@ class TestGetMissionTools:
         from app.config import get_mission_tools
 
         with _mock_config({}):
-            assert get_mission_tools() == "Read,Glob,Grep,Edit,Write,Bash"
+            assert get_mission_tools() == "Read,Glob,Grep,Edit,Write,Bash,Skill"
 
     def test_custom(self):
         from app.config import get_mission_tools
@@ -91,7 +91,7 @@ class TestGetAllowedTools:
         from app.config import get_allowed_tools
 
         with _mock_config({}):
-            assert get_allowed_tools() == "Read,Glob,Grep,Edit,Write,Bash"
+            assert get_allowed_tools() == "Read,Glob,Grep,Edit,Write,Bash,Skill"
 
 
 # --- get_tools_description ---
@@ -262,6 +262,32 @@ class TestGetIntervalSeconds:
             assert get_interval_seconds() == 120
 
 
+# --- get_same_project_stickiness_percent ---
+
+
+class TestGetSameProjectStickinessPercent:
+    def test_default_disabled(self):
+        from app.config import get_same_project_stickiness_percent
+
+        with _mock_config({}):
+            assert get_same_project_stickiness_percent() == 0
+
+    def test_reads_nested_prompt_caching_value(self):
+        from app.config import get_same_project_stickiness_percent
+
+        with _mock_config({"prompt_caching": {"same_project_stickiness_percent": 35}}):
+            assert get_same_project_stickiness_percent() == 35
+
+    def test_clamps_out_of_range_values(self):
+        from app.config import get_same_project_stickiness_percent
+
+        with _mock_config({"prompt_caching": {"same_project_stickiness_percent": 999}}):
+            assert get_same_project_stickiness_percent() == 100
+
+        with _mock_config({"prompt_caching": {"same_project_stickiness_percent": -5}}):
+            assert get_same_project_stickiness_percent() == 0
+
+
 # --- get_fast_reply_model ---
 
 
@@ -345,7 +371,7 @@ class TestGetSkillTimeout:
         from app.config import get_skill_timeout
 
         with _mock_config({}):
-            assert get_skill_timeout() == 3600
+            assert get_skill_timeout() == 7200
 
     def test_custom(self):
         from app.config import get_skill_timeout
@@ -363,13 +389,36 @@ class TestGetSkillTimeout:
         from app.config import get_skill_timeout
 
         with _mock_config({"skill_timeout": "forever"}):
-            assert get_skill_timeout() == 3600
+            assert get_skill_timeout() == 7200
 
     def test_none_returns_default(self):
         from app.config import get_skill_timeout
 
         with _mock_config({"skill_timeout": None}):
-            assert get_skill_timeout() == 3600
+            assert get_skill_timeout() == 7200
+
+
+# --- get_first_output_timeout ---
+
+
+class TestGetFirstOutputTimeout:
+    def test_default(self):
+        from app.config import get_first_output_timeout
+
+        with _mock_config({}):
+            assert get_first_output_timeout() == 600
+
+    def test_custom(self):
+        from app.config import get_first_output_timeout
+
+        with _mock_config({"first_output_timeout": 300}):
+            assert get_first_output_timeout() == 300
+
+    def test_zero_disables(self):
+        from app.config import get_first_output_timeout
+
+        with _mock_config({"first_output_timeout": 0}):
+            assert get_first_output_timeout() == 0
 
 
 # --- get_skill_max_turns ---
@@ -401,6 +450,35 @@ class TestGetSkillMaxTurns:
             assert get_skill_max_turns() == 200
 
 
+# --- get_analysis_max_turns ---
+
+
+class TestGetAnalysisMaxTurns:
+    def test_default(self):
+        from app.config import get_analysis_max_turns
+
+        with _mock_config({}):
+            assert get_analysis_max_turns() == 75
+
+    def test_custom(self):
+        from app.config import get_analysis_max_turns
+
+        with _mock_config({"analysis_max_turns": 100}):
+            assert get_analysis_max_turns() == 100
+
+    def test_string_value_coerced(self):
+        from app.config import get_analysis_max_turns
+
+        with _mock_config({"analysis_max_turns": "100"}):
+            assert get_analysis_max_turns() == 100
+
+    def test_invalid_string_returns_default(self):
+        from app.config import get_analysis_max_turns
+
+        with _mock_config({"analysis_max_turns": "lots"}):
+            assert get_analysis_max_turns() == 75
+
+
 # --- get_mission_timeout ---
 
 
@@ -422,6 +500,35 @@ class TestGetMissionTimeout:
 
         with _mock_config({"mission_timeout": 0}):
             assert get_mission_timeout() == 0
+
+
+# --- get_post_mission_timeout ---
+
+
+class TestGetPostMissionTimeout:
+    def test_default(self):
+        from app.config import get_post_mission_timeout
+
+        with _mock_config({}):
+            assert get_post_mission_timeout() == 300
+
+    def test_custom(self):
+        from app.config import get_post_mission_timeout
+
+        with _mock_config({"post_mission_timeout": 600}):
+            assert get_post_mission_timeout() == 600
+
+    def test_string_parsed(self):
+        from app.config import get_post_mission_timeout
+
+        with _mock_config({"post_mission_timeout": "120"}):
+            assert get_post_mission_timeout() == 120
+
+    def test_invalid_returns_default(self):
+        from app.config import get_post_mission_timeout
+
+        with _mock_config({"post_mission_timeout": "nope"}):
+            assert get_post_mission_timeout() == 300
 
 
 # --- build_claude_flags ---
@@ -679,6 +786,74 @@ class TestDashboardConfig:
             assert get_dashboard_port() == 8080
 
 
+# --- get_mcp_configs ---
+
+
+class TestGetMcpConfigs:
+    def test_default_empty(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({}):
+            with patch("app.config._load_project_overrides", return_value={}):
+                assert get_mcp_configs() == []
+
+    def test_global_list(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({"mcp": ["/path/to/mcp.json"]}):
+            with patch("app.config._load_project_overrides", return_value={}):
+                assert get_mcp_configs() == ["/path/to/mcp.json"]
+
+    def test_global_multiple(self):
+        from app.config import get_mcp_configs
+
+        configs = ["/path/a.json", "/path/b.json"]
+        with _mock_config({"mcp": configs}):
+            with patch("app.config._load_project_overrides", return_value={}):
+                assert get_mcp_configs() == configs
+
+    def test_non_list_returns_empty(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({"mcp": "not-a-list"}):
+            with patch("app.config._load_project_overrides", return_value={}):
+                assert get_mcp_configs() == []
+
+    def test_filters_non_string_entries(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({"mcp": ["/valid.json", 42, "", None]}):
+            with patch("app.config._load_project_overrides", return_value={}):
+                assert get_mcp_configs() == ["/valid.json"]
+
+    def test_project_override_replaces_global(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({"mcp": ["/global.json"]}):
+            with patch(
+                "app.config._load_project_overrides",
+                return_value={"mcp": ["/project.json"]},
+            ):
+                assert get_mcp_configs("myproject") == ["/project.json"]
+
+    def test_project_override_absent_uses_global(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({"mcp": ["/global.json"]}):
+            with patch("app.config._load_project_overrides", return_value={}):
+                assert get_mcp_configs("myproject") == ["/global.json"]
+
+    def test_project_override_empty_list_clears_global(self):
+        from app.config import get_mcp_configs
+
+        with _mock_config({"mcp": ["/global.json"]}):
+            with patch(
+                "app.config._load_project_overrides",
+                return_value={"mcp": []},
+            ):
+                assert get_mcp_configs("myproject") == []
+
+
 class TestBackwardCompat:
     """Verify that importing from app.utils still works."""
 
@@ -688,3 +863,47 @@ class TestBackwardCompat:
         assert callable(get_chat_tools)
         assert callable(get_model_config)
         assert callable(get_branch_prefix)
+
+
+# --- get_effort_for_mode ---
+
+
+class TestGetEffortForMode:
+    def test_defaults_no_config(self):
+        from app.config import get_effort_for_mode
+        with _mock_config({}):
+            assert get_effort_for_mode("review") == "low"
+            assert get_effort_for_mode("implement") == ""
+            assert get_effort_for_mode("deep") == "high"
+            assert get_effort_for_mode("wait") == ""
+
+    def test_string_config_applies_to_all_modes(self):
+        from app.config import get_effort_for_mode
+        with _mock_config({"effort": "max"}):
+            assert get_effort_for_mode("review") == "max"
+            assert get_effort_for_mode("implement") == "max"
+            assert get_effort_for_mode("deep") == "max"
+
+    def test_dict_config_per_mode(self):
+        from app.config import get_effort_for_mode
+        with _mock_config({"effort": {"review": "low", "deep": "max"}}):
+            assert get_effort_for_mode("review") == "low"
+            assert get_effort_for_mode("deep") == "max"
+            # Missing mode falls back to default
+            assert get_effort_for_mode("implement") == ""
+
+    def test_empty_string_disables(self):
+        from app.config import get_effort_for_mode
+        with _mock_config({"effort": ""}):
+            assert get_effort_for_mode("deep") == ""
+
+    def test_invalid_string_returns_empty(self):
+        from app.config import get_effort_for_mode
+        with _mock_config({"effort": "turbo"}):
+            assert get_effort_for_mode("deep") == ""
+
+    def test_invalid_dict_value_falls_back(self):
+        from app.config import get_effort_for_mode
+        with _mock_config({"effort": {"deep": "turbo"}}):
+            # Invalid value in dict falls back to default
+            assert get_effort_for_mode("deep") == "high"

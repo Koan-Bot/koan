@@ -1,5 +1,6 @@
 """Tests for app/skills.py — SKILL.md parsing, registry, and skill execution."""
 
+import sys
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -17,7 +18,9 @@ from app.skills import (
     _parse_bool_flag,
     _parse_inline_list,
     _parse_yaml_lite,
+    _reset_requirements_cache,
     build_registry,
+    ensure_requirements,
     execute_skill,
     get_default_skills_dir,
     parse_skill_md,
@@ -349,6 +352,220 @@ class TestParseSkillMd:
         assert skill.cli_skill is None
 
 
+class TestForwardResultFrontmatter:
+    """Tests for forward_result + title_markers SKILL.md fields."""
+
+    def test_forward_result_defaults_to_false(self, tmp_path):
+        skill_dir = tmp_path / "scope" / "neutral"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: neutral
+            scope: scope
+            commands:
+              - name: neutral
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.forward_result_enabled is False
+        assert skill.title_markers == []
+
+    def test_forward_result_true_parsed(self, tmp_path):
+        skill_dir = tmp_path / "scope" / "fwd"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: fwd
+            scope: scope
+            forward_result: true
+            commands:
+              - name: fwd
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.forward_result_enabled is True
+
+    def test_forward_result_truthy_variants(self, tmp_path):
+        """Accepts 'true', 'yes', '1' via shared _parse_bool_flag helper."""
+        for raw in ("true", "yes", "1"):
+            skill_dir = tmp_path / f"v_{raw}" / "fwd"
+            skill_dir.mkdir(parents=True)
+            skill_md = skill_dir / "SKILL.md"
+            skill_md.write_text(textwrap.dedent(f"""\
+                ---
+                name: fwd
+                scope: scope
+                forward_result: {raw}
+                commands:
+                  - name: fwd
+                ---
+            """))
+            skill = parse_skill_md(skill_md)
+            assert skill is not None
+            assert skill.forward_result_enabled is True, raw
+
+    def test_forward_result_falsy_variants(self, tmp_path):
+        for raw in ("false", "no", "0", ""):
+            skill_dir = tmp_path / f"v_{raw or 'empty'}" / "fwd"
+            skill_dir.mkdir(parents=True)
+            skill_md = skill_dir / "SKILL.md"
+            skill_md.write_text(textwrap.dedent(f"""\
+                ---
+                name: fwd
+                scope: scope
+                forward_result: {raw}
+                commands:
+                  - name: fwd
+                ---
+            """))
+            skill = parse_skill_md(skill_md)
+            assert skill is not None
+            assert skill.forward_result_enabled is False, raw
+
+    def test_title_markers_inline_list(self, tmp_path):
+        skill_dir = tmp_path / "scope" / "fwd"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: fwd
+            scope: scope
+            forward_result: true
+            title_markers: ["my-custom-workflow", "another-marker"]
+            commands:
+              - name: fwd
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.title_markers == ["my-custom-workflow", "another-marker"]
+
+    def test_title_markers_default_empty_when_omitted(self, tmp_path):
+        skill_dir = tmp_path / "scope" / "fwd"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: fwd
+            scope: scope
+            forward_result: true
+            commands:
+              - name: fwd
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.title_markers == []
+
+
+class TestCollectForwardResultMarkers:
+    """Tests for the collect_forward_result_markers registry helper."""
+
+    def test_empty_for_registry_with_no_opt_in(self):
+        from app.skills import (
+            Skill,
+            SkillCommand,
+            SkillRegistry,
+            collect_forward_result_markers,
+        )
+        reg = SkillRegistry()
+        reg._register(Skill(
+            name="neutral",
+            scope="core",
+            commands=[SkillCommand(name="neutral")],
+        ))
+        assert collect_forward_result_markers(reg) == []
+
+    def test_auto_derives_slash_markers_from_commands_and_aliases(self):
+        from app.skills import (
+            Skill,
+            SkillCommand,
+            SkillRegistry,
+            collect_forward_result_markers,
+        )
+        reg = SkillRegistry()
+        reg._register(Skill(
+            name="fix",
+            scope="my_team",
+            forward_result_enabled=True,
+            commands=[SkillCommand(name="my_fix", aliases=["myfix"])],
+        ))
+        markers = collect_forward_result_markers(reg)
+        # Auto-derived markers cover slash command, alias, and scoped form.
+        assert "/my_fix" in markers
+        assert "/myfix" in markers
+        assert "/my_team.fix" in markers
+
+    def test_includes_explicit_title_markers(self):
+        from app.skills import (
+            Skill,
+            SkillCommand,
+            SkillRegistry,
+            collect_forward_result_markers,
+        )
+        reg = SkillRegistry()
+        reg._register(Skill(
+            name="fix",
+            scope="my_team",
+            forward_result_enabled=True,
+            title_markers=["my-custom-workflow", "Long Phrase With Spaces"],
+            commands=[SkillCommand(name="my_fix")],
+        ))
+        markers = collect_forward_result_markers(reg)
+        assert "my-custom-workflow" in markers
+        assert "long phrase with spaces" in markers  # lower-cased
+
+    def test_skips_skills_without_forward_result(self):
+        from app.skills import (
+            Skill,
+            SkillCommand,
+            SkillRegistry,
+            collect_forward_result_markers,
+        )
+        reg = SkillRegistry()
+        reg._register(Skill(
+            name="opt_in",
+            scope="a",
+            forward_result_enabled=True,
+            commands=[SkillCommand(name="opt_in")],
+        ))
+        reg._register(Skill(
+            name="opt_out",
+            scope="a",
+            forward_result_enabled=False,
+            commands=[SkillCommand(name="opt_out")],
+        ))
+        markers = collect_forward_result_markers(reg)
+        assert "/opt_in" in markers
+        assert "/opt_out" not in markers
+
+    def test_markers_are_distinct_and_lowercased(self):
+        from app.skills import (
+            Skill,
+            SkillCommand,
+            SkillRegistry,
+            collect_forward_result_markers,
+        )
+        reg = SkillRegistry()
+        reg._register(Skill(
+            name="fix",
+            scope="my_team",
+            forward_result_enabled=True,
+            title_markers=["MY-CUSTOM-WORKFLOW", "my-custom-workflow"],
+            commands=[SkillCommand(name="my_fix", aliases=["my_fix"])],  # dup alias
+        ))
+        markers = collect_forward_result_markers(reg)
+        # Lower-cased and deduplicated.
+        assert markers == sorted(set(markers))
+        assert all(m == m.lower() for m in markers)
+        assert "my-custom-workflow" in markers
+        assert "MY-CUSTOM-WORKFLOW" not in markers
+
+
 # ---------------------------------------------------------------------------
 # SkillRegistry
 # ---------------------------------------------------------------------------
@@ -464,6 +681,12 @@ class TestSkillRegistry:
         registry = SkillRegistry(self._make_skill_tree(tmp_path))
         # "s" is too short for cutoff, but "deplo" should match "deploy"
         assert registry.suggest_command("deplo") == "deploy"
+
+    def test_suggest_command_short_abbreviation(self, tmp_path):
+        registry = SkillRegistry(self._make_skill_tree(tmp_path))
+        # Short abbreviations like "fo" should match "focus" at 0.5 cutoff
+        assert registry.suggest_command("fo", extra_commands=["focus", "review"]) == "focus"
+        assert registry.suggest_command("up", extra_commands=["update", "quota"]) == "update"
 
     def test_list_all(self, tmp_path):
         registry = SkillRegistry(self._make_skill_tree(tmp_path))
@@ -581,6 +804,43 @@ class TestSkillRegistry:
         """))
         registry = SkillRegistry(tmp_path)
         assert registry.list_by_group("missions") == []
+
+    def test_list_by_group_any_scope_includes_non_core(self, tmp_path):
+        """list_by_group_any_scope returns skills from every scope.
+
+        Used by the integrations help group so custom skills appear under
+        /help integrations even though list_by_group() is core-only.
+        """
+        core_dir = tmp_path / "core" / "plan"
+        core_dir.mkdir(parents=True)
+        (core_dir / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: plan
+            scope: core
+            group: code
+            commands:
+              - name: plan
+                description: Plan
+            ---
+        """))
+        custom_dir = tmp_path / "my_team" / "fix"
+        custom_dir.mkdir(parents=True)
+        (custom_dir / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: fix
+            scope: my_team
+            group: integrations
+            commands:
+              - name: my_fix
+                description: Fix a team-specific bug
+            ---
+        """))
+        registry = SkillRegistry(tmp_path)
+        # Default behavior unchanged: only core returned.
+        assert registry.list_by_group("integrations") == []
+        # New helper returns custom-scoped skill.
+        names = sorted(s.name for s in registry.list_by_group_any_scope("integrations"))
+        assert names == ["fix"]
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +975,55 @@ class TestBuildRegistry:
         # Should not crash on nonexistent dirs
         registry = build_registry(extra_dirs=[tmp_path / "nonexistent"])
         assert len(registry) > 0  # Still has defaults
+
+
+class TestBuildRegistryPendingGate:
+    """Audit finding §3 regression: skills under instance/skills/ whose
+    directory (or ancestor) carries .koan-pending MUST NOT register, so
+    the bridge never exec_module()s an unapproved handler."""
+
+    @staticmethod
+    def _write_skill(parent, scope, name):
+        skill_dir = parent / scope / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(textwrap.dedent(f"""\
+            ---
+            name: {name}
+            scope: {scope}
+            description: x
+            commands:
+              - name: {name}
+                description: x
+            ---
+        """))
+        return skill_dir
+
+    def test_pending_marker_at_scope_hides_all_skills(self, tmp_path):
+        self._write_skill(tmp_path, "blocked", "alpha")
+        self._write_skill(tmp_path, "blocked", "beta")
+        self._write_skill(tmp_path, "ok", "gamma")
+        (tmp_path / "blocked" / ".koan-pending").write_text("fp")
+
+        registry = build_registry(extra_dirs=[tmp_path])
+        assert "blocked.alpha" not in registry
+        assert "blocked.beta" not in registry
+        assert "ok.gamma" in registry
+
+    def test_pending_marker_at_single_skill_hides_only_that_one(self, tmp_path):
+        self._write_skill(tmp_path, "myteam", "deploy")
+        self._write_skill(tmp_path, "myteam", "rollback")
+        (tmp_path / "myteam" / "deploy" / ".koan-pending").write_text("fp")
+
+        registry = build_registry(extra_dirs=[tmp_path])
+        assert "myteam.deploy" not in registry
+        assert "myteam.rollback" in registry
+
+    def test_existing_skills_without_marker_load_normally(self, tmp_path):
+        """Grandfathering regression: pre-fix skills with no marker MUST keep
+        loading so this change does not break running deployments."""
+        self._write_skill(tmp_path, "legacy", "preexisting")
+        registry = build_registry(extra_dirs=[tmp_path])
+        assert "legacy.preexisting" in registry
 
 
 # ---------------------------------------------------------------------------
@@ -1579,35 +1888,61 @@ class TestHyphenValidation:
     """Ensure skills with hyphens in command names or aliases are rejected."""
 
     def test_command_name_with_hyphen_skipped(self, caplog):
-        """A skill whose command name contains a hyphen is not registered."""
+        """A command whose name contains a hyphen is skipped, but the skill is still registered."""
         skill = Skill(
             name="bad_skill", scope="custom",
+            commands=[
+                SkillCommand(name="bad-cmd", description="nope"),
+                SkillCommand(name="good_cmd", description="ok"),
+            ],
+        )
+        registry = SkillRegistry()
+
+        with caplog.at_level("ERROR", logger="app.skills"):
+            registry._register(skill)
+
+        # The skill itself is registered
+        assert registry.get("custom", "bad_skill") is not None
+        # The bad command is not in the command map
+        assert registry.find_by_command("bad-cmd") is None
+        # The good command IS registered
+        assert registry.find_by_command("good_cmd") is not None
+        assert "contains a hyphen" in caplog.text
+        assert "bad-cmd" in caplog.text
+
+    def test_command_name_with_hyphen_only_command(self, caplog):
+        """A skill whose only command has a hyphen is registered but has no commands mapped."""
+        skill = Skill(
+            name="bad_skill_only", scope="custom",
             commands=[SkillCommand(name="bad-cmd", description="nope")],
         )
         registry = SkillRegistry()
 
-        with caplog.at_level("WARNING", logger="app.skills"):
+        with caplog.at_level("ERROR", logger="app.skills"):
             registry._register(skill)
 
-        assert registry.get("custom", "bad_skill") is None
+        # Skill registered, but no commands accessible
+        assert registry.get("custom", "bad_skill_only") is not None
         assert registry.find_by_command("bad-cmd") is None
-        assert "contains a hyphen" in caplog.text
-        assert "bad-cmd" in caplog.text
 
     def test_alias_with_hyphen_skipped(self, caplog):
-        """A skill whose alias contains a hyphen is not registered."""
+        """An alias containing a hyphen is skipped, but the command and skill remain."""
         skill = Skill(
             name="bad_skill2", scope="custom",
-            commands=[SkillCommand(name="good_cmd", aliases=["bad-alias"])],
+            commands=[SkillCommand(name="good_cmd", aliases=["bad-alias", "good_alias"])],
         )
         registry = SkillRegistry()
 
-        with caplog.at_level("WARNING", logger="app.skills"):
+        with caplog.at_level("ERROR", logger="app.skills"):
             registry._register(skill)
 
-        assert registry.get("custom", "bad_skill2") is None
-        assert registry.find_by_command("good_cmd") is None
-        assert "contains a hyphen" in caplog.text
+        # Skill and command are registered
+        assert registry.get("custom", "bad_skill2") is not None
+        assert registry.find_by_command("good_cmd") is not None
+        # Good alias works, bad alias doesn't
+        assert registry.find_by_command("good_alias") is not None
+        assert registry.find_by_command("bad-alias") is None
+        assert "contain a hyphen" in caplog.text
         assert "bad-alias" in caplog.text
 
     def test_underscore_names_accepted(self):
@@ -1644,3 +1979,591 @@ class TestHyphenValidation:
         assert not violations, (
             f"Core skills with hyphens in commands/aliases: {', '.join(violations)}"
         )
+
+
+class TestAliasCollisionDetection:
+    """Verify that SkillRegistry warns when two skills register the same command/alias."""
+
+    def test_command_collision_warns(self, tmp_path, caplog):
+        """Two skills with the same command name should log a warning."""
+        skill_a = tmp_path / "core" / "skill_a"
+        skill_a.mkdir(parents=True)
+        (skill_a / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_a
+            scope: core
+            description: First skill
+            group: status
+            commands:
+              - name: deploy
+                description: Deploy A
+            ---
+        """))
+
+        skill_b = tmp_path / "core" / "skill_b"
+        skill_b.mkdir(parents=True)
+        (skill_b / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_b
+            scope: core
+            description: Second skill
+            group: status
+            commands:
+              - name: deploy
+                description: Deploy B
+            ---
+        """))
+
+        with caplog.at_level("WARNING"):
+            registry = SkillRegistry(tmp_path)
+
+        assert "collides" in caplog.text
+        assert "deploy" in caplog.text
+        assert "core.skill_a" in caplog.text
+        assert "core.skill_b" in caplog.text
+
+        # The later skill wins (overwrites)
+        found = registry.find_by_command("deploy")
+        assert found is not None
+        assert found.name == "skill_b"
+
+    def test_alias_collision_warns(self, tmp_path, caplog):
+        """Two skills with overlapping aliases should log a warning."""
+        skill_a = tmp_path / "core" / "skill_a"
+        skill_a.mkdir(parents=True)
+        (skill_a / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_a
+            scope: core
+            description: First skill
+            group: status
+            commands:
+              - name: alpha
+                description: Alpha cmd
+                aliases: [a]
+            ---
+        """))
+
+        skill_b = tmp_path / "core" / "skill_b"
+        skill_b.mkdir(parents=True)
+        (skill_b / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_b
+            scope: core
+            description: Second skill
+            group: status
+            commands:
+              - name: beta
+                description: Beta cmd
+                aliases: [a]
+            ---
+        """))
+
+        with caplog.at_level("WARNING"):
+            SkillRegistry(tmp_path)
+
+        assert "collides" in caplog.text
+        assert "alias" in caplog.text
+        assert "'a'" in caplog.text
+
+    def test_alias_collides_with_command_warns(self, tmp_path, caplog):
+        """An alias that matches another skill's command name should warn."""
+        skill_a = tmp_path / "core" / "skill_a"
+        skill_a.mkdir(parents=True)
+        (skill_a / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_a
+            scope: core
+            description: First skill
+            group: status
+            commands:
+              - name: deploy
+                description: Deploy
+            ---
+        """))
+
+        skill_b = tmp_path / "core" / "skill_b"
+        skill_b.mkdir(parents=True)
+        (skill_b / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_b
+            scope: core
+            description: Second skill
+            group: status
+            commands:
+              - name: ship
+                description: Ship it
+                aliases: [deploy]
+            ---
+        """))
+
+        with caplog.at_level("WARNING"):
+            SkillRegistry(tmp_path)
+
+        assert "collides" in caplog.text
+        assert "deploy" in caplog.text
+
+    def test_same_skill_multiple_commands_no_warning(self, tmp_path, caplog):
+        """A skill registering its own commands should never trigger a collision."""
+        skill_a = tmp_path / "core" / "skill_a"
+        skill_a.mkdir(parents=True)
+        (skill_a / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_a
+            scope: core
+            description: Multi-command skill
+            group: status
+            commands:
+              - name: start
+                description: Start
+              - name: stop
+                description: Stop
+            ---
+        """))
+
+        with caplog.at_level("WARNING"):
+            SkillRegistry(tmp_path)
+
+        assert "collides" not in caplog.text
+
+    def test_no_collision_across_different_commands(self, tmp_path, caplog):
+        """Skills with distinct commands should not warn."""
+        skill_a = tmp_path / "core" / "skill_a"
+        skill_a.mkdir(parents=True)
+        (skill_a / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_a
+            scope: core
+            description: First
+            group: status
+            commands:
+              - name: alpha
+                description: Alpha
+            ---
+        """))
+
+        skill_b = tmp_path / "core" / "skill_b"
+        skill_b.mkdir(parents=True)
+        (skill_b / "SKILL.md").write_text(textwrap.dedent("""\
+            ---
+            name: skill_b
+            scope: core
+            description: Second
+            group: status
+            commands:
+              - name: beta
+                description: Beta
+            ---
+        """))
+
+        with caplog.at_level("WARNING"):
+            SkillRegistry(tmp_path)
+
+        assert "collides" not in caplog.text
+
+    def test_no_collision_on_real_core_skills(self, caplog):
+        """Verify no alias/command collisions exist in shipped core skills."""
+        from app.skills import get_default_skills_dir
+
+        with caplog.at_level("WARNING", logger="app.skills"):
+            SkillRegistry(get_default_skills_dir())
+
+        collisions = [
+            rec.message for rec in caplog.records if "collides" in rec.message
+        ]
+        assert not collisions, (
+            f"Core skills have command/alias collisions:\n"
+            + "\n".join(collisions)
+        )
+
+
+# ---------------------------------------------------------------------------
+# _refresh_stale_app_modules — mtime-based reload
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshStaleAppModules:
+    """Tests for the mtime-based app.* module refresh mechanism."""
+
+    def test_no_reload_when_mtime_unchanged(self, monkeypatch, tmp_path):
+        """Modules with unchanged mtime are not reloaded."""
+        import importlib as _importlib
+
+        from app.skills import _module_mtimes, _refresh_stale_app_modules
+
+        # Create a fake module with a source file
+        fake_file = tmp_path / "fake_module.py"
+        fake_file.write_text("X = 1")
+        fake_mod = MagicMock()
+        fake_mod.__file__ = str(fake_file)
+
+        monkeypatch.setitem(sys.modules, "app.fake_test_mod", fake_mod)
+        # Pre-populate mtime cache with current mtime
+        mtime = fake_file.stat().st_mtime
+        monkeypatch.setitem(_module_mtimes, "app.fake_test_mod", mtime)
+
+        reload_calls = []
+        original_reload = _importlib.reload
+        monkeypatch.setattr(
+            _importlib, "reload",
+            lambda m: reload_calls.append(m) or original_reload(m),
+        )
+
+        _refresh_stale_app_modules()
+
+        assert not reload_calls, "Should not reload when mtime is unchanged"
+
+        # Cleanup
+        sys.modules.pop("app.fake_test_mod", None)
+        _module_mtimes.pop("app.fake_test_mod", None)
+
+    def test_reload_when_mtime_changes(self, monkeypatch, tmp_path):
+        """Modules with changed mtime trigger a reload attempt."""
+        import importlib as _importlib
+        import os as _os
+
+        from app.skills import _module_mtimes, _refresh_stale_app_modules
+
+        fake_file = tmp_path / "refreshable.py"
+        fake_file.write_text("X = 1")
+        fake_mod = MagicMock()
+        fake_mod.__file__ = str(fake_file)
+
+        monkeypatch.setitem(sys.modules, "app.refreshable_test", fake_mod)
+        # Cache an old mtime so the change is detected
+        old_mtime = _os.path.getmtime(str(fake_file)) - 10
+        monkeypatch.setitem(_module_mtimes, "app.refreshable_test", old_mtime)
+
+        reload_calls = []
+        monkeypatch.setattr(
+            _importlib, "reload",
+            lambda m: reload_calls.append(m),
+        )
+
+        _refresh_stale_app_modules()
+
+        assert fake_mod in reload_calls, "Should reload when mtime has changed"
+
+        # Cleanup
+        sys.modules.pop("app.refreshable_test", None)
+        _module_mtimes.pop("app.refreshable_test", None)
+
+    def test_first_encounter_caches_mtime_without_reload(self, monkeypatch, tmp_path):
+        """First time seeing a module just caches mtime, does not reload —
+        provided the file is no newer than the process start time."""
+        import importlib as _importlib
+
+        from app import skills as _skills
+        from app.skills import _module_mtimes, _refresh_stale_app_modules
+
+        fake_file = tmp_path / "first_seen.py"
+        fake_file.write_text("X = 1")
+        fake_mod = MagicMock()
+        fake_mod.__file__ = str(fake_file)
+
+        monkeypatch.setitem(sys.modules, "app.first_seen_test", fake_mod)
+        # Ensure not in mtime cache
+        _module_mtimes.pop("app.first_seen_test", None)
+
+        # Pretend the process started well after the file's mtime, so the
+        # first-encounter fast path applies (auto-update did not touch it).
+        monkeypatch.setattr(
+            _skills, "_PROCESS_START_TIME", fake_file.stat().st_mtime + 60,
+        )
+
+        reload_calls = []
+        original_reload = _importlib.reload
+        monkeypatch.setattr(
+            _importlib, "reload",
+            lambda m: reload_calls.append(m) or original_reload(m),
+        )
+
+        _refresh_stale_app_modules()
+
+        assert not reload_calls, "First encounter of an old file should not reload"
+        assert "app.first_seen_test" in _module_mtimes
+
+        # Cleanup
+        sys.modules.pop("app.first_seen_test", None)
+        _module_mtimes.pop("app.first_seen_test", None)
+
+    def test_first_encounter_reloads_when_file_newer_than_process_start(
+        self, monkeypatch, tmp_path,
+    ):
+        """If a module's source file was modified after the process started
+        (auto-update path), the very first observation must trigger a reload
+        even though no baseline mtime exists yet. Regression test for the
+        ``cannot import name 'PROJECT_NAME_CHARS' from 'app.utils'`` failure
+        on the first /list after an auto-update added a new symbol."""
+        import importlib as _importlib
+
+        from app import skills as _skills
+        from app.skills import _module_mtimes, _refresh_stale_app_modules
+
+        fake_file = tmp_path / "post_update.py"
+        fake_file.write_text("X = 1")
+        fake_mod = MagicMock()
+        fake_mod.__file__ = str(fake_file)
+
+        monkeypatch.setitem(sys.modules, "app.post_update_test", fake_mod)
+        # No cached mtime: this is the first observation of the module.
+        _module_mtimes.pop("app.post_update_test", None)
+
+        # Pretend the process started before the file was written.
+        file_mtime = fake_file.stat().st_mtime
+        monkeypatch.setattr(_skills, "_PROCESS_START_TIME", file_mtime - 60)
+
+        reload_calls = []
+        monkeypatch.setattr(
+            _importlib, "reload",
+            lambda m: reload_calls.append(m),
+        )
+
+        _refresh_stale_app_modules()
+
+        assert reload_calls == [fake_mod], (
+            "First observation of a file newer than process start must reload"
+        )
+        assert _module_mtimes.get("app.post_update_test") == file_mtime
+
+        # Cleanup
+        sys.modules.pop("app.post_update_test", None)
+        _module_mtimes.pop("app.post_update_test", None)
+
+    def test_failed_reload_evicts_module(self, monkeypatch, tmp_path):
+        """If reload fails, the module is evicted from sys.modules."""
+        import importlib as _importlib
+
+        from app.skills import _module_mtimes, _refresh_stale_app_modules
+
+        fake_file = tmp_path / "broken.py"
+        fake_file.write_text("X = 1")
+        fake_mod = MagicMock()
+        fake_mod.__file__ = str(fake_file)
+
+        monkeypatch.setitem(sys.modules, "app.broken_test", fake_mod)
+        # Set old mtime so reload is triggered
+        old_mtime = fake_file.stat().st_mtime - 10
+        monkeypatch.setitem(_module_mtimes, "app.broken_test", old_mtime)
+
+        # Make reload raise
+        monkeypatch.setattr(
+            _importlib, "reload",
+            lambda m: (_ for _ in ()).throw(ImportError("broken")),
+        )
+
+        _refresh_stale_app_modules()
+
+        assert "app.broken_test" not in sys.modules
+        assert "app.broken_test" not in _module_mtimes
+
+    def test_ignores_non_app_modules(self, monkeypatch, tmp_path):
+        """Modules not starting with 'app.' are never touched."""
+        import importlib as _importlib
+
+        from app.skills import _refresh_stale_app_modules
+
+        reload_calls = []
+        original_reload = _importlib.reload
+        monkeypatch.setattr(
+            _importlib, "reload",
+            lambda m: reload_calls.append(m.__name__) or original_reload(m),
+        )
+
+        _refresh_stale_app_modules()
+
+        # No non-app modules should be reloaded
+        for name in reload_calls:
+            assert name.startswith("app."), f"Non-app module touched: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Skill requirements (auto-install)
+# ---------------------------------------------------------------------------
+
+
+class TestSkillRequirements:
+    """Tests for requirements: field parsing and auto-install."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_requirements_cache(self):
+        """Reset the per-session requirements cache before each test."""
+        _reset_requirements_cache()
+        yield
+        _reset_requirements_cache()
+
+    def test_requirements_parsed_from_skill_md(self, tmp_path):
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: fetcher
+            description: Fetch stuff
+            requirements: [requests, boto3]
+            commands:
+              - name: fetch
+                description: Fetch data
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.requirements == ["requests", "boto3"]
+
+    def test_requirements_empty_when_not_specified(self, tmp_path):
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: basic
+            description: No deps
+            commands:
+              - name: basic
+                description: Basic skill
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.requirements == []
+
+    def test_requirements_single_string(self, tmp_path):
+        """A single string requirement (not a list) is handled."""
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(textwrap.dedent("""\
+            ---
+            name: single
+            description: One dep
+            requirements: requests
+            commands:
+              - name: single
+                description: Single
+            ---
+        """))
+        skill = parse_skill_md(skill_md)
+        assert skill is not None
+        assert skill.requirements == ["requests"]
+
+    def test_ensure_requirements_skips_when_no_requirements(self):
+        skill = Skill(name="nodeps", scope="test")
+        result = ensure_requirements(skill)
+        assert result is None
+
+    def test_ensure_requirements_skips_already_satisfied(self):
+        skill = Skill(name="cached", scope="test", requirements=["os"])
+        # Force the cache to think it's already satisfied
+        from app.skills import _requirements_satisfied
+        _requirements_satisfied.add("test.cached")
+        result = ensure_requirements(skill)
+        assert result is None
+
+    def test_ensure_requirements_succeeds_for_stdlib(self):
+        """stdlib modules like 'json' should be found without install."""
+        skill = Skill(name="stdlib_test", scope="test", requirements=["json"])
+        result = ensure_requirements(skill)
+        assert result is None
+        from app.skills import _requirements_satisfied
+        assert "test.stdlib_test" in _requirements_satisfied
+
+    def test_ensure_requirements_installs_missing(self, monkeypatch):
+        """Missing packages trigger pip install."""
+        skill = Skill(
+            name="missing_pkg", scope="test",
+            requirements=["nonexistent_pkg_xyz123"],
+        )
+
+        # Mock subprocess.run to simulate successful install
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock_result
+
+        monkeypatch.setattr("app.skills.subprocess.run", fake_run)
+
+        result = ensure_requirements(skill)
+        assert result is None
+        assert len(calls) == 1
+        assert "nonexistent_pkg_xyz123" in calls[0]
+        from app.skills import _requirements_satisfied
+        assert "test.missing_pkg" in _requirements_satisfied
+
+    def test_ensure_requirements_returns_error_on_failure(self, monkeypatch):
+        """Failed pip install returns error message."""
+        skill = Skill(
+            name="fail_pkg", scope="test",
+            requirements=["bad_package_xyz"],
+        )
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "No matching distribution"
+
+        monkeypatch.setattr("app.skills.subprocess.run", lambda cmd, **kw: mock_result)
+
+        result = ensure_requirements(skill)
+        assert result is not None
+        assert "No matching distribution" in result
+        from app.skills import _requirements_satisfied
+        assert "test.fail_pkg" not in _requirements_satisfied
+
+    def test_ensure_requirements_handles_version_specifiers(self):
+        """Version specifiers (>=, ==, ~=, etc.) are stripped for import check."""
+        skill = Skill(
+            name="versioned", scope="test",
+            requirements=["json>=1.0"],  # json is stdlib, should import fine
+        )
+        result = ensure_requirements(skill)
+        assert result is None
+        from app.skills import _requirements_satisfied
+        assert "test.versioned" in _requirements_satisfied
+
+    def test_ensure_requirements_handles_tilde_specifier(self):
+        """~= specifier is properly stripped for import check."""
+        skill = Skill(
+            name="tilde_ver", scope="test",
+            requirements=["json~=1.0"],  # json is stdlib
+        )
+        result = ensure_requirements(skill)
+        assert result is None
+
+    def test_ensure_requirements_rejects_flag_injection(self):
+        """Requirement entries starting with '-' are rejected."""
+        skill = Skill(
+            name="evil", scope="test",
+            requirements=["--index-url=https://evil.example.com/simple/"],
+        )
+        result = ensure_requirements(skill)
+        assert result is not None
+        assert "flags not allowed" in result
+
+    def test_execute_handler_fails_on_missing_requirements(self, tmp_path, monkeypatch):
+        """Handler execution returns SkillError when requirements can't be installed."""
+        handler = tmp_path / "handler.py"
+        handler.write_text("def handle(ctx): return 'ok'")
+
+        skill = Skill(
+            name="broken_deps", scope="test",
+            requirements=["impossible_package_xyz"],
+            handler_path=handler,
+            skill_dir=tmp_path,
+        )
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "Could not find package"
+
+        monkeypatch.setattr("app.skills.subprocess.run", lambda cmd, **kw: mock_result)
+
+        ctx = SkillContext(
+            koan_root=tmp_path,
+            instance_dir=tmp_path,
+            command_name="broken_deps",
+        )
+
+        result = execute_skill(skill, ctx)
+        assert isinstance(result, SkillError)
+        assert "Could not find package" in result.message

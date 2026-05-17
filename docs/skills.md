@@ -86,6 +86,7 @@ Skills marked **GitHub @mention** can be triggered by commenting `@koan-bot <com
 | `/language <lang>` | `/lng`, `/fr`, `/en` | Set reply language preference |
 | `/verbose` | — | Enable real-time progress updates |
 | `/silent` | — | Disable real-time progress updates |
+| `/config_check` | `/cfgcheck`, `/configcheck` | Detect drift between instance/config.yaml and the template |
 
 ## System
 
@@ -109,8 +110,15 @@ Install skills from Git repos:
 
 ```
 /skill install https://github.com/your-org/koan-skills.git
+/skill approve <scope> <fingerprint>
 /skill update <scope>
 /skill remove <scope>
 ```
+
+New installs and `/scaffold_skill` output are **quarantined** behind an
+approval gate — the registry will not load them until `/skill approve` is run
+with the fingerprint shown in the install reply. Inspect the cloned files
+before approving. Set `skills.allowed_hosts` in `config.yaml` to restrict
+which Git hosts `/skill install` can fetch from.
 
 Or create your own in `instance/skills/<scope>/<name>/` with a `SKILL.md` file. See [koan/skills/README.md](../koan/skills/README.md) for the full authoring guide.

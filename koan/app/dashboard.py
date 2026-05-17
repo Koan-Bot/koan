@@ -15,6 +15,7 @@ Usage:
     make dashboard
 """
 
+import contextlib
 import json
 import os
 import re
@@ -53,10 +54,20 @@ from app.missions import (
     reorder_mission,
 )
 from app.utils import (
+    PROJECT_TAG_FULL_RE,
     modify_missions_file,
     parse_project,
     insert_pending_mission,
     get_known_projects,
+)
+from app.automation_rules import (
+    KNOWN_ACTIONS,
+    KNOWN_EVENTS,
+    add_rule,
+    load_rules,
+    remove_rule,
+    toggle_rule,
+    update_rule_params,
 )
 
 # ---------------------------------------------------------------------------
@@ -82,19 +93,16 @@ app = Flask(
 )
 
 
-_PROJECT_TAG_RE = re.compile(r'\s*\[(?:project|projet):([a-zA-Z0-9_-]+)\]\s*')
-
-
 @app.template_filter('strip_project_tag')
 def strip_project_tag_filter(text: str) -> str:
     """Remove [project:name] tag from mission text for display."""
-    return _PROJECT_TAG_RE.sub(' ', text).strip()
+    return PROJECT_TAG_FULL_RE.sub(' ', text).strip()
 
 
 @app.template_filter('project_badge')
 def project_badge_filter(text: str) -> str:
     """Extract project tag and return badge HTML, or empty string."""
-    m = _PROJECT_TAG_RE.search(text)
+    m = PROJECT_TAG_FULL_RE.search(text)
     if m:
         name = m.group(1)
         return f'<span class="badge badge-blue">{name}</span> '
@@ -203,10 +211,8 @@ def get_agent_state() -> dict:
     project_file = KOAN_ROOT / PROJECT_FILE
     project = ""
     if project_file.exists():
-        try:
+        with contextlib.suppress(OSError):
             project = project_file.read_text().strip()
-        except OSError:
-            pass
 
     # Read focus state
     focus = None
@@ -349,11 +355,10 @@ def get_journal_entries(limit: int = 7) -> list:
         # Check nested structure
         nested = JOURNAL_DIR / d
         if nested.is_dir():
-            for f in sorted(nested.glob("*.md")):
-                day_entries.append({
-                    "project": f.stem,
-                    "content": f.read_text(),
-                })
+            day_entries.extend(
+                {"project": f.stem, "content": f.read_text()}
+                for f in sorted(nested.glob("*.md"))
+            )
         # Check flat structure
         flat = JOURNAL_DIR / f"{d}.md"
         if flat.is_file():
@@ -737,7 +742,13 @@ def usage_page():
 @app.route("/api/usage")
 def api_usage():
     """JSON usage data for the specified time range."""
-    from app.cost_tracker import summarize_range, get_pricing_config, estimate_cost, daily_series
+    from app.cost_tracker import (
+        summarize_range,
+        get_pricing_config,
+        estimate_cost,
+        estimate_cache_savings,
+        daily_series,
+    )
 
     days = request.args.get("days", "7", type=str)
     selected_project = request.args.get("project", "")
@@ -774,6 +785,7 @@ def api_usage():
 
     # Per-day time series for charts
     daily = daily_series(INSTANCE_DIR, start, end, project=selected_project or None)
+    estimated_cache_savings = estimate_cache_savings(summary, pricing)
 
     return jsonify({
         "days": days,
@@ -781,11 +793,15 @@ def api_usage():
         "end": end.isoformat(),
         "total_input": summary["total_input"],
         "total_output": summary["total_output"],
+        "cache_creation_input_tokens": summary["cache_creation_input_tokens"],
+        "cache_read_input_tokens": summary["cache_read_input_tokens"],
+        "cache_hit_rate": summary["cache_hit_rate"],
         "count": summary["count"],
         "by_project": by_project,
         "by_model": summary["by_model"],
         "has_pricing": pricing is not None,
         "estimated_cost": estimated_cost,
+        "estimated_cache_savings": estimated_cache_savings,
         "daily": daily,
     })
 
@@ -1250,6 +1266,253 @@ def api_status():
         },
         "agent_state": get_agent_state(),
     })
+
+
+# ---------------------------------------------------------------------------
+# Agent introspection — memory, skills, soul, config
+# ---------------------------------------------------------------------------
+
+# Simple 30-second TTL cache for skills registry (file I/O per SKILL.md is
+# non-trivial when many custom skills are installed).
+_agent_skills_cache: dict = {}
+_AGENT_SKILLS_CACHE_TTL = 30  # seconds
+
+_SENSITIVE_KEY_RE = re.compile(
+    r'(?m)^(\s*(?:token|password|api_key|secret|private_key)\s*:\s*)\S+',
+    re.IGNORECASE,
+)
+
+
+def _mask_sensitive(yaml_text: str) -> str:
+    """Replace sensitive YAML values with <redacted>."""
+    return _SENSITIVE_KEY_RE.sub(r'\1<redacted>', yaml_text)
+
+
+def _read_capped(path: Path, cap: int = 10_000) -> dict:
+    """Read a file, capping at `cap` chars and flagging truncation."""
+    if not path.exists():
+        return {"content": None, "path": str(path.relative_to(KOAN_ROOT)), "truncated": False}
+    text = path.read_text(errors="replace")
+    truncated = len(text) > cap
+    return {
+        "content": text[:cap],
+        "path": str(path.relative_to(KOAN_ROOT)),
+        "truncated": truncated,
+        "total_chars": len(text) if truncated else None,
+    }
+
+
+@app.route("/agent")
+def agent_page():
+    """Agent introspection page — memory, skills, soul, config."""
+    return render_template("agent.html")
+
+
+@app.route("/api/agent/soul")
+def api_agent_soul():
+    """Return soul.md content."""
+    soul_path = INSTANCE_DIR / "soul.md"
+    data = _read_capped(soul_path)
+    return jsonify(data)
+
+
+@app.route("/api/agent/memory")
+def api_agent_memory():
+    """Return a structured tree of memory files."""
+    memory_dir = INSTANCE_DIR / "memory"
+
+    if not memory_dir.exists():
+        return jsonify({"summary": None, "global": [], "projects": {}})
+
+    summary = _read_capped(memory_dir / "summary.md")
+
+    # Global context files under memory/global/
+    global_files = []
+    global_dir = memory_dir / "global"
+    if global_dir.is_dir():
+        global_files.extend(
+            {**_read_capped(f), "name": f.name}
+            for f in sorted(global_dir.iterdir())
+            if f.is_file() and f.suffix in (".md", ".txt")
+        )
+
+    # Per-project files under memory/projects/{name}/
+    projects: dict = {}
+    projects_dir = memory_dir / "projects"
+    if projects_dir.is_dir():
+        for proj_dir in sorted(projects_dir.iterdir()):
+            if not proj_dir.is_dir():
+                continue
+            files = [
+                {**_read_capped(f), "name": f.name}
+                for f in sorted(proj_dir.iterdir())
+                if f.is_file() and f.suffix in (".md", ".txt")
+            ]
+            if files:
+                projects[proj_dir.name] = files
+
+    return jsonify({"summary": summary, "global": global_files, "projects": projects})
+
+
+@app.route("/api/agent/skills")
+def api_agent_skills():
+    """Return skill registry metadata."""
+    from app.skills import build_registry
+
+    now = time.time()
+    if "ts" in _agent_skills_cache and now - _agent_skills_cache["ts"] < _AGENT_SKILLS_CACHE_TTL:
+        return jsonify(_agent_skills_cache["data"])
+
+    extra_dirs = []
+    instance_skills = INSTANCE_DIR / "skills"
+    if instance_skills.is_dir():
+        extra_dirs.append(instance_skills)
+
+    registry = build_registry(extra_dirs)
+
+    skills_list = []
+    for skill in registry.list_all():
+        commands = [
+            {
+                "name": cmd.name,
+                "aliases": list(cmd.aliases) if cmd.aliases else [],
+                "description": cmd.description or "",
+            }
+            for cmd in skill.commands
+        ]
+        skills_list.append({
+            "name": skill.name,
+            "scope": skill.scope,
+            "group": skill.group,
+            "description": skill.description or "",
+            "commands": commands,
+            "audience": skill.audience,
+            "worker": skill.worker,
+            "github_enabled": skill.github_enabled,
+        })
+
+    data = {
+        "scopes": registry.scopes(),
+        "groups": registry.groups(),
+        "skills": skills_list,
+    }
+    _agent_skills_cache["ts"] = now
+    _agent_skills_cache["data"] = data
+    return jsonify(data)
+
+
+@app.route("/api/agent/config")
+def api_agent_config():
+    """Return config.yaml and projects.yaml contents (sensitive values masked)."""
+    config_path = KOAN_ROOT / "instance" / "config.yaml"
+    projects_path = KOAN_ROOT / "projects.yaml"
+
+    def read_yaml(path: Path):
+        if not path.exists():
+            return None
+        return _mask_sensitive(path.read_text(errors="replace"))
+
+    return jsonify({
+        "config_yaml": read_yaml(config_path),
+        "projects_yaml": read_yaml(projects_path),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Automation rules routes
+# ---------------------------------------------------------------------------
+
+def _get_rule_history(limit: int = 50) -> list:
+    """Read [automation_rule]-tagged journal lines, capped at `limit` entries."""
+    entries = []
+    if not JOURNAL_DIR.exists():
+        return entries
+
+    journal_dates = sorted(
+        (d for d in JOURNAL_DIR.iterdir() if d.is_dir() and re.match(r"\d{4}-\d{2}-\d{2}", d.name)),
+        reverse=True,
+    )
+
+    for day_dir in journal_dates:
+        auto_file = day_dir / "automation.md"
+        if not auto_file.exists():
+            continue
+        for line in reversed(auto_file.read_text().splitlines()):
+            if "[automation_rule]" in line:
+                entries.append({"date": day_dir.name, "line": line.strip()})
+                if len(entries) >= limit:
+                    return entries
+    return entries
+
+
+@app.route("/rules")
+def rules_page():
+    """Automation rules management page."""
+    rules = load_rules(str(INSTANCE_DIR))
+    history = _get_rule_history()
+    return render_template(
+        "rules.html",
+        rules=rules,
+        history=history,
+        known_events=sorted(KNOWN_EVENTS),
+        known_actions=sorted(KNOWN_ACTIONS),
+    )
+
+
+@app.route("/api/rules", methods=["GET"])
+def api_rules_list():
+    """Return all automation rules as JSON."""
+    rules = load_rules(str(INSTANCE_DIR))
+    return jsonify([r.to_dict() for r in rules])
+
+
+@app.route("/api/rules", methods=["POST"])
+def api_rules_create():
+    """Create a new automation rule."""
+    data = request.get_json(force=True) or {}
+    event = data.get("event", "")
+    action = data.get("action", "")
+
+    if event not in KNOWN_EVENTS:
+        return jsonify({"error": f"Unknown event '{event}'. Valid: {sorted(KNOWN_EVENTS)}"}), 400
+    if action not in KNOWN_ACTIONS:
+        return jsonify({"error": f"Unknown action '{action}'. Valid: {sorted(KNOWN_ACTIONS)}"}), 400
+
+    rule = add_rule(
+        str(INSTANCE_DIR),
+        event=event,
+        action=action,
+        params=data.get("params") or {},
+        enabled=bool(data.get("enabled", True)),
+    )
+    return jsonify(rule.to_dict()), 201
+
+
+@app.route("/api/rules/<rule_id>", methods=["PATCH"])
+def api_rules_update(rule_id):
+    """Toggle enabled state or update params of a rule."""
+    data = request.get_json(force=True) or {}
+
+    updated = None
+    if "enabled" in data:
+        updated = toggle_rule(str(INSTANCE_DIR), rule_id, enabled=bool(data["enabled"]))
+    if "params" in data and updated is None:
+        updated = update_rule_params(str(INSTANCE_DIR), rule_id, data["params"])
+    elif "params" in data and updated is not None:
+        updated = update_rule_params(str(INSTANCE_DIR), rule_id, data["params"])
+
+    if updated is None:
+        return jsonify({"error": "Rule not found"}), 404
+    return jsonify(updated.to_dict())
+
+
+@app.route("/api/rules/<rule_id>", methods=["DELETE"])
+def api_rules_delete(rule_id):
+    """Delete a rule by id."""
+    removed = remove_rule(str(INSTANCE_DIR), rule_id)
+    if not removed:
+        return jsonify({"error": "Rule not found"}), 404
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------

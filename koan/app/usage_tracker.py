@@ -91,7 +91,7 @@ class UsageTracker:
 
         # Parse session line
         session_match = re.search(
-            r'Session\s*\([^)]+\)\s*:\s*(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
+            r'Session\s*\([^)]+\)\s*:\s*~?(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
             content,
             re.IGNORECASE
         )
@@ -101,7 +101,7 @@ class UsageTracker:
 
         # Parse weekly line
         weekly_match = re.search(
-            r'Weekly\s*\([^)]+\)\s*:\s*(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
+            r'Weekly\s*\([^)]+\)\s*:\s*~?(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
             content,
             re.IGNORECASE
         )
@@ -165,14 +165,10 @@ class UsageTracker:
         Returns:
             True if estimated cost fits within available budget
         """
-        cost_multipliers = {
-            "review": 0.5,      # Low-cost: read-only activities
-            "implement": 1.0,   # Medium-cost: normal development
-            "deep": 2.0,        # High-cost: intensive work
-        }
+        from app.burn_rate import MODE_MULTIPLIERS
 
         base_cost = self.estimate_run_cost()
-        estimated_cost = base_cost * cost_multipliers.get(mode, 1.0)
+        estimated_cost = base_cost * MODE_MULTIPLIERS.get(mode, 1.0)
 
         session_rem, weekly_rem = self.remaining_budget()
         available = min(session_rem, weekly_rem)

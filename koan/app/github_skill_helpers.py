@@ -14,6 +14,28 @@ from typing import Callable, Optional, Tuple
 
 
 
+def is_own_pr(owner: str, repo: str, pr_number: str) -> Tuple[bool, str]:
+    """Check if a PR was created by this Kōan instance (branch prefix match).
+
+    Returns:
+        Tuple of (is_owned, head_branch). is_owned is True if the PR's
+        head branch starts with this instance's configured branch_prefix.
+    """
+    import json
+    from app.config import get_branch_prefix
+    from app.github import run_gh
+
+    raw = run_gh(
+        "pr", "view", str(pr_number),
+        "--repo", f"{owner}/{repo}",
+        "--json", "headRefName",
+    )
+    data = json.loads(raw)
+    head_branch = data.get("headRefName", "")
+    prefix = get_branch_prefix()
+    return head_branch.startswith(prefix), head_branch
+
+
 def extract_github_url(args: str, url_type: str = "pr-or-issue") -> Optional[Tuple[str, Optional[str]]]:
     """Extract and validate a GitHub URL from command arguments.
 
@@ -65,7 +87,10 @@ def resolve_project_for_repo(repo: str, owner: Optional[str] = None) -> Tuple[Op
     return project_path, project_name
 
 
-def queue_github_mission(ctx, command: str, url: str, project_name: str, context: Optional[str] = None) -> None:
+def queue_github_mission(
+    ctx, command: str, url: str, project_name: str,
+    context: Optional[str] = None, *, urgent: bool = False,
+) -> bool:
     """Queue a GitHub-related mission with consistent formatting.
 
     Args:
@@ -74,6 +99,10 @@ def queue_github_mission(ctx, command: str, url: str, project_name: str, context
         url: GitHub URL
         project_name: Project name for tagging
         context: Optional additional context to append
+        urgent: If True, insert at the top of the queue (--now flag)
+
+    Returns:
+        True if the mission was queued, False if it was a duplicate.
     """
     from app.utils import insert_pending_mission
 
@@ -83,7 +112,29 @@ def queue_github_mission(ctx, command: str, url: str, project_name: str, context
 
     mission_entry = f"- [project:{project_name}] {mission_text}"
     missions_path = ctx.instance_dir / "missions.md"
-    insert_pending_mission(missions_path, mission_entry)
+    return insert_pending_mission(missions_path, mission_entry, urgent=urgent)
+
+
+def queue_github_mission_once(
+    ctx, command: str, url: str, project_name: str,
+    context: Optional[str] = None, *, urgent: bool = False,
+    type_label: str = "PR", number: int = 0,
+    owner: str = "", repo: str = "",
+) -> Optional[str]:
+    """Queue a GitHub mission, returning a duplicate warning if skipped.
+
+    Combines queue_github_mission + standard duplicate message into one call.
+
+    Returns:
+        A ⚠️ duplicate warning string if skipped, None if successfully queued.
+    """
+    inserted = queue_github_mission(ctx, command, url, project_name, context, urgent=urgent)
+    if not inserted:
+        return (
+            f"\u26a0\ufe0f Duplicate ignored — /{command} already queued or running "
+            f"for {type_label} #{number} ({owner}/{repo})."
+        )
+    return None
 
 
 def format_project_not_found_error(repo: str, owner: Optional[str] = None) -> str:
@@ -132,7 +183,7 @@ def _find_repo_name_matches(repo: str) -> list:
         config = load_projects_config(str(KOAN_ROOT))
         if not config:
             return matches
-        for _name, project in config.get("projects", {}).items():
+        for project in config.get("projects", {}).values():
             if not isinstance(project, dict):
                 continue
             gh_url = project.get("github_url", "")
@@ -171,44 +222,47 @@ def handle_github_skill(
     url_type: str,
     parse_func: Callable[[str], Tuple[str, str, str]],
     success_prefix: str,
+    *,
+    urgent: bool = False,
 ) -> str:
     """Unified handler for GitHub-based skills (review, implement, refactor).
-    
+
     This consolidates the common pattern used by review, implement, and refactor skills:
     1. Extract and validate GitHub URL
     2. Parse URL to get owner/repo/number
     3. Resolve to local project
     4. Queue mission
     5. Return success message
-    
+
     Args:
         ctx: Skill context
         command: Command name (e.g., "review", "implement", "refactor")
         url_type: URL type filter ("pr", "issue", or "pr-or-issue")
         parse_func: Function to parse the URL, returns (owner, repo, number) or (owner, repo, type, number)
         success_prefix: Prefix for success message (e.g., "Review queued")
-        
+        urgent: If True, insert at the top of the queue (--now flag)
+
     Returns:
         Success or error message string
     """
     args = ctx.args.strip()
-    
+
     if not args:
         return _format_usage_message(command, url_type)
-    
+
     # Extract URL from arguments
     result = extract_github_url(args, url_type=url_type)
     if not result:
         return _format_no_url_error(url_type)
-    
+
     url, context = result
-    
+
     # Parse URL
     try:
         parsed = parse_func(url)
     except ValueError as e:
         return f"\u274c {e}"
-    
+
     # Handle different parse result formats
     if len(parsed) == 3:
         owner, repo, number = parsed
@@ -216,17 +270,23 @@ def handle_github_skill(
     else:
         owner, repo, url_type_result, number = parsed
         type_label = "PR" if url_type_result == "pull" else "issue"
-    
+
     # Resolve project
     project_path, project_name = resolve_project_for_repo(repo, owner=owner)
     if not project_path:
         return format_project_not_found_error(repo, owner=owner)
-    
-    # Queue mission
-    queue_github_mission(ctx, command, url, project_name, context)
-    
+
+    # Queue mission (with duplicate detection)
+    duplicate = queue_github_mission_once(
+        ctx, command, url, project_name, context, urgent=urgent,
+        type_label=type_label, number=number, owner=owner, repo=repo,
+    )
+    if duplicate:
+        return duplicate
+
     # Return success message
-    return f"{success_prefix} for {format_success_message(type_label, number, owner, repo, context)}"
+    priority = " (priority)" if urgent else ""
+    return f"{success_prefix}{priority} for {format_success_message(type_label, number, owner, repo, context)}"
 
 
 def _format_usage_message(command: str, url_type: str) -> str:

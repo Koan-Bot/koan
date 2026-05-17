@@ -107,13 +107,26 @@ class TestValidateProjects:
         assert result is not None
         assert "Max 2" in result
 
-    def test_missing_path(self, tmp_path):
+    def test_all_missing_paths(self, tmp_path):
         from app.loop_manager import validate_projects
 
         result = validate_projects([("proj1", "/nonexistent/path/xyz")])
         assert result is not None
-        assert "does not exist" in result
-        assert "proj1" in result
+        assert "No valid project" in result
+
+    def test_some_missing_paths_still_valid(self, tmp_path):
+        """When some projects have missing dirs, valid ones keep the config valid."""
+        from app.loop_manager import validate_projects
+
+        p1 = tmp_path / "existing"
+        p1.mkdir()
+        subprocess.run(["git", "init"], cwd=p1, capture_output=True)
+
+        result = validate_projects([
+            ("existing", str(p1)),
+            ("missing", "/nonexistent/path/xyz"),
+        ])
+        assert result is None  # valid — at least one project exists
 
     def test_single_valid_project(self, tmp_path):
         from app.loop_manager import validate_projects
@@ -123,7 +136,7 @@ class TestValidateProjects:
         assert result is None
 
     def test_non_git_directory(self, tmp_path):
-        """A valid directory that is not a git repo should be rejected."""
+        """A directory that is not a git repo is skipped; if it's the only one, validation fails."""
         from app.loop_manager import validate_projects
 
         proj = tmp_path / "not-a-repo"
@@ -131,11 +144,10 @@ class TestValidateProjects:
 
         result = validate_projects([("myproj", str(proj))])
         assert result is not None
-        assert "not a git repository" in result
-        assert "myproj" in result
+        assert "No valid project" in result
 
     def test_mixed_git_and_non_git(self, tmp_path):
-        """First project is a git repo, second is not — should catch the second."""
+        """First project is a git repo, second is not — warns but still valid."""
         from app.loop_manager import validate_projects
 
         p1 = tmp_path / "repo"
@@ -145,9 +157,20 @@ class TestValidateProjects:
         subprocess.run(["git", "init"], cwd=p1, capture_output=True)
 
         result = validate_projects([("repo", str(p1)), ("plain", str(p2))])
+        assert result is None  # valid — at least one project is a git repo
+
+    def test_all_non_git_fails(self, tmp_path):
+        """All projects are non-git directories — should fail."""
+        from app.loop_manager import validate_projects
+
+        p1 = tmp_path / "plain1"
+        p2 = tmp_path / "plain2"
+        p1.mkdir()
+        p2.mkdir()
+
+        result = validate_projects([("plain1", str(p1)), ("plain2", str(p2))])
         assert result is not None
-        assert "plain" in result
-        assert "not a git repository" in result
+        assert "No valid project" in result
 
 
 # --- Test lookup_project ---
@@ -455,6 +478,33 @@ class TestInterruptibleSleep:
             check_interval=1,
         )
         assert result == "mission"
+
+    def test_wake_on_mission_false_ignores_pending(self, tmp_path):
+        """With wake_on_mission=False, pending missions must NOT wake the sleep.
+
+        Used by branch_saturated_wait: the pending missions are the blocker, so
+        waking on them would tight-loop back into the same blocked state.
+        """
+        from app.loop_manager import interruptible_sleep
+
+        koan_root = str(tmp_path / "root")
+        instance = str(tmp_path / "instance")
+        os.makedirs(koan_root, exist_ok=True)
+        os.makedirs(instance, exist_ok=True)
+
+        missions_md = Path(instance) / "missions.md"
+        missions_md.write_text("## Pending\n\n- Blocked mission\n\n## Done\n")
+
+        # Very short interval so the test completes quickly but still goes
+        # through the full sleep cycle without returning "mission".
+        result = interruptible_sleep(
+            interval=1,
+            koan_root=koan_root,
+            instance_dir=instance,
+            check_interval=1,
+            wake_on_mission=False,
+        )
+        assert result == "timeout"
 
     def test_priority_stop_over_pause(self, tmp_path):
         from app.loop_manager import interruptible_sleep
@@ -1094,8 +1144,10 @@ class TestDrainNotifications:
             result = process_github_notifications(str(tmp_path), str(tmp_path))
 
         assert result == 1  # 1 actionable processed
-        # Drain notification should also be marked as read
-        mock_mark.assert_called_once_with("400")
+        # Both actionable and drain notifications should be marked as read
+        assert mock_mark.call_count == 2
+        mock_mark.assert_any_call("1")    # actionable
+        mock_mark.assert_any_call("400")  # drain
 
 
 # --- Test _normalize_github_url ---
@@ -1514,10 +1566,9 @@ class TestFetchNotificationsLogging:
         with caplog.at_level(logging.DEBUG, logger="app.github_notifications"):
             result = fetch_unread_notifications()
 
-        assert len(result.actionable) == 1
+        assert len(result.actionable) == 2
         assert "drain-only" in caplog.text
         assert "ci_activity=2" in caplog.text
-        assert "assign=1" in caplog.text
 
     @patch("app.github_notifications.api")
     def test_logs_skipped_unknown_repos(self, mock_api, caplog):
@@ -1525,8 +1576,9 @@ class TestFetchNotificationsLogging:
         import logging
         from app.github_notifications import fetch_unread_notifications
 
+        # Use a non-mention reason — mentions bypass the repo filter
         mock_api.return_value = json.dumps([
-            {"reason": "mention", "repository": {"full_name": "unknown/repo"}},
+            {"reason": "comment", "repository": {"full_name": "unknown/repo"}},
         ])
 
         known = {"sukria/koan"}
@@ -1759,6 +1811,35 @@ class TestNotifyMissionFromMention:
         msg = mock_send.call_args[0][0]
         assert "https://" not in msg
 
+    @patch("app.notify.send_telegram", return_value=True)
+    def test_includes_command_and_author(self, mock_send):
+        from app.loop_manager import _notify_mission_from_mention
+
+        notif = {
+            "repository": {"full_name": "sukria/koan"},
+            "subject": {"title": "Fix auth bug", "type": "PullRequest"},
+            "_koan_command": "rebase",
+            "_koan_author": "atoomic",
+        }
+        _notify_mission_from_mention(notif)
+        msg = mock_send.call_args[0][0]
+        assert "@atoomic" in msg
+        assert "/rebase" in msg
+        assert "mission queued" in msg
+
+    @patch("app.notify.send_telegram", return_value=True)
+    def test_fallback_when_no_command_or_author(self, mock_send):
+        from app.loop_manager import _notify_mission_from_mention
+
+        notif = {
+            "repository": {"full_name": "sukria/koan"},
+            "subject": {"title": "Fix auth bug", "type": "PullRequest"},
+        }
+        _notify_mission_from_mention(notif)
+        msg = mock_send.call_args[0][0]
+        assert "@mention" in msg
+        assert "mission queued" in msg
+
 
 # --- Test configurable check interval ---
 
@@ -1905,12 +1986,14 @@ class TestBuildSkillRegistryCache:
         import app.loop_manager as lm
         lm._gh_cached_registry = None
         lm._gh_cached_extra_dirs = None
+        lm._gh_cached_mtime = 0.0
 
     def teardown_method(self):
         """Reset cache after each test."""
         import app.loop_manager as lm
         lm._gh_cached_registry = None
         lm._gh_cached_extra_dirs = None
+        lm._gh_cached_mtime = 0.0
 
     @patch("app.skills.build_registry")
     def test_caches_registry_across_calls(self, mock_build, tmp_path):
@@ -1958,6 +2041,33 @@ class TestBuildSkillRegistryCache:
         args = mock_build.call_args[0][0]
         assert len(args) == 1
         assert args[0] == skills_dir
+
+    @patch("app.skills.build_registry")
+    def test_rebuilds_when_mtime_changes(self, mock_build, tmp_path):
+        """Cache invalidates when skills directory mtime increases."""
+        import app.loop_manager as lm
+        from app.loop_manager import _build_skill_registry
+
+        mock_registry_1 = MagicMock()
+        mock_registry_2 = MagicMock()
+        mock_build.side_effect = [mock_registry_1, mock_registry_2]
+
+        # First call builds
+        r1 = _build_skill_registry(str(tmp_path))
+        assert r1 is mock_registry_1
+
+        # Second call returns cached
+        r2 = _build_skill_registry(str(tmp_path))
+        assert r2 is mock_registry_1
+        assert mock_build.call_count == 1
+
+        # Simulate mtime change by decrementing cached mtime
+        lm._gh_cached_mtime -= 1.0
+
+        # Third call detects change and rebuilds
+        r3 = _build_skill_registry(str(tmp_path))
+        assert r3 is mock_registry_2
+        assert mock_build.call_count == 2
 
 
 # --- Test notification processing cache ---
@@ -2144,6 +2254,219 @@ class TestNotificationCacheIdValidation:
         assert "missing 'id'" in caplog.text
         assert "Test PR" in caplog.text
 
+    def test_cache_notif_survives_full_ttl_eviction(self):
+        """min() on an empty _notif_cache must not raise ValueError.
+
+        If _NOTIF_CACHE_TTL is pathologically low (or all entries are
+        somehow aged past TTL), the sweep can empty the cache entirely.
+        Without a guard, the subsequent min(_notif_cache, ...) crashes.
+        """
+        import app.loop_manager as lm
+        from app.loop_manager import _cache_notif, _notif_cache_lock
+
+        original_max = lm._NOTIF_CACHE_MAX
+        original_ttl = lm._NOTIF_CACHE_TTL
+        # TTL of -1 means every entry (including just-added) is "expired"
+        lm._NOTIF_CACHE_TTL = -1
+        # Max of -1 means len(cache) > max is True even when cache is empty (0 > -1)
+        lm._NOTIF_CACHE_MAX = -1
+        try:
+            # Without the guard, this raises ValueError: min() arg is empty sequence
+            _cache_notif({"id": "901", "updated_at": "2026-03-20T11:00:00Z"})
+            # Cache should be empty — everything was evicted by TTL sweep
+            with _notif_cache_lock:
+                assert len(lm._notif_cache) == 0
+        finally:
+            lm._NOTIF_CACHE_MAX = original_max
+            lm._NOTIF_CACHE_TTL = original_ttl
+
+
+class TestErrorReplyRetryQueue:
+    """Test the failed error reply queue and retry logic."""
+
+    def setup_method(self):
+        from app.loop_manager import reset_github_backoff
+        reset_github_backoff()
+
+    def test_failed_reply_queued_for_retry(self):
+        """When post_error_reply fails, the reply is queued for retry."""
+        import app.loop_manager as lm
+
+        notif = {
+            "id": "1",
+            "updated_at": "2026-03-20T10:00:00Z",
+            "subject": {"url": "https://api.github.com/repos/o/r/issues/1"},
+            "repository": {"full_name": "o/r"},
+        }
+
+        with patch("app.github_command_handler.resolve_project_from_notification",
+                    return_value=("proj", "o", "r")), \
+             patch("app.github_command_handler.extract_issue_number_from_notification",
+                    return_value=42), \
+             patch("app.github_notifications.get_comment_from_notification",
+                    return_value={"id": 999, "url": "https://api.github.com/comment/999"}), \
+             patch("app.github_command_handler.post_error_reply",
+                    side_effect=OSError("network error")):
+            lm._post_error_for_notification(notif, "some error")
+
+        with lm._pending_error_replies_lock:
+            assert len(lm._pending_error_replies) == 1
+            entry = lm._pending_error_replies[0]
+            assert entry["owner"] == "o"
+            assert entry["repo"] == "r"
+            assert entry["issue_num"] == 42
+            assert entry["comment_id"] == "999"
+            assert entry["attempts"] == 1
+
+    def test_error_reply_queued_when_get_comment_raises(self):
+        """Regression: NameError when get_comment_from_notification raises.
+
+        If get_comment_from_notification raises an OSError (or similar),
+        comment_id and comment_api_url were unbound, causing NameError in
+        the except block. The fix initializes them before the try block.
+        """
+        import app.loop_manager as lm
+
+        notif = {
+            "id": "2",
+            "updated_at": "2026-03-27T10:00:00Z",
+            "subject": {"url": "https://api.github.com/repos/o/r/issues/5"},
+            "repository": {"full_name": "o/r"},
+        }
+
+        with lm._pending_error_replies_lock:
+            lm._pending_error_replies.clear()
+
+        with patch("app.github_command_handler.resolve_project_from_notification",
+                    return_value=("proj", "o", "r")), \
+             patch("app.github_command_handler.extract_issue_number_from_notification",
+                    return_value=5), \
+             patch("app.github_notifications.get_comment_from_notification",
+                    side_effect=OSError("network timeout")):
+            # Before the fix, this raised NameError: name 'comment_id' is not defined
+            lm._post_error_for_notification(notif, "dispatch failed")
+
+        with lm._pending_error_replies_lock:
+            assert len(lm._pending_error_replies) == 1
+            entry = lm._pending_error_replies[0]
+            assert entry["comment_id"] == ""
+            assert entry["comment_api_url"] == ""
+            assert entry["error"] == "dispatch failed"
+
+    def test_retry_succeeds_clears_queue(self):
+        """Successful retry removes entry from the queue."""
+        import app.loop_manager as lm
+
+        entry = {
+            "owner": "o", "repo": "r", "issue_num": 42,
+            "comment_id": "999", "error": "some error",
+            "comment_api_url": "", "attempts": 1,
+        }
+        with lm._pending_error_replies_lock:
+            lm._pending_error_replies.append(entry)
+
+        with patch("app.github_command_handler.post_error_reply") as mock_reply:
+            lm._retry_failed_replies()
+            mock_reply.assert_called_once()
+
+        with lm._pending_error_replies_lock:
+            assert len(lm._pending_error_replies) == 0
+
+    def test_retry_failure_requeues_with_incremented_attempts(self):
+        """Failed retry re-queues with attempts incremented."""
+        import app.loop_manager as lm
+
+        entry = {
+            "owner": "o", "repo": "r", "issue_num": 42,
+            "comment_id": "999", "error": "some error",
+            "comment_api_url": "", "attempts": 1,
+        }
+        with lm._pending_error_replies_lock:
+            lm._pending_error_replies.append(entry)
+
+        with patch("app.github_command_handler.post_error_reply",
+                    side_effect=OSError("still broken")):
+            lm._retry_failed_replies()
+
+        with lm._pending_error_replies_lock:
+            assert len(lm._pending_error_replies) == 1
+            assert lm._pending_error_replies[0]["attempts"] == 2
+
+    def test_max_retries_drops_entry(self):
+        """After _MAX_REPLY_RETRIES attempts, the entry is dropped."""
+        import app.loop_manager as lm
+
+        entry = {
+            "owner": "o", "repo": "r", "issue_num": 42,
+            "comment_id": "999", "error": "some error",
+            "comment_api_url": "", "attempts": lm._MAX_REPLY_RETRIES,
+        }
+        with lm._pending_error_replies_lock:
+            lm._pending_error_replies.append(entry)
+
+        with patch("app.github_command_handler.post_error_reply",
+                    side_effect=OSError("permanent failure")):
+            lm._retry_failed_replies()
+
+        with lm._pending_error_replies_lock:
+            assert len(lm._pending_error_replies) == 0
+
+    def test_reset_clears_retry_queue(self):
+        """reset_github_backoff clears the retry queue."""
+        import app.loop_manager as lm
+
+        with lm._pending_error_replies_lock:
+            lm._pending_error_replies.append({"owner": "o", "repo": "r"})
+
+        lm.reset_github_backoff()
+
+        with lm._pending_error_replies_lock:
+            assert len(lm._pending_error_replies) == 0
+
+    @patch("app.loop_manager._load_github_config")
+    @patch("app.loop_manager._build_skill_registry")
+    @patch("app.loop_manager._get_known_repos_from_projects")
+    @patch("app.utils.load_config")
+    def test_cache_written_before_error_reply(
+        self, mock_config, mock_repos, mock_registry, mock_gh_config, tmp_path
+    ):
+        """Cache must be written before the error reply attempt so that a
+        reply failure doesn't cause re-processing of the whole notification."""
+        from app.github_notifications import FetchResult
+        from app.loop_manager import process_github_notifications, _is_notif_cached
+
+        mock_config.return_value = {}
+        mock_gh_config.return_value = {"bot_username": "bot", "max_age": 300}
+        mock_registry.return_value = MagicMock()
+        mock_repos.return_value = set()
+
+        notif = {
+            "id": "1", "updated_at": "2026-03-20T10:00:00Z",
+            "subject": {"url": "https://api.github.com/repos/o/r/issues/1"},
+            "repository": {"full_name": "o/r"},
+        }
+
+        call_order = []
+
+        def mock_process(*a, **kw):
+            return (False, "some error")
+
+        def mock_post_error(n, e):
+            # At the point when error reply is attempted, cache should exist
+            call_order.append(("post_error", _is_notif_cached(notif)))
+
+        with patch("app.projects_config.load_projects_config", return_value={}), \
+             patch("app.github_notifications.fetch_unread_notifications",
+                   return_value=FetchResult([notif], [])), \
+             patch("app.github_command_handler.process_single_notification",
+                   side_effect=mock_process), \
+             patch("app.loop_manager._post_error_for_notification",
+                   side_effect=mock_post_error):
+            process_github_notifications(str(tmp_path), str(tmp_path))
+
+        assert call_order == [("post_error", True)], \
+            "Notification should be cached before error reply attempt"
+
 
 # --- Thread-safety tests ---
 
@@ -2223,46 +2546,235 @@ class TestThreadSafety:
 class TestCheckSSOFailures:
     def setup_method(self):
         from app.loop_manager import reset_github_backoff
-        from app.github_notifications import reset_sso_failure_count
+        from app.github_notifications import reset_sso_failure_count, reset_consecutive_sso_state
         reset_github_backoff()
         reset_sso_failure_count()
+        reset_consecutive_sso_state()
 
     def teardown_method(self):
         from app.loop_manager import reset_github_backoff
-        from app.github_notifications import reset_sso_failure_count
+        from app.github_notifications import reset_sso_failure_count, reset_consecutive_sso_state
         reset_github_backoff()
         reset_sso_failure_count()
+        reset_consecutive_sso_state()
 
-    @patch("app.loop_manager.log")
+    @patch("app.loop_manager._github_log")
     def test_no_alert_when_no_sso_failures(self, mock_log):
         from app.loop_manager import _check_sso_failures
         _check_sso_failures()
         # Should not log any warning
-        mock_log.warning.assert_not_called()
+        mock_log.assert_not_called()
 
-    def test_sends_telegram_on_sso_failure(self):
+    def test_logs_warning_on_sso_failure(self):
         from app.loop_manager import _check_sso_failures
         from app.github_notifications import _record_sso_failure
         _record_sso_failure("test")
 
-        with patch("app.notify.send_telegram") as mock_tg:
+        with patch("app.loop_manager._github_log") as mock_log:
             _check_sso_failures()
-            mock_tg.assert_called_once()
-            msg = mock_tg.call_args[0][0]
+            mock_log.assert_called_once()
+            msg = mock_log.call_args[0][0]
             assert "SSO" in msg
-            assert "gh auth refresh" in msg
 
-    def test_cooldown_prevents_repeated_alerts(self):
+    def test_escalation_after_threshold(self, monkeypatch):
+        """After enough consecutive failures, check_sso_escalation fires."""
+        from app.loop_manager import _check_sso_failures
+        from app.github_notifications import (
+            _record_sso_failure, reset_sso_failure_count,
+            SSO_ESCALATION_THRESHOLD,
+        )
+        monkeypatch.setenv("KOAN_ROOT", "/tmp/test-koan")
+
+        with patch("app.utils.append_to_outbox") as mock_outbox:
+            # Run enough cycles with failures to reach threshold
+            for i in range(SSO_ESCALATION_THRESHOLD):
+                reset_sso_failure_count()
+                _record_sso_failure(f"test-{i}")
+                _check_sso_failures()
+
+            assert mock_outbox.call_count == 1
+            msg = mock_outbox.call_args[0][1]
+            assert "SSO" in msg
+
+    def test_no_escalation_below_threshold(self, monkeypatch):
         from app.loop_manager import _check_sso_failures
         from app.github_notifications import _record_sso_failure, reset_sso_failure_count
+        monkeypatch.setenv("KOAN_ROOT", "/tmp/test-koan")
 
-        with patch("app.notify.send_telegram") as mock_tg:
-            _record_sso_failure("test1")
-            _check_sso_failures()
-            assert mock_tg.call_count == 1
+        with patch("app.utils.append_to_outbox") as mock_outbox:
+            # Only 2 cycles with failures — below threshold
+            for i in range(2):
+                reset_sso_failure_count()
+                _record_sso_failure(f"test-{i}")
+                _check_sso_failures()
 
-            # Second call within cooldown — should not alert again
-            reset_sso_failure_count()
-            _record_sso_failure("test2")
-            _check_sso_failures()
-            assert mock_tg.call_count == 1
+            mock_outbox.assert_not_called()
+
+
+class TestDrainCiQueueDuringSleep:
+    """Verify CI queue is drained during interruptible_sleep."""
+
+    def test_drain_called_during_sleep(self, tmp_path):
+        """drain_one is called during interruptible sleep (throttled)."""
+        import app.loop_manager as lm
+
+        # Reset throttle so our call goes through
+        lm._last_ci_queue_sleep_check = 0
+
+        with patch("app.ci_queue_runner.drain_one", return_value="CI passed for PR #42") as mock_drain:
+            lm._drain_ci_queue_during_sleep(str(tmp_path), 0)
+
+        mock_drain.assert_called_once_with(str(tmp_path))
+
+    def test_drain_throttled(self, tmp_path):
+        """drain_one is NOT called if within the throttle window."""
+        import time
+        import app.loop_manager as lm
+
+        # Set last check to now — should be throttled
+        lm._last_ci_queue_sleep_check = time.monotonic()
+
+        with patch("app.ci_queue_runner.drain_one") as mock_drain:
+            lm._drain_ci_queue_during_sleep(str(tmp_path), 0)
+
+        mock_drain.assert_not_called()
+
+    def test_drain_none_is_silent(self, tmp_path):
+        """When drain_one returns None (queue empty), no error raised."""
+        import app.loop_manager as lm
+
+        lm._last_ci_queue_sleep_check = 0
+
+        with patch("app.ci_queue_runner.drain_one", return_value=None):
+            # Should not raise
+            lm._drain_ci_queue_during_sleep(str(tmp_path), 0)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent notification processing
+# ---------------------------------------------------------------------------
+
+class TestConcurrentNotificationProcessing:
+    """Verify _process_notifications_concurrent parallelizes work and stays correct."""
+
+    def setup_method(self):
+        from app.loop_manager import reset_github_backoff
+        reset_github_backoff()
+
+    def test_returns_zero_for_empty_input(self):
+        from app.loop_manager import _process_notifications_concurrent
+
+        assert _process_notifications_concurrent(
+            [], MagicMock(), {}, {}, {}, workers=4,
+        ) == 0
+
+    def test_serial_path_when_workers_is_one(self):
+        """workers=1 must not spin up a thread pool but still produce correct counts."""
+        import threading
+        from app.loop_manager import _process_notifications_concurrent
+
+        notifs = [{"id": str(i), "subject": {}, "repository": {}} for i in range(3)]
+        seen_threads = set()
+
+        def fake_process(notif, *_, **__):
+            seen_threads.add(threading.get_ident())
+            return True
+
+        with patch("app.loop_manager._process_one_notification", side_effect=fake_process):
+            count = _process_notifications_concurrent(
+                notifs, MagicMock(), {}, {}, {}, workers=1,
+            )
+
+        assert count == 3
+        # Serial path runs on the caller's thread only.
+        assert seen_threads == {threading.get_ident()}
+
+    def test_parallel_path_uses_multiple_threads(self):
+        """workers>1 must dispatch onto distinct threads (verifies real concurrency)."""
+        import threading
+        import time as _time
+        from app.loop_manager import _process_notifications_concurrent
+
+        notifs = [{"id": str(i), "subject": {}, "repository": {}} for i in range(4)]
+        seen_threads = set()
+        barrier = threading.Barrier(4, timeout=5)
+
+        def fake_process(notif, *_, **__):
+            # Wait for all workers to reach this point. If the loop is serial,
+            # the barrier will time out and raise BrokenBarrierError.
+            barrier.wait()
+            seen_threads.add(threading.get_ident())
+            return True
+
+        with patch("app.loop_manager._process_one_notification", side_effect=fake_process):
+            count = _process_notifications_concurrent(
+                notifs, MagicMock(), {}, {}, {}, workers=4,
+            )
+
+        assert count == 4
+        # All 4 notifications ran on distinct worker threads.
+        assert len(seen_threads) == 4
+
+    def test_only_successes_counted(self):
+        from app.loop_manager import _process_notifications_concurrent
+
+        notifs = [{"id": str(i)} for i in range(5)]
+        outcomes = iter([True, False, True, False, True])
+
+        def fake_process(notif, *_, **__):
+            return next(outcomes)
+
+        with patch("app.loop_manager._process_one_notification", side_effect=fake_process):
+            assert _process_notifications_concurrent(
+                notifs, MagicMock(), {}, {}, {}, workers=3,
+            ) == 3
+
+    def test_worker_exception_does_not_cascade(self):
+        """A crash in one notification's worker must not lose the others."""
+        from app.loop_manager import _process_one_notification
+
+        good_notif = {"id": "1", "subject": {"url": ""}}
+        bad_notif = {"id": "2", "subject": {"url": ""}}
+        results = []
+
+        def fake_inner(notif, *_, **__):
+            if notif["id"] == "2":
+                raise RuntimeError("boom")
+            return True, None
+
+        with patch("app.github_command_handler.process_single_notification", side_effect=fake_inner), \
+             patch("app.github_notifications.mark_notification_read"), \
+             patch("app.loop_manager._notify_mission_from_mention"):
+            for notif in (good_notif, bad_notif):
+                results.append(_process_one_notification(
+                    notif, MagicMock(), {}, {}, {"bot_username": "bot", "max_age": 24},
+                ))
+
+        # First notif succeeded; second crashed but returned False instead of raising.
+        assert results == [True, False]
+
+
+class TestGithubParallelWorkersConfig:
+    """get_github_parallel_workers config helper."""
+
+    def test_default_is_four(self):
+        from app.github_config import get_github_parallel_workers
+        assert get_github_parallel_workers({}) == 4
+
+    def test_reads_from_config(self):
+        from app.github_config import get_github_parallel_workers
+        assert get_github_parallel_workers({"github": {"parallel_workers": 8}}) == 8
+
+    def test_floor_one(self):
+        from app.github_config import get_github_parallel_workers
+        assert get_github_parallel_workers({"github": {"parallel_workers": 0}}) == 1
+        assert get_github_parallel_workers({"github": {"parallel_workers": -3}}) == 1
+
+    def test_ceiling_sixteen(self):
+        from app.github_config import get_github_parallel_workers
+        assert get_github_parallel_workers({"github": {"parallel_workers": 999}}) == 16
+
+    def test_invalid_falls_back_to_default(self):
+        from app.github_config import get_github_parallel_workers
+        assert get_github_parallel_workers({"github": {"parallel_workers": "x"}}) == 4
+        assert get_github_parallel_workers({"github": None}) == 4

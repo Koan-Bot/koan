@@ -10,10 +10,13 @@ the agent's own tool calls) skip this mechanism and pass the prompt
 directly as a ``-p`` argument.
 """
 
+import contextlib
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -78,10 +81,8 @@ def prepare_prompt_file(cmd: List[str]) -> Tuple[List[str], Optional[str]]:
 def _cleanup_prompt_file(path: Optional[str]) -> None:
     """Silently remove a temp prompt file if it exists."""
     if path:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(path)
-        except OSError:
-            pass
 
 
 def run_cli(cmd, **kwargs) -> subprocess.CompletedProcess:
@@ -134,6 +135,112 @@ def popen_cli(
     else:
         kwargs.setdefault("stdin", subprocess.DEVNULL)
         return subprocess.Popen(cmd, **kwargs), lambda: None
+
+
+class StreamResult:
+    """Result of :func:`stream_with_timeout`."""
+
+    __slots__ = ("stdout", "stderr", "timed_out")
+
+    def __init__(self, stdout: str, stderr: str, timed_out: bool):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+
+
+def stream_with_timeout(
+    proc: subprocess.Popen,
+    timeout: float,
+    on_line: Optional[Callable[[str], None]] = None,
+    drain_timeout: float = 30.0,
+) -> StreamResult:
+    """Consume ``proc.stdout`` line-by-line with a process-group-kill watchdog.
+
+    Each stdout line is collected into the returned ``stdout`` text and
+    optionally forwarded to *on_line*. After stdout EOF, the stderr
+    stream is drained and the subprocess is awaited.
+
+    On timeout the entire process group is SIGKILL'd via
+    :func:`os.killpg` — the caller must have started *proc* with
+    ``start_new_session=True`` (or ``process_group=0`` on 3.11+) so the
+    group exists. Killing the group ensures grandchildren that inherited
+    the stdout pipe are torn down too, preventing pipe-drain hangs.
+
+    A ``completed`` flag guarded by a lock closes the race where the
+    watchdog Timer fires between the last consumed line and
+    ``Timer.cancel()`` — in that window we still want a clean completion
+    rather than a spurious timeout.
+
+    Both std streams are closed before returning.
+    """
+    stdout_lines: List[str] = []
+    stderr_text = ""
+    timed_out = False
+    completed = False
+    state_lock = threading.Lock()
+
+    def _kill_process_group() -> None:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+
+    def _watchdog_fire() -> None:
+        # Race guard: if the stream loop has already finished and is
+        # about to call watchdog.cancel(), don't flip ``timed_out`` and
+        # don't kill — the process is exiting cleanly.
+        nonlocal timed_out
+        with state_lock:
+            if completed:
+                return
+            timed_out = True
+        _kill_process_group()
+
+    watchdog = threading.Timer(timeout, _watchdog_fire)
+    watchdog.daemon = True
+    watchdog.start()
+
+    try:
+        try:
+            for line in proc.stdout:
+                stripped = line.rstrip("\n")
+                stdout_lines.append(stripped)
+                if on_line is not None:
+                    on_line(stripped)
+        finally:
+            with state_lock:
+                if not timed_out:
+                    completed = True
+            watchdog.cancel()
+
+        with contextlib.suppress(OSError, ValueError):
+            if proc.stderr:
+                stderr_text = proc.stderr.read()
+
+        try:
+            proc.wait(timeout=drain_timeout)
+        except subprocess.TimeoutExpired:
+            # Stdout EOF reached but the process refuses to exit —
+            # force-kill and report a timeout so callers see the hang.
+            timed_out = True
+            _kill_process_group()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+    finally:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+
+    return StreamResult(
+        stdout="\n".join(stdout_lines).strip(),
+        stderr=stderr_text,
+        timed_out=timed_out,
+    )
 
 
 # Default backoff durations for CLI retries (seconds).
@@ -194,10 +301,15 @@ def run_cli_with_retry(
 
         if attempt < max_attempts - 1:
             delay = backoff[min(attempt, len(backoff) - 1)]
+            err_detail = (result.stderr or "").strip()
+            if not err_detail:
+                err_detail = (result.stdout or "").strip()[-200:]
+            else:
+                err_detail = err_detail[:200]
             print(
                 f"[cli_exec] Retryable CLI error "
                 f"(attempt {attempt + 1}/{max_attempts}): "
-                f"{(result.stderr or '')[:200]} "
+                f"{err_detail} "
                 f"— retrying in {delay}s",
                 file=sys.stderr,
             )

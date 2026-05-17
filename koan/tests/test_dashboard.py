@@ -146,6 +146,74 @@ class TestRoutes:
         assert data["ok"] is False
 
 
+class TestUsageApi:
+    def test_api_usage_exposes_cache_metrics(self, app_client):
+        fake_summary = {
+            "total_input": 1000,
+            "total_output": 500,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 1200,
+            "cache_hit_rate": 0.48,
+            "count": 3,
+            "by_project": {"koan": {"input_tokens": 1000, "output_tokens": 500, "count": 3}},
+            "by_model": {
+                "claude-sonnet-4-20250514": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "cache_creation_input_tokens": 300,
+                    "cache_read_input_tokens": 1200,
+                    "count": 3,
+                }
+            },
+        }
+        fake_daily = [{
+            "date": "2026-03-21",
+            "total_input": 1000,
+            "total_output": 500,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 1200,
+            "cache_hit_rate": 0.48,
+            "count": 3,
+            "cost": 0.12,
+        }]
+
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value={"sonnet": {"input": 3.0, "output": 15.0}}), \
+             patch("app.cost_tracker.estimate_cost", return_value=0.12), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=0.00324), \
+             patch("app.cost_tracker.daily_series", return_value=fake_daily):
+            resp = app_client.get("/api/usage?days=7")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["cache_creation_input_tokens"] == 300
+        assert data["cache_read_input_tokens"] == 1200
+        assert data["cache_hit_rate"] == pytest.approx(0.48)
+        assert data["estimated_cache_savings"] == pytest.approx(0.00324)
+        assert data["daily"][0]["cache_read_input_tokens"] == 1200
+
+    def test_api_usage_without_pricing_returns_null_cache_savings(self, app_client):
+        fake_summary = {
+            "total_input": 0,
+            "total_output": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "count": 0,
+            "by_project": {},
+            "by_model": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=1")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["has_pricing"] is False
+        assert data["estimated_cache_savings"] is None
+
+
 class TestSignals:
     def test_no_signals(self, tmp_path):
         with patch.object(dashboard, "KOAN_ROOT", tmp_path):
@@ -1179,3 +1247,104 @@ class TestPlansPage:
             )
         assert len(linked) == 1
         assert "/plan" in linked[0]
+
+
+# ---------------------------------------------------------------------------
+# Automation rules routes
+# ---------------------------------------------------------------------------
+
+import yaml as _yaml
+
+
+class TestRulesRoutes:
+    """Integration tests for the /api/rules and /rules endpoints."""
+
+    def test_get_rules_empty(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.get("/api/rules")
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+    def test_post_rule_creates_entry(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.post("/api/rules", json={
+                "event": "post_mission",
+                "action": "notify",
+                "params": {"message": "done"},
+            })
+            assert resp.status_code == 201
+            rule = resp.get_json()
+            assert rule["event"] == "post_mission"
+            assert rule["action"] == "notify"
+            assert rule["params"]["message"] == "done"
+
+            # Appears in subsequent GET
+            resp2 = app_client.get("/api/rules")
+            assert resp2.status_code == 200
+            rules = resp2.get_json()
+            assert len(rules) == 1
+            assert rules[0]["id"] == rule["id"]
+
+    def test_post_rule_unknown_event_returns_400(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.post("/api/rules", json={
+                "event": "no_such_event",
+                "action": "notify",
+            })
+        assert resp.status_code == 400
+        assert "error" in resp.get_json()
+
+    def test_post_rule_unknown_action_returns_400(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.post("/api/rules", json={
+                "event": "post_mission",
+                "action": "send_email",
+            })
+        assert resp.status_code == 400
+
+    def test_patch_rule_toggles_enabled(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            create = app_client.post("/api/rules", json={
+                "event": "post_mission",
+                "action": "notify",
+                "params": {"message": "hi"},
+            })
+            rule_id = create.get_json()["id"]
+            assert create.get_json()["enabled"] is True
+
+            patch_resp = app_client.patch(f"/api/rules/{rule_id}", json={"enabled": False})
+            assert patch_resp.status_code == 200
+            assert patch_resp.get_json()["enabled"] is False
+
+    def test_delete_rule_removes_it(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            create = app_client.post("/api/rules", json={
+                "event": "pre_mission",
+                "action": "pause",
+            })
+            rule_id = create.get_json()["id"]
+
+            del_resp = app_client.delete(f"/api/rules/{rule_id}")
+            assert del_resp.status_code == 200
+
+            rules = app_client.get("/api/rules").get_json()
+            assert all(r["id"] != rule_id for r in rules)
+
+    def test_delete_nonexistent_rule_returns_404(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.delete("/api/rules/does_not_exist")
+        assert resp.status_code == 404
+
+    def test_rules_page_renders_without_error(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir), \
+             patch.object(dashboard, "JOURNAL_DIR", instance_dir / "journal"):
+            resp = app_client.get("/rules")
+        assert resp.status_code == 200
+        assert b"Automation Rules" in resp.data
+
+    def test_rules_page_shows_empty_state_when_no_rules(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir), \
+             patch.object(dashboard, "JOURNAL_DIR", instance_dir / "journal"):
+            resp = app_client.get("/rules")
+        assert resp.status_code == 200
+        assert b"No rules yet" in resp.data
