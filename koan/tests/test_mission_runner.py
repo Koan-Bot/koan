@@ -9,6 +9,15 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_circuit_breaker():
+    """Reset the mission_runner circuit breaker between tests."""
+    from app.mission_runner import _breaker
+    _breaker.reset()
+    yield
+    _breaker.reset()
+
+
 class TestBuildMissionCommand:
     """Test build_mission_command function."""
 
@@ -1211,7 +1220,7 @@ class TestRecordSessionOutcome:
         # Should not raise
         _record_session_outcome(str(tmp_path), "koan", "deep", 30, "text")
         captured = capsys.readouterr()
-        assert "Session outcome recording failed" in (captured.err + captured.out)
+        assert "session_tracker failed:" in (captured.err + captured.out)
 
     @patch("app.session_tracker.record_outcome")
     def test_forwards_mission_type_override(self, mock_record, tmp_path):
@@ -1459,7 +1468,7 @@ class TestTriggerReflectionErrors:
         result = trigger_reflection(str(tmp_path), "audit", 60, project_name="koan")
         assert result is False
         captured = capsys.readouterr()
-        assert "Reflection failed" in (captured.err + captured.out)
+        assert "reflection failed:" in (captured.err + captured.out)
 
 
 class TestParseClaudeOutputEdgeCases:
@@ -2164,7 +2173,7 @@ class TestTriggerReflectionEdgeCases:
         result = trigger_reflection(str(tmp_path), "audit", 60, project_name="koan")
         assert result is False
         captured = capsys.readouterr()
-        assert "Reflection failed" in (captured.err + captured.out)
+        assert "reflection failed:" in (captured.err + captured.out)
 
     @patch("app.post_mission_reflection.write_to_journal")
     @patch("app.post_mission_reflection.run_reflection", return_value="insight")

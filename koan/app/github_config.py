@@ -24,6 +24,11 @@ Per-project override in projects.yaml:
 
 from typing import List, Optional
 
+# Defaults shared with github_webhook.py (duplicated here to avoid circular
+# imports — github_webhook imports from github_config inside function bodies).
+DEFAULT_WEBHOOK_PORT = 8474
+DEFAULT_WEBHOOK_HOST = "127.0.0.1"
+
 
 def get_github_nickname(config: dict) -> str:
     """Get the bot's GitHub @mention nickname from config.yaml.
@@ -218,6 +223,36 @@ def get_github_subscribe_max_per_cycle(config: dict) -> int:
         return max(1, int(github.get("subscribe_max_per_cycle", 5)))
     except (ValueError, TypeError):
         return 5
+
+
+def get_github_webhook_enabled(config: dict) -> bool:
+    """Check if the push-based webhook receiver is enabled. Default: off."""
+    github = config.get("github") or {}
+    webhook = github.get("webhook") or {}
+    return bool(webhook.get("enabled", False))
+
+
+def get_github_webhook_port(config: dict) -> int:
+    """Port the webhook receiver binds to. Default: 8474."""
+    github = config.get("github") or {}
+    webhook = github.get("webhook") or {}
+    try:
+        val = int(webhook.get("port", DEFAULT_WEBHOOK_PORT))
+        if 1 <= val <= 65535:
+            return val
+        return DEFAULT_WEBHOOK_PORT
+    except (ValueError, TypeError):
+        return DEFAULT_WEBHOOK_PORT
+
+
+def get_github_webhook_host(config: dict) -> str:
+    """Host the webhook receiver binds to. Default: 127.0.0.1."""
+    github = config.get("github") or {}
+    webhook = github.get("webhook") or {}
+    host = webhook.get("host", DEFAULT_WEBHOOK_HOST)
+    if isinstance(host, str) and host.strip():
+        return host.strip()
+    return DEFAULT_WEBHOOK_HOST
 
 
 def validate_github_config(config: dict) -> Optional[str]:
