@@ -116,8 +116,8 @@ def _merge_provider_env(kwargs: dict) -> None:
             env = os.environ.copy()
             env.update(extra)
             kwargs["env"] = env
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[cli_exec] provider env merge failed: {e}", file=sys.stderr)
 
 
 def run_cli(cmd, **kwargs) -> subprocess.CompletedProcess:
