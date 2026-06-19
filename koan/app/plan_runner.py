@@ -339,7 +339,7 @@ def review_plan(plan_text: str, project_path: str, skill_dir) -> Tuple[bool, str
             allowed_tools=["Read", "Glob", "Grep"],
             model_key="lightweight",
             max_turns=3,
-            timeout=120,
+            timeout=300,
             max_turns_source=None,
         )
     except Exception as e:
@@ -403,7 +403,7 @@ def improve_plan(
             allowed_tools=["Read", "Glob", "Grep"],
             model_key="mission",
             max_turns=5,
-            timeout=180,
+            timeout=420,
             max_turns_source=None,
         )
     except Exception as e:
