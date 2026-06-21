@@ -707,6 +707,85 @@ def _format_tokens(n: int) -> str:
     return str(n)
 
 
+def compute_efficiency(
+    instance_dir: Path,
+    start: date,
+    end: date,
+    project: Optional[str] = None,
+) -> dict:
+    """Join cost data and session outcomes to compute per-project token efficiency.
+
+    Returns dict with "days" and "by_project" mapping project names to efficiency
+    metrics (tokens_per_productive_outcome, waste_pct as 0-1 fraction).
+    """
+    from app.session_tracker import load_outcomes
+
+    days = (end - start).days + 1
+
+    outcomes_path = Path(instance_dir) / "session_outcomes.json"
+    all_outcomes = load_outcomes(outcomes_path)
+    start_dt = datetime.combine(start, datetime.min.time())
+    end_dt = datetime.combine(end + timedelta(days=1), datetime.min.time())
+
+    outcome_counts: dict = {}
+    for o in all_outcomes:
+        ts = o.get("timestamp", "")
+        try:
+            ts_dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        if ts_dt < start_dt or ts_dt >= end_dt:
+            continue
+        proj = o.get("project", "")
+        if not proj or (project and proj != project):
+            continue
+        if proj not in outcome_counts:
+            outcome_counts[proj] = {"productive": 0, "empty": 0, "blocked": 0}
+        outcome = o.get("outcome", "")
+        if outcome in outcome_counts[proj]:
+            outcome_counts[proj][outcome] += 1
+
+    summary = summarize_range(instance_dir, start, end)
+    cost_by_project = summary.get("by_project", {})
+    if project:
+        cost_by_project = {k: v for k, v in cost_by_project.items() if k == project}
+
+    all_projects = set(outcome_counts.keys()) | set(cost_by_project.keys())
+    by_project: dict = {}
+    for proj in sorted(all_projects):
+        oc = outcome_counts.get(proj, {"productive": 0, "empty": 0, "blocked": 0})
+        cost = cost_by_project.get(proj, {})
+        total_tokens = cost.get("input_tokens", 0) + cost.get("output_tokens", 0)
+        productive = oc["productive"]
+        empty = oc["empty"]
+        blocked = oc["blocked"]
+        total_sessions = productive + empty + blocked
+
+        has_cost = proj in cost_by_project
+        tppo = (
+            total_tokens / productive
+            if productive > 0 and has_cost
+            else None
+        )
+        waste = (
+            (empty + blocked) / total_sessions
+            if total_sessions > 0
+            else (1.0 if total_tokens > 0 else 0.0)
+        )
+
+        by_project[proj] = {
+            "productive_count": productive,
+            "empty_count": empty,
+            "blocked_count": blocked,
+            "total_sessions": total_sessions,
+            "total_tokens": total_tokens,
+            "tokens_per_productive_outcome": tppo,
+            "waste_pct": round(waste, 4),
+        }
+
+    return {"by_project": by_project, "days": days}
+
+
 def get_pricing_config(config: Optional[dict] = None) -> Optional[dict]:
     """Get pricing table from config.yaml → usage.pricing.
 
