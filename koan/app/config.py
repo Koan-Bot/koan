@@ -702,10 +702,10 @@ def get_max_runs() -> int:
     """Get maximum runs per day from config.yaml.
 
     This is the primary source of truth for max_runs configuration.
-    Returns default of 20 if not configured.
+    Returns default of 60 if not configured.
     """
     config = _load_config()
-    return _safe_int(config.get("max_runs_per_day", 20), 20)
+    return _safe_int(config.get("max_runs_per_day", 60), 60)
 
 
 def get_interval_seconds() -> int:

@@ -669,7 +669,7 @@ class TestGetMaxRuns:
         from app.config import get_max_runs
 
         with _mock_config({}):
-            assert get_max_runs() == 20
+            assert get_max_runs() == 60
 
     def test_custom(self):
         from app.config import get_max_runs
@@ -1160,12 +1160,12 @@ class TestGetMaxRunsInvalidConfig:
     def test_invalid_string_returns_default(self):
         from app.config import get_max_runs
         with _mock_config({"max_runs_per_day": "not_a_number"}):
-            assert get_max_runs() == 20
+            assert get_max_runs() == 60
 
     def test_none_returns_default(self):
         from app.config import get_max_runs
         with _mock_config({"max_runs_per_day": None}):
-            assert get_max_runs() == 20
+            assert get_max_runs() == 60
 
 
 class TestGetIntervalSecondsInvalidConfig:

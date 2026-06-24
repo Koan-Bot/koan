@@ -1218,7 +1218,7 @@ All behavioral config lives in `instance/config.yaml`. Key settings:
 
 ```yaml
 # Work intensity
-max_runs_per_day: 10          # Max missions per day
+max_runs_per_day: 60          # Max missions per day (default: 60)
 interval_seconds: 60          # Seconds between mission checks
 
 # Model selection (see docs/users/model-configuration.md)

@@ -270,7 +270,7 @@ All behavioral config lives in `instance/config.yaml`. Secrets stay in `.env`.
 
 ```yaml
 # How hard should Kōan work
-max_runs_per_day: 10
+max_runs_per_day: 60
 interval_seconds: 60
 
 # Model selection per role

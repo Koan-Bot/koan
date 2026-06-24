@@ -61,7 +61,7 @@
 # These are the primary source of truth for run loop configuration.
 # max_runs_per_day: Maximum runs before auto-pause (resets on /resume or quota reset)
 # interval_seconds: Seconds between runs (how often the loop iterates)
-max_runs_per_day: 20
+max_runs_per_day: 60
 interval_seconds: 300
 
 # Startup delay — seconds to wait before the first mission after boot.
