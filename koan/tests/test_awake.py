@@ -13,6 +13,7 @@ import pytest
 from app.awake import (
     is_mission,
     is_command,
+    promote_bare_skill_command,
     parse_project,
     handle_chat,
     handle_message,
@@ -25,9 +26,14 @@ from app.awake import (
     _clean_chat_response,
     _run_in_worker,
     _flush_outbox_async,
+    _strip_bot_mention_from_text,
+    _is_addressed_to_other_user,
+    _check_group_chat_mode,
     get_updates,
     check_config,
+    _bridge_loop,
 )
+from app.outbox_manager import OutboxManager
 from app.bridge_state import (
     _get_registry,
     _reset_registry,
@@ -220,6 +226,42 @@ class TestIsCommand:
         assert is_command("hello") is False
         assert is_command("fix the bug") is False
         assert is_command("") is False
+
+
+# ---------------------------------------------------------------------------
+# promote_bare_skill_command
+# ---------------------------------------------------------------------------
+
+class TestPromoteBareSkillCommand:
+    def test_bare_skill_word_promoted(self):
+        """A bare core-skill word gains a leading slash."""
+        assert promote_bare_skill_command("time") == "/time"
+        assert promote_bare_skill_command("status") == "/status"
+
+    def test_skill_word_with_args_promoted(self):
+        """Args after the skill word are preserved."""
+        assert promote_bare_skill_command(
+            "review https://github.com/o/r/pull/1"
+        ) == "/review https://github.com/o/r/pull/1"
+
+    def test_non_skill_word_not_promoted(self):
+        assert promote_bare_skill_command("hello there") is None
+        assert promote_bare_skill_command("") is None
+
+    def test_already_slashed_not_double_promoted(self):
+        """Leading-slash text is not a bare word, so it isn't promoted."""
+        assert promote_bare_skill_command("/time") is None
+
+    def test_case_insensitive(self):
+        assert promote_bare_skill_command("TIME") == "/TIME"
+
+    @patch("app.awake.handle_command")
+    @patch("app.command_handlers._run_in_worker_cb")
+    def test_handle_message_routes_bare_skill_to_command(self, mock_worker, mock_cmd):
+        """A bare skill word reaches handle_command as its slash form, not chat."""
+        handle_message("time")
+        mock_cmd.assert_called_once_with("/time")
+        mock_worker.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +551,7 @@ class TestHandleResume:
     def test_no_quota_file(self, mock_send, mock_alive, tmp_path):
         with patch("app.command_handlers.KOAN_ROOT", tmp_path):
             handle_resume()
-        assert "No pause or quota hold" in mock_send.call_args[0][0]
+        assert "Resume acknowledged" in mock_send.call_args[0][0]
 
     @patch("app.command_handlers._is_runner_alive", return_value=True)
     @patch("app.command_handlers.send_telegram")
@@ -657,8 +699,8 @@ class TestHandleStart:
         """/resume should NOT call _handle_start — verify separation."""
         with patch("app.command_handlers.KOAN_ROOT", tmp_path):
             handle_command("/resume")
-        # /resume with no pause file → "No pause or quota hold"
-        assert "No pause" in mock_send.call_args[0][0]
+        # /resume with no pause file → "Resume acknowledged"
+        assert "Resume acknowledged" in mock_send.call_args[0][0]
 
     @patch("app.command_handlers.send_telegram")
     def test_help_shows_system_group(self, mock_send, tmp_path):
@@ -748,6 +790,37 @@ class TestHandleChat:
     @patch("app.awake.format_conversation_history", return_value="")
     @patch("app.awake.get_tools_description", return_value="")
     @patch("app.awake.get_chat_tools", return_value="")
+    @patch("app.awake.send_telegram")
+    @patch("app.awake.subprocess.run")
+    def test_chat_uses_dedicated_chat_workspace_cwd(
+        self, mock_run, mock_send, mock_tools, mock_tools_desc,
+        mock_fmt, mock_hist, mock_save, tmp_path,
+    ):
+        """Chat CLI must run from KOAN_ROOT so paths align with reflection
+        and the agent loop, and distinct from project_path to avoid session
+        lock conflicts with concurrent mission execution."""
+        mock_run.return_value = MagicMock(stdout="ok", returncode=0)
+        koan_root = tmp_path
+        instance_dir = tmp_path / "instance"
+        instance_dir.mkdir()
+        project_path = str(tmp_path / "some-project")
+        with patch("app.awake.INSTANCE_DIR", instance_dir), \
+             patch("app.awake.KOAN_ROOT", koan_root), \
+             patch("app.awake.PROJECT_PATH", project_path), \
+             patch("app.awake.CONVERSATION_HISTORY_FILE", instance_dir / "history.jsonl"), \
+             patch("app.awake.SOUL", ""), \
+             patch("app.awake.SUMMARY", ""):
+            handle_chat("hello")
+        cwd = mock_run.call_args.kwargs.get("cwd")
+        assert cwd == str(koan_root)
+        assert cwd != str(instance_dir)
+        assert cwd != project_path
+
+    @patch("app.awake.save_conversation_message")
+    @patch("app.awake.load_recent_history", return_value=[])
+    @patch("app.awake.format_conversation_history", return_value="")
+    @patch("app.awake.get_tools_description", return_value="")
+    @patch("app.awake.get_chat_tools", return_value="")
     @patch("app.awake.send_telegram", return_value=True)
     @patch("app.awake.subprocess.run")
     def test_chat_reads_journal_flat_fallback(self, mock_run, mock_send, mock_tools,
@@ -791,25 +864,52 @@ class TestHandleChat:
         # Must save the error message to conversation history
         assert mock_save.call_count >= 2  # user msg + error msg
 
+    @patch("app.awake.save_conversation_message")
+    @patch("app.awake.load_recent_history", return_value=[])
+    @patch("app.awake.format_conversation_history", return_value="")
+    @patch("app.awake.get_tools_description", return_value="")
+    @patch("app.awake.get_chat_tools", return_value="")
+    @patch("app.awake.send_telegram")
+    @patch("app.awake.subprocess.run")
+    def test_empty_response_sends_fallback(self, mock_run, mock_send, mock_tools,
+                                           mock_tools_desc, mock_fmt, mock_hist,
+                                           mock_save, tmp_path):
+        """Empty Claude response (exit 0, blank stdout) must still reply to the user."""
+        mock_run.return_value = MagicMock(stdout="", returncode=0, stderr="")
+        with patch("app.awake.INSTANCE_DIR", tmp_path), \
+             patch("app.awake.KOAN_ROOT", tmp_path), \
+             patch("app.awake.PROJECT_PATH", ""), \
+             patch("app.awake.CONVERSATION_HISTORY_FILE", tmp_path / "history.jsonl"), \
+             patch("app.awake.SOUL", ""), \
+             patch("app.awake.SUMMARY", ""):
+            handle_chat("hello")
+        # User must receive a reply — not silence
+        mock_send.assert_called_once()
+        # Must persist the fallback to conversation history
+        assert mock_save.call_count >= 2  # user msg + fallback msg
+
 
 # ---------------------------------------------------------------------------
 # flush_outbox
 # ---------------------------------------------------------------------------
 
 class TestFlushOutbox:
-    @patch("app.awake._format_outbox_message", return_value="Formatted msg")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted msg")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_formats_and_sends(self, mock_send, mock_fmt, tmp_path):
         outbox = tmp_path / "outbox.md"
         outbox.write_text("Raw message here")
         with patch("app.awake.OUTBOX_FILE", outbox):
             flush_outbox()
         mock_fmt.assert_called_once_with("Raw message here")
-        mock_send.assert_called_once_with("Formatted msg")
+        mock_send.assert_called_once()
+        call_kwargs = mock_send.call_args
+        assert call_kwargs[0][0] == "Formatted msg"
+        assert call_kwargs[1]["priority"].name == "ACTION"
         assert outbox.read_text() == ""
 
-    @patch("app.awake._format_outbox_message", return_value="Formatted msg")
-    @patch("app.awake.send_telegram", return_value=False)
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted msg")
+    @patch("app.outbox_manager.send_telegram", return_value=False)
     def test_flush_keeps_on_send_failure(self, mock_send, mock_fmt, tmp_path):
         outbox = tmp_path / "outbox.md"
         outbox.write_text("Important message")
@@ -823,8 +923,8 @@ class TestFlushOutbox:
         with patch("app.awake.OUTBOX_FILE", outbox):
             flush_outbox()  # Should not raise
 
-    @patch("app.awake._format_outbox_message", return_value="X")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="X")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_empty_file(self, mock_send, mock_fmt, tmp_path):
         outbox = tmp_path / "outbox.md"
         outbox.write_text("")
@@ -832,8 +932,8 @@ class TestFlushOutbox:
             flush_outbox()
         mock_send.assert_not_called()
 
-    @patch("app.awake._format_outbox_message", return_value="X")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="X")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_whitespace_only(self, mock_send, mock_fmt, tmp_path):
         outbox = tmp_path / "outbox.md"
         outbox.write_text("   \n\n  ")
@@ -841,8 +941,8 @@ class TestFlushOutbox:
             flush_outbox()
         mock_send.assert_not_called()
 
-    @patch("app.awake._format_outbox_message", return_value="Formatted msg")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted msg")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_clears_before_format(self, mock_send, mock_fmt, tmp_path):
         """File should be cleared BEFORE the slow format call, not after."""
         outbox = tmp_path / "outbox.md"
@@ -861,8 +961,8 @@ class TestFlushOutbox:
         # File was cleared before format was called
         assert file_content_during_format == [""]
 
-    @patch("app.awake._format_outbox_message", return_value="Fmt")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="Fmt")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_concurrent_write_during_format_preserved(self, mock_send, mock_fmt, tmp_path):
         """Messages written during formatting should survive (not be truncated)."""
         outbox = tmp_path / "outbox.md"
@@ -880,8 +980,8 @@ class TestFlushOutbox:
         # Message B was written AFTER the file was cleared — it should survive
         assert "Message B" in outbox.read_text()
 
-    @patch("app.awake._format_outbox_message", return_value="Fmt")
-    @patch("app.awake.send_telegram", return_value=False)
+    @patch.object(OutboxManager, "_format_message", return_value="Fmt")
+    @patch("app.outbox_manager.send_telegram", return_value=False)
     def test_flush_requeue_on_failure_preserves_new_writes(self, mock_send, mock_fmt, tmp_path):
         """On send failure, re-queued content should not overwrite new messages."""
         outbox = tmp_path / "outbox.md"
@@ -901,7 +1001,7 @@ class TestFlushOutbox:
         assert "Message B" in content
         assert "Message A" in content
 
-    @patch("app.awake.scan_and_log")
+    @patch("app.outbox_manager.scan_and_log")
     def test_flush_blocked_clears_file_before_quarantine(self, mock_scan, tmp_path):
         """Blocked messages should still clear the outbox promptly."""
         from types import SimpleNamespace
@@ -919,8 +1019,8 @@ class TestFlushOutbox:
         assert "SECRET_KEY" in quarantine.read_text()
 
 
-    @patch("app.awake._format_outbox_message", return_value="PR #42 merged")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="PR #42 merged")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_expands_github_refs(self, mock_send, mock_fmt, tmp_path):
         """GitHub #refs should be expanded to full URLs before sending."""
         outbox = tmp_path / "outbox.md"
@@ -932,15 +1032,94 @@ class TestFlushOutbox:
         sent_text = mock_send.call_args[0][0]
         assert "https://github.com/owner/myproject/issues/42" in sent_text
 
-    @patch("app.awake._format_outbox_message", return_value="All good")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="All good")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_no_expansion_without_project(self, mock_send, mock_fmt, tmp_path):
         """When no project tag is found, text is sent unchanged."""
         outbox = tmp_path / "outbox.md"
         outbox.write_text("All good")
         with patch("app.awake.OUTBOX_FILE", outbox):
             flush_outbox()
-        mock_send.assert_called_once_with("All good")
+        mock_send.assert_called_once()
+        call_kwargs = mock_send.call_args
+        assert call_kwargs[0][0] == "All good"
+        assert call_kwargs[1]["priority"].name == "ACTION"
+
+
+class TestOutboxPriorityParsing:
+    """Tests for _parse_outbox_priority() — header parsing and stripping."""
+
+    def test_no_header_defaults_to_action(self):
+        from app.awake import _parse_outbox_priority
+        from app.notify import NotificationPriority
+        priority, cleaned = _parse_outbox_priority("Hello world")
+        assert priority.name == "ACTION"
+        assert cleaned == "Hello world"
+
+    def test_urgent_header_parsed(self):
+        from app.awake import _parse_outbox_priority
+        priority, cleaned = _parse_outbox_priority("[priority:urgent]\nMessage")
+        assert priority.name == "URGENT"
+        assert cleaned == "Message"
+
+    def test_info_header_parsed(self):
+        from app.awake import _parse_outbox_priority
+        priority, cleaned = _parse_outbox_priority("[priority:info]\nSoft update")
+        assert priority.name == "INFO"
+        assert cleaned == "Soft update"
+
+    def test_warning_header_parsed(self):
+        from app.awake import _parse_outbox_priority
+        priority, cleaned = _parse_outbox_priority("[priority:warning]\nQuota low")
+        assert priority.name == "WARNING"
+        assert cleaned == "Quota low"
+
+    def test_multiple_blocks_highest_wins(self):
+        from app.awake import _parse_outbox_priority
+        content = "[priority:info]\nUpdate 1\n[priority:urgent]\nCritical alert"
+        priority, cleaned = _parse_outbox_priority(content)
+        assert priority.name == "URGENT"
+        assert "[priority:" not in cleaned
+
+    def test_header_stripped_from_content(self):
+        from app.awake import _parse_outbox_priority
+        _, cleaned = _parse_outbox_priority("[priority:action]\nMission complete")
+        assert "[priority:" not in cleaned
+        assert "Mission complete" in cleaned
+
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
+    def test_flush_passes_priority_to_send(self, mock_send, mock_fmt, tmp_path):
+        """flush_outbox passes parsed priority to send_telegram."""
+        outbox = tmp_path / "outbox.md"
+        outbox.write_text("[priority:urgent]\nServer is down")
+        with patch("app.awake.OUTBOX_FILE", outbox):
+            flush_outbox()
+        mock_send.assert_called_once()
+        assert mock_send.call_args[1]["priority"].name == "URGENT"
+
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
+    def test_legacy_entry_defaults_to_action(self, mock_send, mock_fmt, tmp_path):
+        """Legacy outbox entries without a header default to ACTION."""
+        outbox = tmp_path / "outbox.md"
+        outbox.write_text("Old-style message without header")
+        with patch("app.awake.OUTBOX_FILE", outbox):
+            flush_outbox()
+        assert mock_send.call_args[1]["priority"].name == "ACTION"
+
+    @patch.object(OutboxManager, "_format_message")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
+    def test_priority_header_stripped_before_format(self, mock_send, mock_fmt, tmp_path):
+        """Priority header is stripped before content is passed to Claude formatter."""
+        mock_fmt.return_value = "fmt"
+        outbox = tmp_path / "outbox.md"
+        outbox.write_text("[priority:warning]\nQuota is low")
+        with patch("app.awake.OUTBOX_FILE", outbox):
+            flush_outbox()
+        formatted_input = mock_fmt.call_args[0][0]
+        assert "[priority:" not in formatted_input
+        assert "Quota is low" in formatted_input
 
 
 class TestRequeueOutbox:
@@ -1007,7 +1186,7 @@ class TestWriteOutboxFailed:
         """_requeue_outbox should call _write_outbox_failed when outbox write fails."""
         bad_outbox = tmp_path / "no-such-dir" / "outbox.md"
         with patch("app.awake.OUTBOX_FILE", bad_outbox), \
-             patch("app.awake._write_outbox_failed") as mock_fallback:
+             patch.object(OutboxManager, "_write_failed") as mock_fallback:
             _requeue_outbox("Important message")
         mock_fallback.assert_called_once()
         args = mock_fallback.call_args[0]
@@ -1018,7 +1197,7 @@ class TestWriteOutboxFailed:
         """If even the fallback file can't be written, log the content."""
         bad_failed_dir = tmp_path / "no-such-dir" / "outbox-failed.md"
         with patch("app.awake.OUTBOX_FILE", bad_failed_dir), \
-             patch("app.awake.log") as mock_log:
+             patch("app.outbox_manager.log") as mock_log:
             _write_outbox_failed("Critical data", OSError("boom"))
         mock_log.assert_called()
         logged = str(mock_log.call_args_list[-1])
@@ -1028,8 +1207,8 @@ class TestWriteOutboxFailed:
 class TestStagingFileRecovery:
     """Crash-safety: staging file (outbox-sending.md) prevents message loss."""
 
-    @patch("app.awake._format_outbox_message", return_value="Formatted")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_staging_file_created_then_cleaned_on_success(self, mock_send, mock_fmt, tmp_path):
         """Staging file is created before truncation and deleted after successful send."""
         outbox = tmp_path / "outbox.md"
@@ -1050,8 +1229,8 @@ class TestStagingFileRecovery:
         # Staging cleaned up after success
         assert not staging.exists()
 
-    @patch("app.awake._format_outbox_message", return_value="Formatted")
-    @patch("app.awake.send_telegram", return_value=False)
+    @patch.object(OutboxManager, "_format_message", return_value="Formatted")
+    @patch("app.outbox_manager.send_telegram", return_value=False)
     def test_staging_file_cleaned_on_send_failure(self, mock_send, mock_fmt, tmp_path):
         """Staging file is cleaned up even when send fails (content is re-queued)."""
         outbox = tmp_path / "outbox.md"
@@ -1094,8 +1273,8 @@ class TestStagingFileRecovery:
         assert not staging.exists()
         assert outbox.read_text() == ""
 
-    @patch("app.awake._format_outbox_message", return_value="New formatted")
-    @patch("app.awake.send_telegram", return_value=True)
+    @patch.object(OutboxManager, "_format_message", return_value="New formatted")
+    @patch("app.outbox_manager.send_telegram", return_value=True)
     def test_flush_recovers_staged_before_processing_new(self, mock_send, mock_fmt, tmp_path):
         """flush_outbox recovers staged content before processing new outbox content."""
         outbox = tmp_path / "outbox.md"
@@ -1105,13 +1284,11 @@ class TestStagingFileRecovery:
         with patch("app.awake.OUTBOX_FILE", outbox):
             flush_outbox()
         # Staged content was re-queued, new message was processed
-        # The format call should include "New message" (the content from outbox)
-        # BUT the staged content was prepended to outbox first, so both are present
         fmt_calls = [call[0][0] for call in mock_fmt.call_args_list]
         combined = " ".join(fmt_calls)
         assert "New message" in combined or "Crashed old message" in combined
 
-    @patch("app.awake.scan_and_log")
+    @patch("app.outbox_manager.scan_and_log")
     def test_staging_file_cleaned_on_blocked_message(self, mock_scan, tmp_path):
         """Staging file is cleaned up when outbox content is blocked by scanner."""
         from types import SimpleNamespace
@@ -1137,17 +1314,17 @@ class TestStagingFileRecovery:
 # ---------------------------------------------------------------------------
 
 class TestFormatOutboxMessage:
-    @patch("app.awake.format_message", return_value="Formatted")
-    @patch("app.awake.load_memory_context", return_value="mem")
-    @patch("app.awake.load_human_prefs", return_value="prefs")
-    @patch("app.awake.load_soul", return_value="soul")
+    @patch("app.outbox_manager.format_message", return_value="Formatted")
+    @patch("app.outbox_manager.load_memory_context", return_value="mem")
+    @patch("app.outbox_manager.load_human_prefs", return_value="prefs")
+    @patch("app.outbox_manager.load_soul", return_value="soul")
     def test_formats_with_context(self, mock_soul, mock_prefs, mock_mem, mock_fmt, tmp_path):
         with patch("app.awake.INSTANCE_DIR", tmp_path):
             result = _format_outbox_message("raw content")
         assert result == "Formatted"
         mock_fmt.assert_called_once_with("raw content", "soul", "prefs", "mem")
 
-    @patch("app.awake.load_soul", side_effect=Exception("load error"))
+    @patch("app.outbox_manager.load_soul", side_effect=Exception("load error"))
     def test_fallback_on_error(self, mock_soul, tmp_path):
         with patch("app.awake.INSTANCE_DIR", tmp_path):
             result = _format_outbox_message("raw content")
@@ -1167,13 +1344,15 @@ class TestHandleMessage:
 
     @patch("app.awake.handle_mission")
     def test_dispatches_mission(self, mock_mission):
-        handle_message("implement dark mode")
-        mock_mission.assert_called_once_with("implement dark mode")
+        # "build" is an imperative mission verb but not a core skill, so it
+        # routes to handle_mission rather than being promoted to a command.
+        handle_message("build dark mode")
+        mock_mission.assert_called_once_with("build dark mode")
 
     @patch("app.awake._run_in_worker")
     def test_dispatches_chat(self, mock_worker):
         handle_message("how are you?")
-        mock_worker.assert_called_once_with(handle_chat, "how are you?")
+        mock_worker.assert_called_once_with(handle_chat, "how are you?", lane="chat")
 
     @patch("app.awake.handle_command")
     @patch("app.awake.handle_mission")
@@ -1265,13 +1444,15 @@ class TestGetUpdates:
 class TestCheckConfig:
     def test_exits_without_token(self, monkeypatch, tmp_path):
         monkeypatch.setenv("KOAN_TELEGRAM_TOKEN", "")
-        with patch("app.awake.BOT_TOKEN", ""), \
+        with patch("app.messaging.resolve_provider_name", return_value="telegram"), \
+             patch("app.awake.BOT_TOKEN", ""), \
              patch("app.awake.CHAT_ID", "123"), \
              pytest.raises(SystemExit):
             check_config()
 
     def test_exits_without_chat_id(self, monkeypatch, tmp_path):
-        with patch("app.awake.BOT_TOKEN", "token"), \
+        with patch("app.messaging.resolve_provider_name", return_value="telegram"), \
+             patch("app.awake.BOT_TOKEN", "token"), \
              patch("app.awake.CHAT_ID", ""), \
              pytest.raises(SystemExit):
             check_config()
@@ -1291,6 +1472,30 @@ class TestCheckConfig:
              patch("app.awake.INSTANCE_DIR", inst):
             check_config()  # Should not raise
 
+    def test_does_not_exit_for_non_telegram_without_telegram_creds(self, tmp_path):
+        """Non-telegram providers (matrix/slack) leave BOT_TOKEN/CHAT_ID unset.
+        check_config() must not sys.exit on them — the credential check is
+        deferred to each provider's own configure()."""
+        inst = tmp_path / "instance"
+        inst.mkdir()
+        with patch("app.messaging.resolve_provider_name", return_value="matrix"), \
+             patch("app.awake.BOT_TOKEN", ""), \
+             patch("app.awake.CHAT_ID", ""), \
+             patch("app.awake.INSTANCE_DIR", inst):
+            check_config()  # Should not raise
+
+    def test_still_exits_for_telegram_without_creds(self, tmp_path):
+        """The telegram credential gate still fires when the provider is
+        telegram and creds are missing."""
+        inst = tmp_path / "instance"
+        inst.mkdir()
+        with patch("app.messaging.resolve_provider_name", return_value="telegram"), \
+             patch("app.awake.BOT_TOKEN", ""), \
+             patch("app.awake.CHAT_ID", ""), \
+             patch("app.awake.INSTANCE_DIR", inst), \
+             pytest.raises(SystemExit):
+            check_config()
+
 
 # ---------------------------------------------------------------------------
 # main() loop
@@ -1305,12 +1510,13 @@ class TestMainLoop:
     def mock_pid_manager(self):
         """Auto-mock PID file management for all main() tests."""
         with patch("app.pid_manager.acquire_pidfile") as mock_acquire, \
-             patch("app.pid_manager.release_pidfile"):
+             patch("app.pid_manager.release_pidfile"), \
+             patch("app.awake._load_offset", return_value=None):
             mock_acquire.return_value = MagicMock()
             yield
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -1319,12 +1525,12 @@ class TestMainLoop:
     def test_main_processes_updates(self, mock_sleep, mock_config, mock_updates,
                                     mock_handle, mock_flush, mock_heartbeat):
         """main() fetches updates, dispatches messages, flushes outbox, writes heartbeat."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = [
             {"update_id": 100, "message": {"text": "hello", "chat": {"id": int(self.TEST_CHAT_ID)}}}
         ]
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         mock_config.assert_called_once()
         mock_updates.assert_called_once_with(None)
         mock_handle.assert_called_once_with("hello")
@@ -1332,7 +1538,7 @@ class TestMainLoop:
         mock_heartbeat.assert_called()
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -1340,16 +1546,16 @@ class TestMainLoop:
     def test_main_ignores_wrong_chat_id(self, mock_sleep, mock_config, mock_updates,
                                          mock_handle, mock_flush, mock_heartbeat):
         """Messages from other chat IDs are ignored."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = [
             {"update_id": 100, "message": {"text": "hello", "chat": {"id": 999999}}}
         ]
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         mock_handle.assert_not_called()
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -1358,7 +1564,7 @@ class TestMainLoop:
     def test_main_updates_offset(self, mock_sleep, mock_config, mock_updates,
                                   mock_handle, mock_flush, mock_heartbeat):
         """Offset advances to update_id + 1 after processing."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         test_chat_id = self.TEST_CHAT_ID
         call_count = [0]
         def side_effect(offset=None):
@@ -1369,12 +1575,12 @@ class TestMainLoop:
         mock_updates.side_effect = side_effect
 
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         assert mock_updates.call_count == 2
         mock_updates.assert_called_with(43)
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", return_value=[])
     @patch("app.awake.check_config")
@@ -1382,15 +1588,15 @@ class TestMainLoop:
     def test_main_empty_updates_still_flushes(self, mock_sleep, mock_config, mock_updates,
                                                mock_handle, mock_flush, mock_heartbeat):
         """Even with no updates, outbox is flushed and heartbeat written."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         mock_handle.assert_not_called()
         mock_flush.assert_called_once()
         mock_heartbeat.assert_called()
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -1399,16 +1605,139 @@ class TestMainLoop:
     def test_main_skips_updates_without_text(self, mock_sleep, mock_config, mock_updates,
                                               mock_handle, mock_flush, mock_heartbeat):
         """Updates without text field (e.g., photo, sticker) are ignored."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = [
             {"update_id": 100, "message": {"chat": {"id": int(self.TEST_CHAT_ID)}}}  # no text
         ]
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
+        mock_handle.assert_not_called()
+
+    # -- Non-Telegram provider regressions (matrix/slack/discord) ------------
+    #
+    # These providers leave CHAT_ID unset and match on the resolved
+    # channel_id (e.g. a matrix room id). The main loop must not assume the
+    # Telegram update shape, or it crash-loops the bridge on every message.
+
+    MATRIX_ROOM_ID = "!VakERumPJhkcdQphyO:example.org"
+
+    def _matrix_provider_mock(self):
+        """A messaging provider whose channel_id is a matrix room id."""
+        provider = MagicMock()
+        provider.get_provider_name.return_value = "matrix"
+        provider.get_channel_id.return_value = self.MATRIX_ROOM_ID
+        return provider
+
+    @patch("app.awake._check_group_chat_mode")
+    @patch("app.messaging.get_messaging_provider")
+    @patch("app.awake.write_heartbeat")
+    @patch("app.awake._flush_outbox_async")
+    @patch("app.awake.handle_message")
+    @patch("app.awake.get_updates")
+    @patch("app.awake.check_config")
+    @patch("app.awake.CHAT_ID", "")  # matrix leaves CHAT_ID unset
+    @patch("app.awake.time.sleep", side_effect=StopIteration)
+    def test_main_matrix_message_binds_message_id(
+        self, mock_sleep, mock_config, mock_updates, mock_handle, mock_flush,
+        mock_heartbeat, mock_provider, mock_group_check,
+    ):
+        """A matrix message (chat_id matches channel_id but not CHAT_ID) must
+        dispatch without raising UnboundLocalError on message_id. The buggy
+        version bound message_id only inside a `chat_id == CHAT_ID` guard,
+        crashing the bridge on every matrix message → restart → crash-loop."""
+        from app.awake import _bridge_loop
+        mock_provider.return_value = self._matrix_provider_mock()
+        mock_updates.return_value = [
+            {"update_id": 1, "message": {
+                "message_id": "$evt", "text": "/resume",
+                "chat": {"id": self.MATRIX_ROOM_ID}}}
+        ]
+        # Must reach sleep() (StopIteration), not raise UnboundLocalError.
+        with pytest.raises(StopIteration):
+            _bridge_loop()
+        mock_handle.assert_called_once_with("/resume")
+
+    @patch("app.awake._check_group_chat_mode")
+    @patch("app.messaging.get_messaging_provider")
+    @patch("app.awake.write_heartbeat")
+    @patch("app.awake._flush_outbox_async")
+    @patch("app.awake.handle_message")
+    @patch("app.awake.get_updates")
+    @patch("app.awake.check_config")
+    @patch("app.awake.CHAT_ID", "")
+    @patch("app.awake.time.sleep", side_effect=StopIteration)
+    def test_main_update_without_update_id_does_not_crash(
+        self, mock_sleep, mock_config, mock_updates, mock_handle, mock_flush,
+        mock_heartbeat, mock_provider, mock_group_check,
+    ):
+        """An update lacking update_id must not crash the loop. A KeyError here
+        would take down main(), the supervisor would restart the bridge, the
+        same poison message would be re-delivered, and we'd crash-loop forever."""
+        from app.awake import _bridge_loop
+        mock_provider.return_value = self._matrix_provider_mock()
+        mock_updates.return_value = [
+            {"message": {"message_id": "$evt", "text": "hi from matrix",
+                         "chat": {"id": self.MATRIX_ROOM_ID}}}
+        ]
+        with pytest.raises(StopIteration):
+            _bridge_loop()
+        mock_handle.assert_called_once_with("hi from matrix")
+        mock_flush.assert_called_once()
+        mock_heartbeat.assert_called()
+
+    @patch("app.awake._check_group_chat_mode")
+    @patch("app.messaging.get_messaging_provider")
+    @patch("app.awake.write_heartbeat")
+    @patch("app.awake._flush_outbox_async")
+    @patch("app.awake.handle_message")
+    @patch("app.awake.get_updates")
+    @patch("app.awake.check_config")
+    @patch("app.awake.CHAT_ID", "")
+    @patch("app.awake.time.sleep", side_effect=StopIteration)
+    def test_main_drops_message_from_other_channel(
+        self, mock_sleep, mock_config, mock_updates, mock_handle, mock_flush,
+        mock_heartbeat, mock_provider, mock_group_check,
+    ):
+        """A message whose chat.id matches neither channel_id nor CHAT_ID is
+        dropped (not dispatched)."""
+        from app.awake import _bridge_loop
+        mock_provider.return_value = self._matrix_provider_mock()
+        mock_updates.return_value = [
+            {"update_id": 1, "message": {
+                "message_id": "$evt", "text": "intruder",
+                "chat": {"id": "!someOtherRoom:example.org"}}}
+        ]
+        with pytest.raises(StopIteration):
+            _bridge_loop()
+        mock_handle.assert_not_called()
+
+    @patch("app.awake._check_group_chat_mode")
+    @patch("app.messaging.get_messaging_provider")
+    @patch("app.awake.write_heartbeat")
+    @patch("app.awake._flush_outbox_async")
+    @patch("app.awake.handle_message")
+    @patch("app.awake.get_updates")
+    @patch("app.awake.check_config")
+    @patch("app.awake.CHAT_ID", "")
+    @patch("app.awake.time.sleep", side_effect=StopIteration)
+    def test_main_drops_malformed_update_missing_chat_id(
+        self, mock_sleep, mock_config, mock_updates, mock_handle, mock_flush,
+        mock_heartbeat, mock_provider, mock_group_check,
+    ):
+        """With CHAT_ID="" (normal for matrix/slack), a malformed update with no
+        chat.id (chat_id == "") must NOT pass the channel filter. Guards against
+        the empty-string match `"" in (channel_id, "")` slipping through."""
+        from app.awake import _bridge_loop
+        mock_provider.return_value = self._matrix_provider_mock()
+        mock_updates.return_value = [
+            {"update_id": 1, "message": {"message_id": "$evt", "text": "no chat id"}}
+        ]
+        with pytest.raises(StopIteration):
+            _bridge_loop()
         mock_handle.assert_not_called()
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", side_effect=KeyboardInterrupt)
     @patch("app.awake.check_config")
@@ -1416,15 +1745,15 @@ class TestMainLoop:
                                            mock_handle, mock_flush, mock_heartbeat,
                                            capsys):
         """CTRL-C (KeyboardInterrupt) exits cleanly without traceback."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         with pytest.raises(SystemExit) as exc_info:
-            main()
+            _bridge_loop()
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         assert "Shutting down" in captured.err
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", return_value=[])
     @patch("app.awake.check_config")
@@ -1435,9 +1764,9 @@ class TestMainLoop:
                                                         mock_flush, mock_heartbeat,
                                                         capsys):
         """CTRL-C during sleep between polls also exits cleanly."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         with pytest.raises(SystemExit) as exc_info:
-            main()
+            _bridge_loop()
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         assert "Shutting down" in captured.err
@@ -1445,7 +1774,7 @@ class TestMainLoop:
     @patch("app.awake.clear_shutdown")
     @patch("app.awake.is_shutdown_requested", return_value=True)
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", return_value=[])
     @patch("app.awake.check_config")
@@ -1455,9 +1784,9 @@ class TestMainLoop:
                                             mock_heartbeat, mock_shutdown,
                                             mock_clear, capsys):
         """Bridge exits cleanly when /shutdown signal is detected."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         with pytest.raises(SystemExit) as exc_info:
-            main()
+            _bridge_loop()
         assert exc_info.value.code == 0
         mock_shutdown.assert_called()
         mock_clear.assert_called()
@@ -1465,7 +1794,7 @@ class TestMainLoop:
         assert "Shutdown requested" in captured.err
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", side_effect=KeyboardInterrupt)
     @patch("app.awake.check_config")
@@ -1473,19 +1802,19 @@ class TestMainLoop:
                                   mock_handle, mock_flush, mock_heartbeat,
                                   tmp_path, monkeypatch):
         """main() sets PYTHONPATH to include koan/ package directory."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         monkeypatch.setattr("app.awake.KOAN_ROOT", tmp_path)
         monkeypatch.delenv("PYTHONPATH", raising=False)
 
         with pytest.raises(SystemExit):
-            main()
+            _bridge_loop()
 
         pythonpath = os.environ.get("PYTHONPATH", "")
         koan_dir = str(tmp_path / "koan")
         assert koan_dir in pythonpath.split(os.pathsep)
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", side_effect=KeyboardInterrupt)
     @patch("app.awake.check_config")
@@ -1494,12 +1823,12 @@ class TestMainLoop:
                                                  mock_heartbeat,
                                                  tmp_path, monkeypatch):
         """main() prepends koan/ to PYTHONPATH without losing existing entries."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         monkeypatch.setattr("app.awake.KOAN_ROOT", tmp_path)
         monkeypatch.setenv("PYTHONPATH", "/existing/path")
 
         with pytest.raises(SystemExit):
-            main()
+            _bridge_loop()
 
         pythonpath = os.environ.get("PYTHONPATH", "")
         parts = pythonpath.split(os.pathsep)
@@ -1508,7 +1837,7 @@ class TestMainLoop:
         assert "/existing/path" in parts
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", side_effect=KeyboardInterrupt)
     @patch("app.awake.check_config")
@@ -1517,13 +1846,13 @@ class TestMainLoop:
                                                  mock_heartbeat,
                                                  tmp_path, monkeypatch):
         """main() does not add koan/ to PYTHONPATH if already present."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         koan_dir = str(tmp_path / "koan")
         monkeypatch.setattr("app.awake.KOAN_ROOT", tmp_path)
         monkeypatch.setenv("PYTHONPATH", koan_dir)
 
         with pytest.raises(SystemExit):
-            main()
+            _bridge_loop()
 
         pythonpath = os.environ.get("PYTHONPATH", "")
         # Should not be duplicated
@@ -1706,13 +2035,13 @@ class TestPauseCommand:
         assert "max runs" in status.lower()
 
     def test_status_shows_working_when_active(self, tmp_path):
-        """Status shows Working when no pause/stop."""
+        """Status shows Active when no pause/stop/passive."""
         (tmp_path / "instance").mkdir()
         (tmp_path / "instance" / "missions.md").write_text(
             "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n"
         )
         status = _call_status_handler(tmp_path)
-        assert "Working" in status
+        assert "Active" in status
 
     def test_status_shows_stopping(self, tmp_path):
         """Status shows Stopping when stop file exists."""
@@ -1949,7 +2278,7 @@ class TestPauseAwareness:
             "# Missions\n\n## Pending\n\n## In Progress\n\n"
         )
         status = _call_status_handler(tmp_path)
-        assert "Working" in status
+        assert "Active" in status
 
     @patch("app.awake.save_conversation_message")
     @patch("app.awake.load_recent_history", return_value=[])
@@ -2279,13 +2608,24 @@ class TestHandlePr:
 
     @patch("app.command_handlers.send_telegram")
     def test_handle_command_routes_pr(self, mock_send, tmp_path):
-        """handle_command dispatches /pr through worker (skill has worker=true)."""
+        """handle_command dispatches /pr through worker when args provided."""
+        with patch("app.command_handlers.KOAN_ROOT", tmp_path), \
+             patch("app.command_handlers.INSTANCE_DIR", tmp_path), \
+             patch("app.command_handlers._run_in_worker_cb") as mock_worker:
+            handle_command("/pr https://github.com/owner/repo/pull/1")
+        # PR is a worker skill — should dispatch via _run_in_worker
+        mock_worker.assert_called_once()
+
+    @patch("app.command_handlers.send_telegram")
+    def test_handle_command_pr_no_args_shows_usage(self, mock_send, tmp_path):
+        """Bare /pr with no args shows usage immediately without spawning worker."""
         with patch("app.command_handlers.KOAN_ROOT", tmp_path), \
              patch("app.command_handlers.INSTANCE_DIR", tmp_path), \
              patch("app.command_handlers._run_in_worker_cb") as mock_worker:
             handle_command("/pr")
-        # PR is a worker skill — should dispatch via _run_in_worker
-        mock_worker.assert_called_once()
+        mock_worker.assert_not_called()
+        msg = mock_send.call_args[0][0]
+        assert "Usage:" in msg
 
     @patch("app.command_handlers.send_telegram")
     def test_help_includes_pr(self, mock_send):
@@ -2828,7 +3168,7 @@ class TestBridgeExceptionResilience:
             yield
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.send_telegram")
     @patch("app.awake.handle_message", side_effect=RuntimeError("unexpected bug"))
     @patch("app.awake.get_updates")
@@ -2840,20 +3180,20 @@ class TestBridgeExceptionResilience:
         mock_send, mock_flush, mock_heartbeat
     ):
         """If handle_message raises, the bridge logs and continues."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = [
             {"update_id": 100, "message": {"text": "/bad", "chat": {"id": int(self.TEST_CHAT_ID)}}}
         ]
         # Should stop at StopIteration (time.sleep), NOT at RuntimeError
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         mock_handle.assert_called_once_with("/bad")
         # Error notification sent to user
         mock_send.assert_called_once()
         assert "RuntimeError" in mock_send.call_args[0][0]
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.send_telegram", side_effect=Exception("telegram down"))
     @patch("app.awake.handle_message", side_effect=RuntimeError("bug"))
     @patch("app.awake.get_updates")
@@ -2865,12 +3205,12 @@ class TestBridgeExceptionResilience:
         mock_send, mock_flush, mock_heartbeat
     ):
         """If both handle_message AND the error notification fail, bridge still survives."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = [
             {"update_id": 100, "message": {"text": "/bad", "chat": {"id": int(self.TEST_CHAT_ID)}}}
         ]
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         # Bridge survived both exceptions
 
 
@@ -2887,7 +3227,7 @@ class TestBridgeInfrastructureResilience:
             yield
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates", side_effect=ConnectionError("network down"))
     @patch("app.awake.check_config")
@@ -2898,9 +3238,9 @@ class TestBridgeInfrastructureResilience:
         mock_flush, mock_heartbeat, capsys
     ):
         """If get_updates raises, bridge logs error and retries next iteration."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         # handle_message never called (no updates received)
         mock_handle.assert_not_called()
         # flush_outbox and heartbeat NOT called when get_updates fails
@@ -2909,7 +3249,7 @@ class TestBridgeInfrastructureResilience:
         assert "get_updates failed" in captured.err
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox", side_effect=OSError("disk full"))
+    @patch("app.awake._flush_outbox_async", side_effect=OSError("disk full"))
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -2920,10 +3260,10 @@ class TestBridgeInfrastructureResilience:
         mock_flush, mock_heartbeat, capsys
     ):
         """If flush_outbox raises, bridge logs error and continues."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = []
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         mock_flush.assert_called_once()
         # Heartbeat still called despite flush failure
         mock_heartbeat.assert_called()
@@ -2931,7 +3271,7 @@ class TestBridgeInfrastructureResilience:
         assert "flush_outbox failed" in captured.err
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox")
+    @patch("app.awake._flush_outbox_async")
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -2942,19 +3282,19 @@ class TestBridgeInfrastructureResilience:
         mock_flush, mock_heartbeat, capsys
     ):
         """If write_heartbeat raises in the loop, bridge logs error and continues."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = []
         # First call succeeds (startup), second call (loop) fails
         mock_heartbeat.side_effect = [None, PermissionError("read-only fs")]
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         mock_flush.assert_called_once()
         assert mock_heartbeat.call_count == 2
         captured = capsys.readouterr()
         assert "write_heartbeat failed" in captured.err
 
     @patch("app.awake.write_heartbeat")
-    @patch("app.awake.flush_outbox", side_effect=OSError("flush boom"))
+    @patch("app.awake._flush_outbox_async", side_effect=OSError("flush boom"))
     @patch("app.awake.handle_message")
     @patch("app.awake.get_updates")
     @patch("app.awake.check_config")
@@ -2965,12 +3305,12 @@ class TestBridgeInfrastructureResilience:
         mock_flush, mock_heartbeat, capsys
     ):
         """Both flush_outbox and write_heartbeat can fail without crashing."""
-        from app.awake import main
+        from app.awake import _bridge_loop
         mock_updates.return_value = []
         # First call succeeds (startup), second call (loop) fails
         mock_heartbeat.side_effect = [None, RuntimeError("heartbeat boom")]
         with pytest.raises(StopIteration):
-            main()
+            _bridge_loop()
         captured = capsys.readouterr()
         assert "flush_outbox failed" in captured.err
         assert "write_heartbeat failed" in captured.err
@@ -2983,20 +3323,22 @@ class TestAsyncOutboxFlush:
     def reset_outbox_thread(self):
         import app.awake as awake_mod
 
-        awake_mod._outbox_thread = None
+        mgr = awake_mod._outbox_mgr
+        mgr._thread = None
         yield
-        if awake_mod._outbox_thread is not None:
-            awake_mod._outbox_thread.join(timeout=2)
-        awake_mod._outbox_thread = None
+        if mgr._thread is not None:
+            mgr._thread.join(timeout=2)
+        mgr._thread = None
 
     def test_flush_outbox_async_runs_in_thread(self):
         """_flush_outbox_async spawns a background thread for flush_outbox."""
         import app.awake as awake_mod
 
-        with patch.object(awake_mod, "flush_outbox") as mock_flush:
+        mgr = awake_mod._outbox_mgr
+        with patch.object(mgr, "flush") as mock_flush:
             _flush_outbox_async()
             # Wait for the thread to complete
-            awake_mod._outbox_thread.join(timeout=2)
+            mgr._thread.join(timeout=2)
             mock_flush.assert_called_once()
 
     def test_flush_outbox_async_skips_if_already_running(self):
@@ -3004,17 +3346,18 @@ class TestAsyncOutboxFlush:
         import threading
         import app.awake as awake_mod
 
+        mgr = awake_mod._outbox_mgr
         # Simulate a long-running flush
         barrier = threading.Event()
 
         def slow_flush():
             barrier.wait(timeout=5)
 
-        with patch.object(awake_mod, "flush_outbox", side_effect=slow_flush) as mock_flush:
+        with patch.object(mgr, "flush", side_effect=slow_flush) as mock_flush:
             _flush_outbox_async()  # Starts the slow flush
             _flush_outbox_async()  # Should skip (thread still alive)
             barrier.set()
-            awake_mod._outbox_thread.join(timeout=2)
+            mgr._thread.join(timeout=2)
 
         mock_flush.assert_called_once()
 
@@ -3022,9 +3365,10 @@ class TestAsyncOutboxFlush:
         """Exceptions in flush_outbox are caught and logged, not propagated."""
         import app.awake as awake_mod
 
-        with patch.object(awake_mod, "flush_outbox", side_effect=RuntimeError("boom")):
+        mgr = awake_mod._outbox_mgr
+        with patch.object(mgr, "flush", side_effect=RuntimeError("boom")):
             _flush_outbox_async()
-            awake_mod._outbox_thread.join(timeout=2)
+            mgr._thread.join(timeout=2)
 
         captured = capsys.readouterr()
         assert "Background flush_outbox failed" in captured.err
@@ -3033,16 +3377,399 @@ class TestAsyncOutboxFlush:
         """After a flush completes, the next call spawns a new thread."""
         import app.awake as awake_mod
 
+        mgr = awake_mod._outbox_mgr
         call_count = 0
 
         def counting_flush():
             nonlocal call_count
             call_count += 1
 
-        with patch.object(awake_mod, "flush_outbox", side_effect=counting_flush):
+        with patch.object(mgr, "flush", side_effect=counting_flush):
             _flush_outbox_async()
-            awake_mod._outbox_thread.join(timeout=2)
+            mgr._thread.join(timeout=2)
             _flush_outbox_async()
-            awake_mod._outbox_thread.join(timeout=2)
+            mgr._thread.join(timeout=2)
 
         assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Test: hard text truncation when lite mode still exceeds MAX_PROMPT_CHARS
+# ---------------------------------------------------------------------------
+
+class TestBuildChatPromptHardTruncation:
+    """Tests that _build_chat_prompt truncates user text as last resort."""
+
+    @patch("app.awake.save_conversation_message")
+    @patch("app.awake.load_recent_history", return_value=[])
+    @patch("app.awake.format_conversation_history", return_value="")
+    @patch("app.awake.get_tools_description", return_value="")
+    @patch("app.awake.get_chat_tools", return_value="")
+    @patch("app.awake.send_telegram", return_value=True)
+    @patch("app.awake.subprocess.run")
+    def test_truncates_long_message_in_lite_mode(
+        self, mock_run, mock_send, mock_tools, mock_tools_desc, mock_fmt,
+        mock_hist, mock_save, tmp_path
+    ):
+        """When lite=True and prompt still exceeds 12k, user text is truncated."""
+        from app.awake import _build_chat_prompt
+
+        # Create a very long user message that will exceed 12k even in lite mode
+        long_text = "x" * 15000
+
+        with patch("app.awake.INSTANCE_DIR", tmp_path), \
+             patch("app.awake.KOAN_ROOT", tmp_path), \
+             patch("app.awake.MISSIONS_FILE", tmp_path / "missions.md"), \
+             patch("app.awake.SOUL", "test soul"), \
+             patch("app.awake.SUMMARY", ""):
+            prompt = _build_chat_prompt(long_text, lite=True)
+
+        # Prompt must be at or under the cap
+        assert len(prompt) <= 12000, f"Prompt is {len(prompt)} chars, expected <= 12000"
+        # The truncation marker should be present
+        assert "[truncated]" in prompt
+
+    @patch("app.awake.save_conversation_message")
+    @patch("app.awake.load_recent_history", return_value=[])
+    @patch("app.awake.format_conversation_history", return_value="")
+    @patch("app.awake.get_tools_description", return_value="")
+    @patch("app.awake.get_chat_tools", return_value="")
+    @patch("app.awake.send_telegram", return_value=True)
+    @patch("app.awake.subprocess.run")
+    def test_short_message_not_truncated(
+        self, mock_run, mock_send, mock_tools, mock_tools_desc, mock_fmt,
+        mock_hist, mock_save, tmp_path
+    ):
+        """Short messages should not be truncated."""
+        from app.awake import _build_chat_prompt
+
+        short_text = "hello, how are you?"
+
+        with patch("app.awake.INSTANCE_DIR", tmp_path), \
+             patch("app.awake.KOAN_ROOT", tmp_path), \
+             patch("app.awake.MISSIONS_FILE", tmp_path / "missions.md"), \
+             patch("app.awake.SOUL", "test soul"), \
+             patch("app.awake.SUMMARY", ""):
+            prompt = _build_chat_prompt(short_text, lite=True)
+
+        assert "[truncated]" not in prompt
+        assert short_text in prompt
+
+
+# ---------------------------------------------------------------------------
+# _strip_bot_mention_from_text
+# ---------------------------------------------------------------------------
+
+
+class TestStripBotMentionFromText:
+    """Test @bot_username stripping from non-command messages."""
+
+    def test_no_entities(self):
+        assert _strip_bot_mention_from_text("hello world", {}) == "hello world"
+
+    def test_no_mention_entities(self):
+        msg = {"entities": [{"type": "bold", "offset": 0, "length": 5}]}
+        assert _strip_bot_mention_from_text("hello world", msg) == "hello world"
+
+    def test_mention_at_start(self):
+        msg = {"entities": [{"type": "mention", "offset": 0, "length": 8}]}
+        assert _strip_bot_mention_from_text("@BotName hello world", msg) == "hello world"
+
+    def test_mention_at_end(self):
+        msg = {"entities": [{"type": "mention", "offset": 6, "length": 8}]}
+        assert _strip_bot_mention_from_text("hello @BotName", msg) == "hello"
+
+    def test_multiple_mentions(self):
+        msg = {"entities": [
+            {"type": "mention", "offset": 0, "length": 4},
+            {"type": "mention", "offset": 11, "length": 5},
+        ]}
+        assert _strip_bot_mention_from_text("@Bot hello @User world", msg) == "hello  world"
+
+    def test_command_not_stripped(self):
+        msg = {"entities": [{"type": "bot_command", "offset": 0, "length": 15}]}
+        assert _strip_bot_mention_from_text("/start@BotName", msg) == "/start@BotName"
+
+    def test_empty_text(self):
+        assert _strip_bot_mention_from_text("", {}) == ""
+
+    def test_mention_only(self):
+        msg = {"entities": [{"type": "mention", "offset": 0, "length": 8}]}
+        assert _strip_bot_mention_from_text("@BotName", msg) == ""
+
+
+# ---------------------------------------------------------------------------
+# _is_addressed_to_other_user — skip messages addressed to other participants
+# ---------------------------------------------------------------------------
+
+
+class TestIsAddressedToOtherUser:
+    """Messages starting with @other-user should be ignored in group chats."""
+
+    def test_addressed_to_other_user_via_entity(self):
+        msg = {"entities": [{"type": "mention", "offset": 0, "length": 10}]}
+        assert _is_addressed_to_other_user("@OtherUser hello", msg, "MyBot") is True
+
+    def test_addressed_to_bot_via_entity(self):
+        msg = {"entities": [{"type": "mention", "offset": 0, "length": 6}]}
+        assert _is_addressed_to_other_user("@MyBot hello", msg, "MyBot") is False
+
+    def test_case_insensitive(self):
+        msg = {"entities": [{"type": "mention", "offset": 0, "length": 6}]}
+        assert _is_addressed_to_other_user("@mybot hello", msg, "MyBot") is False
+
+    def test_no_mention_at_start(self):
+        msg = {"entities": [{"type": "mention", "offset": 6, "length": 10}]}
+        assert _is_addressed_to_other_user("hello @OtherUser", msg, "MyBot") is False
+
+    def test_no_entities(self):
+        assert _is_addressed_to_other_user("hello world", {}, "MyBot") is False
+
+    def test_no_bot_username(self):
+        msg = {"entities": [{"type": "mention", "offset": 0, "length": 10}]}
+        assert _is_addressed_to_other_user("@OtherUser hello", msg, "") is False
+
+    def test_text_fallback_other_user(self):
+        assert _is_addressed_to_other_user("@OtherUser hello", {}, "MyBot") is True
+
+    def test_text_fallback_bot(self):
+        assert _is_addressed_to_other_user("@MyBot hello", {}, "MyBot") is False
+
+    def test_plain_text_no_mention(self):
+        assert _is_addressed_to_other_user("just a message", {}, "MyBot") is False
+
+    def test_command_not_matched(self):
+        assert _is_addressed_to_other_user("/start", {}, "MyBot") is False
+
+    def test_non_mention_entity_at_start(self):
+        msg = {"entities": [{"type": "bold", "offset": 0, "length": 5}]}
+        assert _is_addressed_to_other_user("hello world", msg, "MyBot") is False
+
+
+# ---------------------------------------------------------------------------
+# _check_group_chat_mode — group detection + privacy-mode self-diagnosis
+# ---------------------------------------------------------------------------
+
+
+class TestCheckGroupChatMode:
+    """Verify the bot detects whether it can actually read group messages."""
+
+    def _provider(self):
+        provider = MagicMock()
+        provider.get_provider_name.return_value = "telegram"
+        provider.get_api_base.return_value = "http://api"
+        provider.get_channel_id.return_value = "-100123"
+        return provider
+
+    def _side_effect(self, getchat=None, getme=None, member=None):
+        """Build a requests.get side_effect that dispatches on URL suffix."""
+        def _dispatch(url, *args, **kwargs):
+            resp = MagicMock()
+            if url.endswith("/getChat"):
+                resp.json.return_value = getchat or {"ok": False}
+            elif url.endswith("/getMe"):
+                resp.json.return_value = getme or {"ok": False}
+            elif url.endswith("/getChatMember"):
+                resp.json.return_value = member or {"ok": False}
+            else:
+                resp.json.return_value = {"ok": False}
+            return resp
+        return _dispatch
+
+    @patch("app.awake.log")
+    @patch("requests.get")
+    def test_privacy_disabled_no_warning(self, mock_get, mock_log):
+        provider = self._provider()
+        mock_get.side_effect = self._side_effect(
+            getchat={"ok": True, "result": {"type": "supergroup"}},
+            getme={"ok": True, "result": {"id": 99, "can_read_all_group_messages": True}},
+        )
+        _check_group_chat_mode(provider)
+        provider.send_message.assert_not_called()
+        assert any("can read all messages" in str(c.args) for c in mock_log.call_args_list)
+
+    @patch("app.awake.log")
+    @patch("requests.get")
+    def test_privacy_on_not_admin_warns_and_sends(self, mock_get, mock_log):
+        provider = self._provider()
+        mock_get.side_effect = self._side_effect(
+            getchat={"ok": True, "result": {"type": "supergroup"}},
+            getme={"ok": True, "result": {"id": 99, "can_read_all_group_messages": False}},
+            member={"ok": True, "result": {"status": "member"}},
+        )
+        _check_group_chat_mode(provider)
+        provider.send_message.assert_called_once()
+        assert "Privacy Mode" in provider.send_message.call_args.args[0]
+
+    @patch("app.awake.log")
+    @patch("requests.get")
+    def test_privacy_on_but_admin_no_warning(self, mock_get, mock_log):
+        provider = self._provider()
+        mock_get.side_effect = self._side_effect(
+            getchat={"ok": True, "result": {"type": "supergroup"}},
+            getme={"ok": True, "result": {"id": 99, "can_read_all_group_messages": False}},
+            member={"ok": True, "result": {"status": "administrator"}},
+        )
+        _check_group_chat_mode(provider)
+        provider.send_message.assert_not_called()
+        assert any("can read all messages" in str(c.args) for c in mock_log.call_args_list)
+
+    @patch("app.awake.log")
+    @patch("requests.get")
+    def test_private_chat_short_circuits(self, mock_get, mock_log):
+        provider = self._provider()
+        mock_get.side_effect = self._side_effect(
+            getchat={"ok": True, "result": {"type": "private"}},
+        )
+        _check_group_chat_mode(provider)
+        provider.send_message.assert_not_called()
+        # Only getChat is called; no getMe / getChatMember probing for private chats.
+        assert mock_get.call_count == 1
+
+    @patch("app.awake.log")
+    @patch("requests.get")
+    def test_api_failure_does_not_crash(self, mock_get, mock_log):
+        provider = self._provider()
+        mock_get.side_effect = RuntimeError("network down")
+        # Must not raise.
+        _check_group_chat_mode(provider)
+        provider.send_message.assert_not_called()
+
+    @patch("app.awake.log")
+    @patch("requests.get")
+    def test_non_telegram_provider_skipped(self, mock_get, mock_log):
+        provider = self._provider()
+        provider.get_provider_name.return_value = "slack"
+        _check_group_chat_mode(provider)
+        mock_get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Reply context threading
+# ---------------------------------------------------------------------------
+
+
+class TestReplyContext:
+    """Test thread-local reply context for group chat threading."""
+
+    def test_default_is_zero(self):
+        from app.notify import get_reply_context, clear_reply_context
+        clear_reply_context()
+        assert get_reply_context() == 0
+
+    def test_set_and_get(self):
+        from app.notify import set_reply_context, get_reply_context, clear_reply_context
+        set_reply_context(42)
+        assert get_reply_context() == 42
+        clear_reply_context()
+
+    def test_clear(self):
+        from app.notify import set_reply_context, get_reply_context, clear_reply_context
+        set_reply_context(99)
+        clear_reply_context()
+        assert get_reply_context() == 0
+
+    def test_worker_inherits_context(self):
+        """_run_in_worker should propagate reply context to worker thread."""
+        import threading
+        from app.notify import set_reply_context, get_reply_context, clear_reply_context
+
+        captured = [None]
+        done_event = threading.Event()
+
+        def capture_context():
+            captured[0] = get_reply_context()
+            done_event.set()
+
+        set_reply_context(123)
+        _run_in_worker(capture_context)
+        done_event.wait(timeout=5)
+        assert captured[0] == 123
+        clear_reply_context()
+
+    def test_send_telegram_passes_reply_to(self):
+        """send_telegram should pass reply_to_message_id from thread-local."""
+        from app.notify import set_reply_context, clear_reply_context, send_telegram
+
+        mock_provider = MagicMock()
+        mock_provider.send_message.return_value = True
+
+        set_reply_context(456)
+        with patch("app.messaging.get_messaging_provider", return_value=mock_provider):
+            send_telegram("test")
+        mock_provider.send_message.assert_called_once_with("test", reply_to_message_id=456)
+        clear_reply_context()
+
+
+# ---------------------------------------------------------------------------
+# _load_cached_context
+# ---------------------------------------------------------------------------
+
+class TestLoadCachedContext:
+    """Tests for the mtime-based file cache used in _build_chat_prompt."""
+
+    def test_reads_file_on_first_call(self, tmp_path):
+        """Cache miss: reads content from disk."""
+        from app.awake import _load_cached_context
+
+        f = tmp_path / "prefs.md"
+        f.write_text("Prefers French")
+        assert _load_cached_context(f) == "Prefers French"
+
+    def test_returns_cached_content_on_second_call(self, tmp_path):
+        """Cache hit: avoids re-reading from disk."""
+        from unittest.mock import MagicMock, patch
+        from app.awake import _load_cached_context, _chat_context_cache
+
+        f = tmp_path / "prefs.md"
+        f.write_text("Prefers French")
+        # Prime cache
+        _load_cached_context(f)
+        # Mutate file behind cache's back
+        f.write_text("Prefers English")
+        # Patch stat so mtime appears unchanged → cache hit
+        def fake_stat(self, *args, **kwargs):
+            result = MagicMock()
+            result.st_mtime = 1.0
+            return result
+
+        with patch("app.awake.Path.stat", fake_stat):
+            assert _load_cached_context(f) == "Prefers French"
+        # Cleanup
+        del _chat_context_cache[str(f)]
+
+    def test_invalidates_cache_when_mtime_changes(self, tmp_path):
+        """Cache invalidated when file mtime advances."""
+        from app.awake import _load_cached_context, _chat_context_cache
+
+        f = tmp_path / "prefs.md"
+        f.write_text("Prefers French")
+        # Prime cache
+        _load_cached_context(f)
+        # Wait a tiny bit so mtime definitely changes
+        time.sleep(0.05)
+        f.write_text("Prefers English")
+        assert _load_cached_context(f) == "Prefers English"
+        # Cleanup
+        del _chat_context_cache[str(f)]
+
+    def test_returns_empty_when_file_missing(self, tmp_path):
+        """Missing file yields empty string."""
+        from app.awake import _load_cached_context
+
+        missing = tmp_path / "missing.md"
+        assert _load_cached_context(missing) == ""
+
+    def test_returns_empty_on_oserror(self, tmp_path):
+        """OSError during stat or read yields empty string."""
+        from app.awake import _load_cached_context
+
+        f = tmp_path / "unreadable.md"
+        f.write_text("secret")
+        # Make file unreadable (best-effort, skipped on platforms where
+        # permissions don't apply to the test runner)
+        try:
+            f.chmod(0o000)
+            assert _load_cached_context(f) == ""
+        finally:
+            f.chmod(0o644)

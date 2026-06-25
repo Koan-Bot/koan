@@ -63,6 +63,13 @@ verify_binaries() {
                 success "claude $(claude --version 2>/dev/null | head -1 || echo '(unknown version)')"
             fi
             ;;
+        codex)
+            if ! command -v codex &>/dev/null; then
+                missing+=("codex (OpenAI Codex CLI) — npm install -g @openai/codex may have failed")
+            else
+                success "codex $(codex --version 2>/dev/null | head -1 || echo '(unknown version)')"
+            fi
+            ;;
         copilot)
             if ! command -v github-copilot-cli &>/dev/null && ! command -v copilot &>/dev/null; then
                 missing+=("github-copilot-cli or copilot (GitHub Copilot CLI)")
@@ -70,7 +77,7 @@ verify_binaries() {
                 success "copilot CLI"
             fi
             ;;
-        local|ollama)
+        local|ollama|ollama-launch)
             if ! command -v ollama &>/dev/null; then
                 missing+=("ollama")
             else
@@ -123,6 +130,41 @@ check_claude_auth() {
     log "  Option 1: Run 'make docker-auth' on the HOST (subscription — generates OAuth token)"
     log "  Option 2: Set ANTHROPIC_API_KEY in .env (API billing)"
     return 1
+}
+
+# Check Codex authentication via a minimal probe.
+# Returns 0 if authenticated, 1 if not.
+check_codex_auth() {
+    # Option 1: OpenAI API key
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+        success "Codex auth: OPENAI_API_KEY"
+        return 0
+    fi
+
+    # Option 2: Device auth / interactive login — probe with a tiny prompt
+    # --skip-git-repo-check: /app may not be a trusted git dir in Docker
+    # --sandbox workspace-write: replaces deprecated --full-auto
+    if timeout 15 codex exec --skip-git-repo-check --sandbox workspace-write "ok" >/dev/null 2>&1; then
+        success "Codex auth: interactive login"
+        return 0
+    fi
+
+    error "Codex CLI is not authenticated"
+    log "  Option 1: Set OPENAI_API_KEY in .env"
+    log "  Option 2: Run 'codex login --device-auth' inside the container"
+    return 1
+}
+
+# Dispatch to the correct auth check based on configured provider.
+check_provider_auth() {
+    local provider="${KOAN_CLI_PROVIDER:-claude}"
+    case "$provider" in
+        claude)  check_claude_auth ;;
+        codex)   check_codex_auth ;;
+        # Other providers (copilot, local, ollama) don't have a standard
+        # auth check — verify_auth() handles their warnings.
+        *)       return 0 ;;
+    esac
 }
 
 verify_auth() {
@@ -218,6 +260,64 @@ setup_workspace() {
 }
 
 
+# -------------------------------------------------------------------------
+# Railway (hosted single-container) bootstrap — idempotent, re-run each deploy
+# -------------------------------------------------------------------------
+railway_setup_git() {
+    [ "${KOAN_DEPLOY:-}" = "railway" ] || return 0
+    if [ -n "${GH_TOKEN:-}" ]; then
+        gh auth setup-git 2>/dev/null \
+            && success "git credential helper configured via gh" \
+            || warn "gh auth setup-git failed (continuing)"
+        git config --global url."https://github.com/".insteadOf "git@github.com:" || true
+        git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" || true
+    else
+        warn "GH_TOKEN unset — git push/clone over HTTPS may prompt"
+    fi
+}
+
+railway_bootstrap() {
+    [ "${KOAN_DEPLOY:-}" = "railway" ] || return 0
+    section "Railway bootstrap"
+
+    # 1. Normalize volume ownership to the *running* UID.
+    local uid gid
+    uid="$(id -u)"; gid="$(id -g)"
+    mkdir -p "$INSTANCE" 2>/dev/null || true
+    chown -R "${uid}:${gid}" "$INSTANCE" 2>/dev/null \
+        && success "volume owned by ${uid}:${gid}" \
+        || warn "could not chown $INSTANCE (continuing)"
+    mkdir -p "$INSTANCE/workspace" 2>/dev/null || true
+
+    # 2. Regenerate /app/.env as a mirror of the service env vars (#2076).
+    if (cd "$KOAN_ROOT/koan" && $PYTHON -c 'import sys; from app.railway import required_env_present; sys.exit(0 if required_env_present() else 1)'); then
+        if (cd "$KOAN_ROOT/koan" && $PYTHON -c "from pathlib import Path; from app.railway import write_env_from_environment as w; w(Path('$KOAN_ROOT/.env'))"); then
+            success ".env mirrored from environment"
+        else
+            warn ".env mirror failed — container may lack credentials"
+        fi
+    else
+        warn "Required env vars missing — .env mirror skipped"
+    fi
+
+    # 3. Drop any stale ephemeral onboarding checkpoint.
+    rm -f "$KOAN_ROOT/.koan-onboarding.json" 2>/dev/null || true
+
+    # 4. Token-only Git.
+    railway_setup_git
+}
+
+railway_provision() {
+    [ "${KOAN_DEPLOY:-}" = "railway" ] || return 0
+    # Seed instance/projects.yaml from template if absent (resolved with
+    # priority by load_projects_config — see Phase 2).
+    if [ ! -e "$INSTANCE/projects.yaml" ] && [ -f "$KOAN_ROOT/projects.example.yaml" ]; then
+        cp "$KOAN_ROOT/projects.example.yaml" "$INSTANCE/projects.yaml"
+        log "instance/projects.yaml seeded from template"
+    fi
+}
+
+
 # =========================================================================
 # Main
 # =========================================================================
@@ -226,10 +326,12 @@ COMMAND="${1:-start}"
 case "$COMMAND" in
     start)
         printf "${BOLD}${CYAN}Kōan Docker — initializing${RESET}\n"
+        railway_bootstrap                 # no-op unless KOAN_DEPLOY=railway
         verify_binaries || exit 1
-        check_claude_auth || exit 1
+        check_provider_auth || exit 1
         verify_auth
         setup_ssh
+        railway_provision                 # no-op unless KOAN_DEPLOY=railway
         setup_instance
         setup_workspace
 
@@ -242,10 +344,12 @@ case "$COMMAND" in
 
     agent)
         log "Kōan Docker — agent only"
+        railway_bootstrap                 # no-op unless KOAN_DEPLOY=railway
         verify_binaries || exit 1
-        check_claude_auth || exit 1
+        check_provider_auth || exit 1
         verify_auth
         setup_ssh
+        railway_provision                 # no-op unless KOAN_DEPLOY=railway
         setup_instance
         setup_workspace
 

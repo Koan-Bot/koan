@@ -48,11 +48,12 @@ class MessagingProvider(ABC):
     """
 
     @abstractmethod
-    def send_message(self, text: str) -> bool:
+    def send_message(self, text: str, reply_to_message_id: int = 0) -> bool:
         """Send a message with provider-specific chunking.
 
         Args:
             text: Message text to send
+            reply_to_message_id: If non-zero, reply to this message (group threading)
 
         Returns:
             True if all chunks sent successfully
@@ -96,17 +97,44 @@ class MessagingProvider(ABC):
         """
         return []
 
-    def send_typing(self) -> bool:
-        """Send a typing indicator to the channel.
+    def get_bot_username(self) -> str:
+        """Return the bot's username (without leading ``@``).
 
-        Shows the user that the bot is "thinking". The indicator typically
+        Empty string means unknown — callers must handle gracefully.
+        """
+        return ""
+
+    def send_typing(self, reply_to_message_id: int = 0, status: str = "") -> bool:
+        """Send a typing / "thinking" indicator to the channel.
+
+        Shows the user that the bot is working. The indicator typically
         expires after a few seconds (5s on Telegram). Callers that need
         a persistent indicator should use TypingIndicator context manager.
+
+        Args:
+            reply_to_message_id: If non-zero, target the conversation/thread
+                that message belongs to (used by providers like Slack whose
+                status is thread-scoped). Ignored by providers with a single
+                channel-wide indicator (e.g. Telegram).
+            status: Optional human-readable status text (e.g. "Thinking…").
+                Ignored by providers that only support a generic indicator.
 
         Returns:
             True if the action was sent (or is unsupported — no-op is success).
         """
         return True  # No-op by default; providers override if supported
+
+    def stop_typing(self, reply_to_message_id: int = 0) -> bool:
+        """Clear a persistent "thinking" indicator, if the provider has one.
+
+        Providers whose indicator auto-expires (e.g. Telegram) need do nothing.
+        Providers with a sticky status (e.g. Slack's assistant status) override
+        this to clear it.
+
+        Returns:
+            True if cleared (or nothing to clear — no-op is success).
+        """
+        return True  # No-op by default; providers override if needed
 
     def chunk_message(self, text: str, max_size: int = DEFAULT_MAX_MESSAGE_SIZE) -> List[str]:
         """Split a message into chunks respecting the provider's size limit.

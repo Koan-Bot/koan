@@ -5,21 +5,24 @@ from pathlib import Path
 PROMPTS_DIR = Path(__file__).parent.parent / "system-prompts"
 
 
-def test_submit_pr_prompt_has_github_issue_instructions():
-    """Submit-pull-request template should instruct to create GitHub issues when appropriate."""
+def test_submit_pr_prompt_has_tracker_issue_instructions():
+    """Submit-pull-request template should use provider-neutral tracker issues."""
     prompt = (PROMPTS_DIR / "submit-pull-request.md").read_text()
 
     # Must have the audit section header
     assert "# Audit Missions" in prompt
 
-    # Must mention gh issue create
-    assert "gh issue create" in prompt
+    # Must use the issue tracker helper through Koan's current interpreter,
+    # not bare python or direct gh issue commands.
+    assert "{KOAN_PYTHON} -m app.issue_cli create" in prompt
+    assert "python -m app.issue_cli create" not in prompt
+    assert "gh issue create" not in prompt
 
     # Must have skip conditions (don't create issues for trivial findings)
     assert "Skip issue creation when" in prompt
 
-    # Must check for GitHub remote first
-    assert "gh repo view" in prompt
+    # Must mention configured tracker availability
+    assert "configured issue tracker" in prompt
 
 
 def test_agent_prompt_has_all_required_placeholders():
@@ -36,6 +39,7 @@ def test_agent_prompt_has_all_required_placeholders():
         "{FOCUS_AREA}",
         "{AVAILABLE_PCT}",
         "{MISSION_INSTRUCTION}",
+        "{KOAN_PYTHON}",
     ]
 
     for placeholder in required_placeholders:
@@ -135,3 +139,71 @@ def test_contemplative_prompt_anti_noise_rules():
     # Must discourage empty/generic output
     assert "silence" in prompt.lower() or "silent" in prompt.lower()
     assert "noise" in prompt.lower() or "generic" in prompt.lower()
+
+
+def test_agent_prompt_uses_mktemp_not_fixed_tmp_names():
+    """Agent prompt must not instruct fixed /tmp filenames.
+
+    Fixed names (e.g. /tmp/issue.md) collide across users running Kōan on the
+    same host. The prompt must use mktemp patterns so each run gets a unique
+    file. See koan_tmp_dir() / the multi-instance temp-collision fix.
+    """
+    prompt = (PROMPTS_DIR / "agent.md").read_text()
+
+    for fixed in ("/tmp/test-output.txt", "/tmp/issue.md", "/tmp/comment.md"):
+        assert fixed not in prompt, f"Fixed /tmp path still present: {fixed}"
+
+    assert "mktemp /tmp/koan-test-output-XXXXXX" in prompt
+    assert "mktemp /tmp/koan-issue-XXXXXX" in prompt
+    assert "mktemp /tmp/koan-comment-XXXXXX" in prompt
+    _assert_mktemp_templates_are_bsd_portable(prompt)
+
+
+def test_submit_pr_prompt_uses_mktemp_not_fixed_tmp_names():
+    """Submit-PR prompt must use a mktemp pattern for the audit issue body."""
+    prompt = (PROMPTS_DIR / "submit-pull-request.md").read_text()
+
+    assert "/tmp/koan-audit-issue.md" not in prompt
+    assert "mktemp /tmp/koan-audit-issue-XXXXXX" in prompt
+    _assert_mktemp_templates_are_bsd_portable(prompt)
+
+
+def test_pr_creation_prompts_use_body_file_not_heredoc():
+    """PR creation in prompts must use --body-file with mktemp, not --body heredoc.
+
+    The heredoc pattern ``--body "$(cat <<'EOF'...)"`` causes Codex agents to
+    improvise with ``--body @/tmp/...`` (which gh doesn't expand), producing
+    literal file paths as PR bodies.  Using ``--body-file "$pr_body"`` is
+    unambiguous and works across all providers.
+    """
+    partials = PROMPTS_DIR / "_partials"
+
+    impl = (partials / "implementation-workflow.md").read_text()
+    assert '--body-file "$pr_body"' in impl
+    assert "mktemp /tmp/koan-pr-body-XXXXXX" in impl
+    assert "--body \"$(cat" not in impl
+
+    fork = (partials / "pr-submit-fork.md").read_text()
+    assert '--body-file "$pr_body"' in fork
+
+    _assert_mktemp_templates_are_bsd_portable(impl)
+
+
+def _assert_mktemp_templates_are_bsd_portable(prompt: str):
+    """Every `mktemp` template must end its X-run at the end of the path.
+
+    BSD/macOS `mktemp` only substitutes a *trailing* run of X's; a suffix after
+    the X's (e.g. `mktemp /tmp/foo-XXXXXX.md`) is taken literally, yielding a
+    fixed filename and reintroducing the cross-user collision this fix removes.
+    Guard against any `XXXXXX<suffix>` form.
+    """
+    import re
+
+    for m in re.finditer(r"mktemp\s+(\S+)", prompt):
+        # Strip trailing shell punctuation (the template often sits inside a
+        # $(...) command substitution, so the token can end with `)`, `;`, etc.).
+        template = m.group(1).rstrip(');"\'`')
+        assert re.search(r"X+$", template), (
+            f"mktemp template {template!r} does not end in X's — not BSD/macOS "
+            "portable (suffix after X's is taken literally). Put the X-run last."
+        )

@@ -1,14 +1,22 @@
 """Tests for git_prep.py — pre-mission git preparation."""
 
+import os
+
 import pytest
 from unittest.mock import patch, call
 
 from app.git_prep import (
+    _authenticated_fetch_url,
+    _fetch_branch_refspec,
+    _fetch_with_https_fallback,
+    _get_remote_url,
+    _sync_secondary_remotes,
     get_upstream_remote,
     prepare_project_branch,
     PrepResult,
     detect_remote_default_branch,
 )
+from tests.conftest import patched_run_iteration
 
 
 # --- get_upstream_remote ---
@@ -95,43 +103,383 @@ class TestDetectRemoteDefaultBranch:
 
     def test_local_ref_fails_falls_to_ls_remote(self):
         """When symbolic-ref fails, falls back to ls-remote."""
-        with patch("app.git_prep.run_git") as mock_git:
-            mock_git.side_effect = [
-                (1, "", "not a symbolic ref"),  # symbolic-ref fails
-                (0, "ref: refs/heads/master\tHEAD\nabc123\tHEAD", ""),  # ls-remote
-            ]
+        def side_effect(*args, **kwargs):
+            if args[0] == "symbolic-ref":
+                return (1, "", "not a symbolic ref")
+            if args[0] == "remote":
+                return (1, "", "no remote")
+            if args[0] == "ls-remote":
+                return (0, "ref: refs/heads/master\tHEAD\nabc123\tHEAD", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect):
             result = detect_remote_default_branch("origin", "/proj")
         assert result == "master"
 
     def test_both_methods_fail_returns_main(self):
         """When both methods fail, returns 'main' as fallback."""
-        with patch("app.git_prep.run_git") as mock_git:
-            mock_git.side_effect = [
-                (1, "", "error"),  # symbolic-ref fails
-                (1, "", "error"),  # ls-remote fails
-            ]
+        def side_effect(*args, **kwargs):
+            return (1, "", "error")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect):
             result = detect_remote_default_branch("origin", "/proj")
         assert result == "main"
 
     def test_empty_symbolic_ref_falls_to_ls_remote(self):
         """Empty symbolic-ref output falls back to ls-remote."""
-        with patch("app.git_prep.run_git") as mock_git:
-            mock_git.side_effect = [
-                (0, "", ""),  # symbolic-ref returns empty
-                (0, "ref: refs/heads/develop\tHEAD\nabc\tHEAD", ""),
-            ]
+        def side_effect(*args, **kwargs):
+            if args[0] == "symbolic-ref":
+                return (0, "", "")
+            if args[0] == "remote":
+                return (1, "", "no remote")
+            if args[0] == "ls-remote":
+                return (0, "ref: refs/heads/develop\tHEAD\nabc\tHEAD", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect):
             result = detect_remote_default_branch("origin", "/proj")
         assert result == "develop"
 
     def test_ls_remote_no_ref_line(self):
         """ls-remote output with no ref: line falls back to 'main'."""
-        with patch("app.git_prep.run_git") as mock_git:
-            mock_git.side_effect = [
-                (1, "", "error"),
-                (0, "abc123\tHEAD", ""),  # no ref: line
-            ]
+        def side_effect(*args, **kwargs):
+            if args[0] == "symbolic-ref":
+                return (1, "", "error")
+            if args[0] == "remote":
+                return (1, "", "no remote")
+            if args[0] == "ls-remote":
+                return (0, "abc123\tHEAD", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect):
             result = detect_remote_default_branch("origin", "/proj")
         assert result == "main"
+
+
+# --- HTTPS token fallback helpers ---
+
+
+class TestGetRemoteUrl:
+    """Tests for _get_remote_url helper."""
+
+    def test_returns_url_on_success(self):
+        with patch("app.git_prep.run_git", return_value=(0, "https://github.com/owner/repo.git", "")):
+            assert _get_remote_url("origin", "/proj") == "https://github.com/owner/repo.git"
+
+    def test_returns_empty_on_failure(self):
+        with patch("app.git_prep.run_git", return_value=(1, "", "no such remote")):
+            assert _get_remote_url("origin", "/proj") == ""
+
+    def test_strips_whitespace(self):
+        with patch("app.git_prep.run_git", return_value=(0, "  https://github.com/x/y.git \n", "")):
+            assert _get_remote_url("origin", "/proj") == "https://github.com/x/y.git"
+
+
+class TestAuthenticatedFetchUrl:
+    """Tests for _authenticated_fetch_url helper."""
+
+    def test_https_github_url_with_token(self):
+        with patch("app.github.run_gh", return_value="ghp_abc123\n"):
+            url, token = _authenticated_fetch_url("https://github.com/owner/repo.git")
+        assert url == "https://x-access-token:ghp_abc123@github.com/owner/repo.git"
+        assert token == "ghp_abc123"
+
+    def test_https_github_url_without_dotgit(self):
+        with patch("app.github.run_gh", return_value="ghp_abc123\n"):
+            url, token = _authenticated_fetch_url("https://github.com/owner/repo")
+        assert url == "https://x-access-token:ghp_abc123@github.com/owner/repo.git"
+        assert token == "ghp_abc123"
+
+    def test_ssh_url_returns_none(self):
+        url, token = _authenticated_fetch_url("git@github.com:owner/repo.git")
+        assert url is None
+        assert token is None
+
+    def test_non_github_https_returns_none(self):
+        url, token = _authenticated_fetch_url("https://gitlab.com/owner/repo.git")
+        assert url is None
+        assert token is None
+
+    def test_no_token_available(self):
+        with patch("app.github.run_gh", side_effect=RuntimeError("no token")):
+            url, token = _authenticated_fetch_url("https://github.com/owner/repo.git")
+        assert url is None
+        assert token is None
+
+    def test_empty_token(self):
+        with patch("app.github.run_gh", return_value="  \n"):
+            url, token = _authenticated_fetch_url("https://github.com/owner/repo.git")
+        assert url is None
+        assert token is None
+
+    def test_empty_url(self):
+        url, token = _authenticated_fetch_url("")
+        assert url is None
+        assert token is None
+
+
+class TestFetchWithHttpsFallback:
+    """Tests for _fetch_with_https_fallback."""
+
+    def test_success_on_first_try(self):
+        """Successful fetch returns immediately — no fallback attempted."""
+        with patch("app.git_prep.run_git", return_value=(0, "", "")) as mock_git:
+            rc, stdout, stderr = _fetch_with_https_fallback("origin", "main", "/proj")
+        assert rc == 0
+        mock_git.assert_called_once()
+
+    def test_non_https_remote_no_fallback(self):
+        """SSH remote failure returns original error — no fallback."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "fetch":
+                return (1, "", "network error")
+            if args[0] == "remote":
+                return (0, "git@github.com:owner/repo.git", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect):
+            rc, _, stderr = _fetch_with_https_fallback("origin", "main", "/proj")
+        assert rc == 1
+        assert stderr == "network error"
+
+    def test_https_remote_retries_with_token(self):
+        """HTTPS remote failure retries with authenticated URL."""
+        call_count = {"fetch": 0}
+
+        def side_effect(*args, **kwargs):
+            if args[0] == "fetch":
+                call_count["fetch"] += 1
+                if call_count["fetch"] == 1:
+                    return (1, "", "could not read Username")
+                return (0, "", "")
+            if args[0] == "remote":
+                return (0, "https://github.com/owner/repo.git", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.github.run_gh", return_value="ghp_token123\n"):
+            rc, _, _ = _fetch_with_https_fallback("origin", "main", "/proj")
+        assert rc == 0
+        assert call_count["fetch"] == 2
+
+    def test_https_fallback_redacts_token_from_stderr(self):
+        """Token is redacted from stderr on fallback failure."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "fetch":
+                return (1, "", "fatal: auth failed for ghp_secret123")
+            if args[0] == "remote":
+                return (0, "https://github.com/owner/repo.git", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.github.run_gh", return_value="ghp_secret123\n"):
+            rc, _, stderr = _fetch_with_https_fallback("origin", "main", "/proj")
+        assert rc == 1
+        assert "ghp_secret123" not in stderr
+        assert "***" in stderr
+
+    def test_https_remote_no_token_no_fallback(self):
+        """HTTPS remote with no available token returns original error."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "fetch":
+                return (1, "", "could not read Username")
+            if args[0] == "remote":
+                return (0, "https://github.com/owner/repo.git", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.github.run_gh", side_effect=RuntimeError("no auth")):
+            rc, _, stderr = _fetch_with_https_fallback("origin", "main", "/proj")
+        assert rc == 1
+        assert "could not read Username" in stderr
+
+
+class TestDetectRemoteDefaultBranchHttpsFallback:
+    """Tests for HTTPS fallback in detect_remote_default_branch."""
+
+    def test_ls_remote_fallback_on_https_remote(self):
+        """ls-remote falls back to authenticated URL on HTTPS remote."""
+        call_log = []
+
+        def side_effect(*args, **kwargs):
+            call_log.append(args)
+            if args[0] == "symbolic-ref":
+                return (1, "", "not a symbolic ref")
+            if args[0] == "remote":
+                return (0, "https://github.com/owner/repo.git", "")
+            if args[0] == "ls-remote":
+                target = args[2]
+                if target == "origin":
+                    return (1, "", "could not read Username")
+                return (0, "ref: refs/heads/develop\tHEAD\nabc\tHEAD", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.github.run_gh", return_value="ghp_tok\n"):
+            result = detect_remote_default_branch("origin", "/proj")
+        assert result == "develop"
+        ls_calls = [c for c in call_log if c[0] == "ls-remote"]
+        assert len(ls_calls) == 2
+
+
+class TestPrepareProjectBranchHttpsFallback:
+    """Tests for HTTPS token fallback in prepare_project_branch."""
+
+    def test_https_fetch_retries_with_token_and_succeeds(self):
+        """Fetch failure on HTTPS remote retries with token, mission proceeds."""
+        fetch_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0] if args else ""
+            if cmd == "rev-parse":
+                return (0, "feature", "")
+            if cmd == "fetch":
+                fetch_count["n"] += 1
+                if fetch_count["n"] == 1:
+                    return (1, "", "could not read Username for 'https://github.com'")
+                return (0, "", "")
+            if cmd == "remote":
+                if len(args) > 1 and args[1] == "get-url":
+                    if len(args) > 2 and args[2] == "upstream":
+                        return (1, "", "no such remote")
+                    return (0, "https://github.com/owner/repo.git", "")
+                return (1, "", "no such remote")
+            if cmd == "status":
+                return (0, "", "")
+            if cmd == "checkout":
+                return (0, "", "")
+            if cmd == "merge":
+                return (0, "", "")
+            return (1, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.git_prep.load_projects_config", return_value=None), \
+             patch("app.git_prep.get_project_submit_to_repository", return_value={}), \
+             patch("app.git_prep.get_project_auto_merge", return_value={"base_branch": "main"}), \
+             patch("app.github.run_gh", return_value="ghp_tok\n"):
+            result = prepare_project_branch("/proj", "myproj", "/koan")
+
+        assert result.success is True
+        assert fetch_count["n"] == 2
+
+
+# --- _fetch_branch_refspec ---
+
+
+class TestFetchBranchRefspec:
+    """Tests for explicit-refspec fetch helper."""
+
+    def test_success_returns_true(self):
+        with patch("app.git_prep.run_git", return_value=(0, "", "")):
+            assert _fetch_branch_refspec("origin", "main", "/proj") is True
+
+    def test_failure_returns_false(self):
+        with patch("app.git_prep.run_git", return_value=(1, "", "error")):
+            assert _fetch_branch_refspec("origin", "main", "/proj") is False
+
+    def test_uses_explicit_refspec(self):
+        with patch("app.git_prep.run_git", return_value=(0, "", "")) as mock_git:
+            _fetch_branch_refspec("upstream", "master", "/proj")
+        mock_git.assert_called_once_with(
+            "fetch", "upstream",
+            "+refs/heads/master:refs/remotes/upstream/master",
+            cwd="/proj", timeout=15,
+        )
+
+    def test_custom_timeout(self):
+        with patch("app.git_prep.run_git", return_value=(0, "", "")) as mock_git:
+            _fetch_branch_refspec("origin", "main", "/proj", timeout=30)
+        assert mock_git.call_args[1]["timeout"] == 30
+
+
+# --- _sync_secondary_remotes ---
+
+
+class TestSyncSecondaryRemotes:
+    """Tests for multi-remote base branch sync."""
+
+    def test_fetches_non_primary_remotes(self):
+        """Fetches base branch from all remotes except the primary."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "remote":
+                return (0, "origin\nupstream\nmyfork", "")
+            if args[0] == "fetch":
+                return (0, "", "")
+            return (1, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect) as mock_git:
+            _sync_secondary_remotes("main", "upstream", "/proj")
+
+        fetch_calls = [
+            c for c in mock_git.call_args_list
+            if c[0][0] == "fetch"
+        ]
+        fetched_remotes = [c[0][1] for c in fetch_calls]
+        assert "origin" in fetched_remotes
+        assert "myfork" in fetched_remotes
+        assert "upstream" not in fetched_remotes
+
+    def test_skips_primary_remote(self):
+        """Primary remote is excluded from secondary fetch."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "remote":
+                return (0, "origin\nupstream", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect) as mock_git:
+            _sync_secondary_remotes("main", "origin", "/proj")
+
+        fetch_calls = [c for c in mock_git.call_args_list if c[0][0] == "fetch"]
+        assert len(fetch_calls) == 1
+        assert fetch_calls[0][0][1] == "upstream"
+
+    def test_no_remotes_listed(self):
+        """git remote failure returns early — no fetches attempted."""
+        with patch("app.git_prep.run_git", return_value=(1, "", "err")) as mock_git:
+            _sync_secondary_remotes("main", "origin", "/proj")
+
+        fetch_calls = [c for c in mock_git.call_args_list if c[0][0] == "fetch"]
+        assert len(fetch_calls) == 0
+
+    def test_single_remote_no_secondary(self):
+        """Only one remote (same as primary) — nothing to fetch."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "remote":
+                return (0, "origin", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect) as mock_git:
+            _sync_secondary_remotes("main", "origin", "/proj")
+
+        fetch_calls = [c for c in mock_git.call_args_list if c[0][0] == "fetch"]
+        assert len(fetch_calls) == 0
+
+    def test_secondary_fetch_failure_nonfatal(self):
+        """Failed secondary fetch is logged, not raised."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "remote":
+                return (0, "origin\nbroken-remote", "")
+            if args[0] == "fetch":
+                return (1, "", "network error")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect):
+            _sync_secondary_remotes("main", "origin", "/proj")
+
+    def test_uses_explicit_refspec(self):
+        """Secondary fetches use explicit refspec for reliable ref updates."""
+        def side_effect(*args, **kwargs):
+            if args[0] == "remote":
+                return (0, "origin\nupstream", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect) as mock_git:
+            _sync_secondary_remotes("main", "origin", "/proj")
+
+        fetch_calls = [c for c in mock_git.call_args_list if c[0][0] == "fetch"]
+        assert len(fetch_calls) == 1
+        refspec = fetch_calls[0][0][2]
+        assert refspec == "+refs/heads/main:refs/remotes/upstream/main"
 
 
 # --- PrepResult ---
@@ -219,6 +567,49 @@ class TestPrepareProjectBranch:
         assert result.stashed is False
         assert result.previous_branch == "feature-branch"
         assert result.error is None
+
+    def test_launching_repo_on_custom_branch_stays_put(self):
+        """The launching repo on a custom branch is left where it is.
+
+        When project_path resolves to the same repo as koan_root and the repo
+        is on a non-base branch, prep must not checkout/reset to base — it
+        returns early so the operator can test their development branch.
+        """
+        stack, mocks = self._patch_all()  # rev-parse → "feature-branch"
+        with stack:
+            result = prepare_project_branch("/koan", "koan", "/koan")
+
+        assert result.success is True
+        assert result.base_branch == "feature-branch"
+        assert result.previous_branch == "feature-branch"
+        # No destructive git ran past the guard.
+        called_cmds = [c.args[0] for c in mocks["run_git"].call_args_list if c.args]
+        assert "checkout" not in called_cmds
+        assert "reset" not in called_cmds
+        assert "fetch" not in called_cmds
+
+    def test_launching_repo_on_base_branch_runs_normally(self):
+        """The launching repo already on the base branch prepares normally."""
+        side_effect = _make_run_git_side_effect({"rev-parse": (0, "main", "")})
+        stack, mocks = self._patch_all(run_git_side_effect=side_effect)
+        with stack:
+            result = prepare_project_branch("/koan", "koan", "/koan")
+
+        assert result.success is True
+        assert result.base_branch == "main"
+        called_cmds = [c.args[0] for c in mocks["run_git"].call_args_list if c.args]
+        assert "checkout" in called_cmds
+
+    def test_non_launching_repo_on_custom_branch_resets_to_base(self):
+        """A regular managed project on a custom branch still resets to base."""
+        stack, mocks = self._patch_all()  # rev-parse → "feature-branch"
+        with stack:
+            result = prepare_project_branch("/proj", "myproj", "/koan")
+
+        assert result.success is True
+        assert result.base_branch == "main"
+        called_cmds = [c.args[0] for c in mocks["run_git"].call_args_list if c.args]
+        assert "checkout" in called_cmds
 
     def test_dirty_working_tree_stashed(self):
         """Dirty working tree is stashed."""
@@ -802,32 +1193,100 @@ class TestPrepareProjectBranch:
         assert "stash" not in calls
 
 
+class TestPrepareProjectBranchSecondarySync:
+    """Verify prepare_project_branch syncs secondary remotes."""
+
+    def test_secondary_sync_called_on_success(self):
+        """_sync_secondary_remotes is called after a successful primary sync."""
+        side_effect = _make_run_git_side_effect()
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.git_prep.load_projects_config", return_value=None), \
+             patch("app.git_prep.get_project_submit_to_repository", return_value={}), \
+             patch("app.git_prep.get_project_auto_merge", return_value={"base_branch": "main"}), \
+             patch("app.git_prep._sync_secondary_remotes") as mock_sync:
+            result = prepare_project_branch("/proj", "myproj", "/koan")
+
+        assert result.success is True
+        mock_sync.assert_called_once_with("main", "origin", "/proj")
+
+    def test_secondary_sync_not_called_on_failure(self):
+        """_sync_secondary_remotes is NOT called when primary sync fails."""
+        side_effect = _make_run_git_side_effect({
+            "fetch": (1, "", "Could not resolve host"),
+        })
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.git_prep.load_projects_config", return_value=None), \
+             patch("app.git_prep.get_project_submit_to_repository", return_value={}), \
+             patch("app.git_prep.get_project_auto_merge", return_value={"base_branch": "main"}), \
+             patch("app.git_prep._sync_secondary_remotes") as mock_sync:
+            result = prepare_project_branch("/proj", "myproj", "/koan")
+
+        assert result.success is False
+        mock_sync.assert_not_called()
+
+    def test_secondary_sync_uses_correct_remote(self):
+        """When upstream is primary, secondary sync receives 'upstream'."""
+        def side_effect(*args, **kwargs):
+            cmd = args[0] if args else ""
+            if cmd == "rev-parse":
+                return (0, "feature", "")
+            if cmd == "remote":
+                return (0, "git@github.com:upstream/repo.git", "")
+            if cmd == "fetch":
+                return (0, "", "")
+            if cmd == "status":
+                return (0, "", "")
+            if cmd == "checkout":
+                return (0, "", "")
+            if cmd == "merge":
+                return (0, "", "")
+            return (0, "", "")
+
+        with patch("app.git_prep.run_git", side_effect=side_effect), \
+             patch("app.git_prep.load_projects_config", return_value=None), \
+             patch("app.git_prep.get_project_submit_to_repository", return_value={}), \
+             patch("app.git_prep.get_project_auto_merge", return_value={"base_branch": "main"}), \
+             patch("app.git_prep._sync_secondary_remotes") as mock_sync:
+            result = prepare_project_branch("/proj", "myproj", "/koan")
+
+        assert result.success is True
+        mock_sync.assert_called_once_with("main", "upstream", "/proj")
+
+
 # --- Integration: _run_iteration calls git prep ---
 
 
 class TestRunIterationIntegration:
-    """Verify git prep is called from run.py's _run_iteration."""
+    """Verify git prep is called from _run_iteration (behavioral)."""
 
-    def test_git_prep_called_in_run_iteration(self):
-        """prepare_project_branch is imported and called in _run_iteration."""
-        # Verify the import exists in run.py by checking the source
-        import inspect
-        from app import run
+    def test_git_prep_called_in_run_iteration(self, tmp_path):
+        """prepare_project_branch is called with project args during iteration."""
+        from app.run import _run_iteration
 
-        source = inspect.getsource(run)
-        assert "from app.git_prep import prepare_project_branch" in source
-        assert "prepare_project_branch(project_path, project_name, koan_root)" in source
+        instance = str(tmp_path / "instance")
+        os.makedirs(instance, exist_ok=True)
 
-    def test_git_prep_failure_aborts_iteration(self):
+        with patched_run_iteration(PrepResult(success=True)) as mock_prep:
+            _run_iteration(
+                koan_root=str(tmp_path), instance=instance,
+                projects=[("testproj", str(tmp_path))],
+                count=0, max_runs=10, interval=30, git_sync_interval=5,
+            )
+
+        mock_prep.assert_called_once_with("/tmp/testproj", "testproj", str(tmp_path))
+
+    def test_git_prep_failure_aborts_iteration(self, tmp_path):
         """Git prep failure aborts the iteration — returns False."""
-        import inspect
-        from app import run
+        from app.run import _run_iteration
 
-        source = inspect.getsource(run)
-        # Find the git prep block — it should abort on failure
-        idx = source.find("prepare_project_branch(project_path")
-        assert idx > 0
-        # After the call, there should be a return False on failure
-        following = source[idx:idx + 600]
-        assert "return False" in following
-        assert "abort" in following.lower()
+        instance = str(tmp_path / "instance")
+        os.makedirs(instance, exist_ok=True)
+
+        with patched_run_iteration(PrepResult(success=False, error="branch conflict")):
+            result = _run_iteration(
+                koan_root=str(tmp_path), instance=instance,
+                projects=[("testproj", str(tmp_path))],
+                count=0, max_runs=10, interval=30, git_sync_interval=5,
+            )
+
+        assert result is False

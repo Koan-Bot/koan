@@ -1,0 +1,405 @@
+{% extends "base.html" %}
+{% block title_suffix %} — Config{% endblock %}
+{% block page_title %}Config{% endblock %}
+{% block content %}
+<p class="k-body-sm k-text-muted k-mb-4">View and edit instance configuration files.</p>
+
+<!-- Tab bar -->
+<div style="display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:1rem;">
+    <div class="k-tabs" role="tablist" style="margin-bottom:0;">
+        <button class="k-tab" role="tab" aria-selected="true" data-tab="config-yaml">config.yaml</button>
+        <button class="k-tab" role="tab" aria-selected="false" data-tab="projects-yaml">projects.yaml</button>
+    </div>
+    <label style="display:flex; align-items:center; gap:0.4rem; font-size:0.82rem; color:var(--text-muted); cursor:pointer; padding-bottom:0.6rem; white-space:nowrap; user-select:none;">
+        <input type="checkbox" id="hide-comments-cb" style="cursor:pointer;"> Hide comments
+    </label>
+</div>
+
+<!-- config.yaml panel -->
+<div class="config-panel active k-mt-4" id="panel-config-yaml" role="tabpanel">
+    <div class="k-card" id="section-config-yaml">
+        <div class="k-card__header">
+            <h2 class="k-card__title">config.yaml</h2>
+            <div class="k-row k-gap-2">
+                <span id="config-yaml-status" class="k-body-sm"></span>
+                <button class="k-btn k-btn--secondary k-btn--sm" id="config-yaml-edit">Edit</button>
+                <button class="k-btn k-btn--primary k-btn--sm" id="config-yaml-save" style="display:none;">Save</button>
+                <button class="k-btn k-btn--ghost k-btn--sm" id="config-yaml-cancel" style="display:none;">Cancel</button>
+            </div>
+        </div>
+        <div id="config-yaml-view">
+            <pre id="config-yaml-pre" class="yaml-highlighted"></pre>
+        </div>
+        <div id="config-yaml-editor" style="display:none;">
+            <textarea id="config-yaml-textarea" class="k-textarea k-code" spellcheck="false" style="min-height:400px;tab-size:2;"></textarea>
+            <div id="config-yaml-error" class="k-alert k-alert--danger k-mt-2" style="display:none;">
+                <div class="k-alert__body k-code" id="config-yaml-error-text"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- projects.yaml panel -->
+<div class="config-panel k-mt-4" id="panel-projects-yaml" role="tabpanel" style="display:none;">
+    <div class="k-card" id="section-projects-yaml">
+        <div class="k-card__header">
+            <h2 class="k-card__title">projects.yaml</h2>
+            <div class="k-row k-gap-2">
+                <span id="projects-yaml-status" class="k-body-sm"></span>
+                <button class="k-btn k-btn--secondary k-btn--sm" id="projects-yaml-edit">Edit</button>
+                <button class="k-btn k-btn--primary k-btn--sm" id="projects-yaml-save" style="display:none;">Save</button>
+                <button class="k-btn k-btn--ghost k-btn--sm" id="projects-yaml-cancel" style="display:none;">Cancel</button>
+            </div>
+        </div>
+        <div id="projects-yaml-view">
+            <pre id="projects-yaml-pre" class="yaml-highlighted"></pre>
+        </div>
+        <div id="projects-yaml-editor" style="display:none;">
+            <textarea id="projects-yaml-textarea" class="k-textarea k-code" spellcheck="false" style="min-height:300px;tab-size:2;"></textarea>
+            <div id="projects-yaml-error" class="k-alert k-alert--danger k-mt-2" style="display:none;">
+                <div class="k-alert__body k-code" id="projects-yaml-error-text"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Restart -->
+<div class="k-card k-mt-4" id="section-restart">
+    <div class="k-row-between">
+        <div>
+            <h2 class="k-card__title">Service Control</h2>
+            <p class="k-body-sm k-text-muted k-mt-2">Restart the main agent service to apply configuration changes.</p>
+        </div>
+        <button class="k-btn k-btn--sm" id="restart-btn" style="background:var(--warning);color:var(--text-inverse);font-weight:var(--fw-semibold);">Restart Service</button>
+    </div>
+    <div id="restart-status" class="k-alert k-mt-3" style="display:none;">
+        <div class="k-alert__body" id="restart-status-text"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var _configRaw = null;
+    var _projectsRaw = null;
+    var _hideComments = false;
+
+    /* ------------------------------------------------------------------ */
+    /* Tab switching                                                       */
+    /* ------------------------------------------------------------------ */
+    var tabs = document.querySelectorAll('.k-tab');
+    tabs.forEach(function (tab) {
+        tab.addEventListener('click', function () {
+            var target = this.getAttribute('data-tab');
+            tabs.forEach(function (t) {
+                t.classList.remove('active');
+                t.setAttribute('aria-selected', 'false');
+            });
+            this.classList.add('active');
+            this.setAttribute('aria-selected', 'true');
+            document.querySelectorAll('.config-panel').forEach(function (p) {
+                p.style.display = 'none';
+                p.classList.remove('active');
+            });
+            var panel = document.getElementById('panel-' + target);
+            panel.style.display = '';
+            panel.classList.add('active');
+        });
+    });
+
+    /* ------------------------------------------------------------------ */
+    /* Hide-comments toggle                                                */
+    /* ------------------------------------------------------------------ */
+    document.getElementById('hide-comments-cb').addEventListener('change', function () {
+        _hideComments = this.checked;
+        renderYaml('config-yaml', _configRaw, 'config.yaml');
+        renderYaml('projects-yaml', _projectsRaw, 'projects.yaml');
+    });
+
+    /* ------------------------------------------------------------------ */
+    /* YAML syntax highlighting (pure JS, no dependencies)                 */
+    /* ------------------------------------------------------------------ */
+    function highlightYaml(text) {
+        if (!text) return '';
+        var lines = text.split('\n');
+        if (_hideComments) {
+            lines = lines.filter(function (line) { return !/^\s*#/.test(line); });
+            var collapsed = [];
+            var lastBlank = false;
+            lines.forEach(function (line) {
+                var isBlank = !line.trim();
+                if (isBlank && lastBlank) return;
+                collapsed.push(line);
+                lastBlank = isBlank;
+            });
+            lines = collapsed;
+        }
+        return lines.map(function (line) {
+            if (/^\s*#/.test(line)) {
+                return '<span class="hl-comment">' + escHtml(line) + '</span>';
+            }
+            var m = line.match(/^(\s*)([\w][\w.\-]*)\s*(:)(.*)/);
+            if (m) {
+                var indent = escHtml(m[1]);
+                var key = '<span class="hl-key">' + escHtml(m[2]) + '</span>';
+                var colon = '<span class="hl-colon">:</span>';
+                var val = highlightValue(m[4]);
+                return indent + key + colon + val;
+            }
+            var listMatch = line.match(/^(\s*)(- )(.*)/);
+            if (listMatch) {
+                var li = escHtml(listMatch[1]) + '<span class="hl-list">- </span>';
+                var rest = listMatch[3];
+                var kvMatch = rest.match(/^([\w][\w.\-]*)\s*(:)(.*)/);
+                if (kvMatch) {
+                    li += '<span class="hl-key">' + escHtml(kvMatch[1]) + '</span>';
+                    li += '<span class="hl-colon">:</span>';
+                    li += highlightValue(kvMatch[3]);
+                } else {
+                    li += highlightValue(' ' + rest).replace(/^./, '');
+                }
+                return li;
+            }
+            return escHtml(line);
+        }).join('\n');
+    }
+
+    function highlightValue(val) {
+        if (!val || !val.trim()) return escHtml(val);
+        var trimmed = val.trim();
+        if (trimmed === '<redacted>') {
+            return escHtml(val.substring(0, val.indexOf(trimmed))) + '<span class="hl-redacted">' + escHtml(trimmed) + '</span>';
+        }
+        if (/^(true|false|yes|no|on|off)$/i.test(trimmed)) {
+            return escHtml(val.substring(0, val.indexOf(trimmed))) + '<span class="hl-bool">' + escHtml(trimmed) + '</span>';
+        }
+        if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+            return escHtml(val.substring(0, val.indexOf(trimmed))) + '<span class="hl-num">' + escHtml(trimmed) + '</span>';
+        }
+        if (/^(null|~)$/i.test(trimmed)) {
+            return escHtml(val.substring(0, val.indexOf(trimmed))) + '<span class="hl-null">' + escHtml(trimmed) + '</span>';
+        }
+        if (/^["'].*["']$/.test(trimmed)) {
+            return escHtml(val.substring(0, val.indexOf(trimmed))) + '<span class="hl-string">' + escHtml(trimmed) + '</span>';
+        }
+        var commentIdx = val.indexOf(' #');
+        if (commentIdx > 0) {
+            if (_hideComments) {
+                return '<span class="hl-value">' + escHtml(val.substring(0, commentIdx)) + '</span>';
+            }
+            return '<span class="hl-value">' + escHtml(val.substring(0, commentIdx)) + '</span><span class="hl-comment">' + escHtml(val.substring(commentIdx)) + '</span>';
+        }
+        return '<span class="hl-value">' + escHtml(val) + '</span>';
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Load config files                                                    */
+    /* ------------------------------------------------------------------ */
+    function loadConfig() {
+        document.getElementById('config-yaml-pre').textContent = 'Loading…';
+        document.getElementById('projects-yaml-pre').textContent = 'Loading…';
+        fetch('/api/agent/config')
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                _configRaw = data.config_yaml;
+                _projectsRaw = data.projects_yaml;
+                renderYaml('config-yaml', _configRaw, 'config.yaml');
+                renderYaml('projects-yaml', _projectsRaw, 'projects.yaml');
+            })
+            .catch(function (err) {
+                console.error('Config load failed:', err);
+                document.getElementById('config-yaml-pre').textContent = 'Error loading config.';
+                document.getElementById('projects-yaml-pre').textContent = 'Error loading projects config.';
+            });
+    }
+
+    function renderYaml(prefix, content, label) {
+        var pre = document.getElementById(prefix + '-pre');
+        if (content === null) {
+            pre.innerHTML = '<span class="k-text-muted">' + escHtml(label) + ' not found.</span>';
+        } else {
+            pre.innerHTML = highlightYaml(content);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Edit / Save / Cancel for each config file                           */
+    /* ------------------------------------------------------------------ */
+    function setupEditor(prefix, getContent, apiField) {
+        var editBtn = document.getElementById(prefix + '-edit');
+        var saveBtn = document.getElementById(prefix + '-save');
+        var cancelBtn = document.getElementById(prefix + '-cancel');
+        var viewEl = document.getElementById(prefix + '-view');
+        var editorEl = document.getElementById(prefix + '-editor');
+        var textarea = document.getElementById(prefix + '-textarea');
+        var errorEl = document.getElementById(prefix + '-error');
+        var errorText = document.getElementById(prefix + '-error-text');
+        var statusEl = document.getElementById(prefix + '-status');
+
+        editBtn.addEventListener('click', function () {
+            var raw = getContent();
+            textarea.value = raw === null ? '' : raw;
+            viewEl.style.display = 'none';
+            editorEl.style.display = 'block';
+            editBtn.style.display = 'none';
+            saveBtn.style.display = '';
+            cancelBtn.style.display = '';
+            errorEl.style.display = 'none';
+            statusEl.textContent = '';
+        });
+
+        cancelBtn.addEventListener('click', function () {
+            viewEl.style.display = '';
+            editorEl.style.display = 'none';
+            editBtn.style.display = '';
+            saveBtn.style.display = 'none';
+            cancelBtn.style.display = 'none';
+            errorEl.style.display = 'none';
+            statusEl.textContent = '';
+        });
+
+        saveBtn.addEventListener('click', function () {
+            var content = textarea.value;
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Validating…';
+            errorEl.style.display = 'none';
+            statusEl.textContent = '';
+
+            fetch('/api/config/' + apiField, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: content })
+            })
+                .then(function (r) {
+                    if (!r.ok && r.headers.get('content-type') && r.headers.get('content-type').indexOf('application/json') === -1) {
+                        throw new Error('Server error (HTTP ' + r.status + ')');
+                    }
+                    return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+                })
+                .then(function (res) {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Save';
+                    if (res.data.ok) {
+                        if (apiField === 'config') { _configRaw = content; }
+                        else { _projectsRaw = content; }
+                        renderYaml(prefix, content, apiField + '.yaml');
+                        viewEl.style.display = '';
+                        editorEl.style.display = 'none';
+                        editBtn.style.display = '';
+                        saveBtn.style.display = 'none';
+                        cancelBtn.style.display = 'none';
+                        statusEl.innerHTML = '<span class="k-text-success">✓ Saved</span>';
+                        setTimeout(function () { statusEl.textContent = ''; }, 3000);
+                    } else {
+                        errorText.textContent = res.data.error || 'Validation failed.';
+                        errorEl.style.display = '';
+                    }
+                })
+                .catch(function (err) {
+                    console.error('Config save failed:', err);
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Save';
+                    errorText.textContent = err.message || 'Network error — could not save.';
+                    errorEl.style.display = '';
+                });
+        });
+
+        textarea.addEventListener('keydown', function (e) {
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                var start = this.selectionStart;
+                var end = this.selectionEnd;
+                this.value = this.value.substring(0, start) + '  ' + this.value.substring(end);
+                this.selectionStart = this.selectionEnd = start + 2;
+            }
+        });
+    }
+
+    setupEditor('config-yaml', function () { return _configRaw; }, 'config');
+    setupEditor('projects-yaml', function () { return _projectsRaw; }, 'projects');
+
+    /* ------------------------------------------------------------------ */
+    /* Restart button                                                      */
+    /* ------------------------------------------------------------------ */
+    document.getElementById('restart-btn').addEventListener('click', function () {
+        if (!confirm('Restart the Kōan agent service?')) return;
+        var btn = this;
+        var statusEl = document.getElementById('restart-status');
+        var statusText = document.getElementById('restart-status-text');
+        btn.disabled = true;
+        btn.textContent = 'Restarting…';
+        statusEl.style.display = 'none';
+
+        fetch('/api/config/restart', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                btn.disabled = false;
+                btn.textContent = 'Restart Service';
+                statusEl.style.display = '';
+                if (data.ok) {
+                    statusEl.className = 'k-alert k-alert--success k-mt-3';
+                    statusText.textContent = '✓ Restart signal sent. The agent will restart shortly.';
+                } else {
+                    statusEl.className = 'k-alert k-alert--danger k-mt-3';
+                    statusText.textContent = data.error || 'Failed to send restart signal.';
+                }
+                setTimeout(function () { statusEl.style.display = 'none'; }, 8000);
+            })
+            .catch(function () {
+                btn.disabled = false;
+                btn.textContent = 'Restart Service';
+                statusEl.style.display = '';
+                statusEl.className = 'k-alert k-alert--danger k-mt-3';
+                statusText.textContent = 'Network error — could not restart.';
+            });
+    });
+
+    /* ------------------------------------------------------------------ */
+    /* Shared                                                              */
+    /* ------------------------------------------------------------------ */
+    function escHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    loadConfig();
+})();
+</script>
+
+<style>
+    /* YAML highlighting */
+    .yaml-highlighted {
+        white-space: pre-wrap;
+        margin: 0;
+        font-family: var(--font-mono);
+        font-size: var(--fs-code);
+        line-height: var(--lh-relaxed);
+        tab-size: 2;
+        overflow-x: auto;
+    }
+    .hl-comment { color: var(--text-muted); font-style: italic; }
+    .hl-key { color: var(--iris-300); font-weight: var(--fw-medium); }
+    .hl-colon { color: var(--text-muted); }
+    .hl-value { color: var(--text-primary); }
+    .hl-string { color: var(--emerald-400); }
+    .hl-bool { color: #d8a8e8; }
+    .hl-num { color: var(--amber-400); }
+    .hl-null { color: #d8a8e8; font-style: italic; }
+    .hl-list { color: var(--text-muted); }
+    .hl-redacted { color: var(--warning); font-style: italic; }
+
+    [data-theme="light"] .hl-key { color: #0550ae; }
+    [data-theme="light"] .hl-string { color: #1a7f37; }
+    [data-theme="light"] .hl-bool { color: #8250df; }
+    [data-theme="light"] .hl-num { color: #953800; }
+    [data-theme="light"] .hl-null { color: #8250df; }
+    [data-theme="light"] .hl-redacted { color: #b35900; }
+
+    .config-panel { display: none; }
+    .config-panel.active { display: block; }
+</style>
+{% endblock %}

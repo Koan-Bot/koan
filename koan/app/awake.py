@@ -15,7 +15,7 @@ Module layout:
 - awake.py (this file) — main loop, chat, outbox, message classification
 """
 
-import fcntl
+import contextlib
 import os
 import re
 import subprocess
@@ -23,7 +23,8 @@ import sys
 import threading
 import time
 from datetime import date, datetime
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 from app.bridge_log import log
 from app.bridge_state import (
@@ -41,6 +42,8 @@ from app.bridge_state import (
     CONVERSATION_HISTORY_FILE,
     TOPICS_FILE,
     _get_registry,
+    get_soul,
+    get_summary,
 )
 from app.cli_provider import build_full_command
 from app.command_handlers import (
@@ -48,11 +51,10 @@ from app.command_handlers import (
     handle_mission,
     set_callbacks,
 )
-from app.format_outbox import format_message, load_soul, load_human_prefs, load_memory_context, fallback_format
 from app.health_check import write_heartbeat
 from app.language_preference import get_language_instruction
-from app.notify import TypingIndicator, reset_flood_state, send_telegram
-from app.outbox_scanner import scan_and_log
+from app.notify import TypingIndicator, reset_flood_state, send_telegram, set_reply_context, clear_reply_context
+from app.outbox_manager import OutboxManager, parse_outbox_priority
 from app.shutdown_manager import is_shutdown_requested, clear_shutdown
 from app.config import (
     get_chat_tools,
@@ -67,27 +69,83 @@ from app.conversation_history import (
 )
 from app.signals import HEARTBEAT_FILE, PAUSE_FILE, STOP_FILE
 from app.utils import (
+    atomic_write_json,
     parse_project as _parse_project,
 )
 
+_OFFSET_FILE = INSTANCE_DIR / ".telegram-offset.json"
+
+
+def _load_offset() -> int | None:
+    """Load the last persisted Telegram polling offset, or None if absent."""
+    try:
+        import json
+        data = json.loads(_OFFSET_FILE.read_text())
+        v = data.get("offset")
+        return int(v) if v is not None else None
+    except (FileNotFoundError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _save_offset(offset: int) -> None:
+    """Persist the Telegram polling offset to disk (best-effort)."""
+    with contextlib.suppress(OSError):
+        atomic_write_json(_OFFSET_FILE, {"offset": offset})
+
+
+# ---------------------------------------------------------------------------
+# Static chat context cache — mtime-based invalidation
+# ---------------------------------------------------------------------------
+
+_chat_context_cache: dict[str, tuple[float, str]] = {}
+
+
+def _load_cached_context(path: Path) -> str:
+    """Load file content with mtime-based caching.
+
+    Avoids re-reading relatively static files (human-preferences.md,
+    emotional-memory.md) from disk on every chat request.  Cache is
+    invalidated automatically when the file changes.
+    """
+    if not path.exists():
+        return ""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+    cache_key = str(path)
+    cached = _chat_context_cache.get(cache_key)
+    if cached is not None:
+        cached_mtime, cached_content = cached
+        if cached_mtime >= mtime:
+            return cached_content
+    try:
+        content = path.read_text().strip()
+    except OSError:
+        return ""
+    _chat_context_cache[cache_key] = (mtime, content)
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Outbox manager — singleton instance, created at module load
+# ---------------------------------------------------------------------------
+
+_outbox_mgr = OutboxManager(OUTBOX_FILE, INSTANCE_DIR, CONVERSATION_HISTORY_FILE)
+
 
 def _get_last_message_id() -> int:
-    """Get the message_id from the last send_telegram() call.
-
-    Returns 0 if the provider doesn't support message ID tracking
-    or if no message was sent.
-    """
-    try:
-        from app.messaging import get_messaging_provider
-        provider = get_messaging_provider()
-        ids = provider.get_last_message_ids()
-        return ids[-1] if ids else 0
-    except (SystemExit, Exception):
-        return 0
+    """Get the message_id from the last send_telegram() call."""
+    return OutboxManager._get_last_message_id()
 
 
 def check_config():
-    if not BOT_TOKEN or not CHAT_ID:
+    # BOT_TOKEN / CHAT_ID are Telegram-specific.  Slack and Matrix users
+    # don't set them — defer the actual credential check to each
+    # provider's own ``configure()`` (called from get_messaging_provider
+    # below) so non-telegram providers don't get sys.exit(1)'d here.
+    from app.messaging import resolve_provider_name
+    if resolve_provider_name() == "telegram" and (not BOT_TOKEN or not CHAT_ID):
         log("error", "Set KOAN_TELEGRAM_TOKEN and KOAN_TELEGRAM_CHAT_ID env vars.")
         sys.exit(1)
     if not INSTANCE_DIR.exists():
@@ -138,9 +196,74 @@ def is_command(text: str) -> bool:
     return text.startswith("/")
 
 
+def promote_bare_skill_command(text: str) -> Optional[str]:
+    """Promote a bare core-skill word to its slash form.
+
+    If the first word of a plain message names a core skill command or alias,
+    return the text with a leading slash so ``time`` is handled exactly like
+    ``/time``. Only ``core`` skills are promoted — never custom/instance
+    skills — so an installed skill colliding with a common word can't hijack
+    chat. Returns None when the first word is not a core skill.
+    """
+    match = re.match(r"[A-Za-z][\w]*", text)
+    if not match:
+        return None
+    skill = _get_registry().find_by_command(match.group(0).lower())
+    if skill is not None and skill.scope == "core":
+        return "/" + text
+    return None
+
+
 def parse_project(text: str) -> Tuple[Optional[str], str]:
     """Extract [project:name] or [projet:name] from message."""
     return _parse_project(text)
+
+
+def _is_addressed_to_other_user(text: str, msg: dict, bot_username: str) -> bool:
+    """Return True if the message opens with an @mention of someone other than the bot.
+
+    In group chats, ``@other-user do X`` should be ignored — it's addressed
+    to a different participant. Only messages starting with ``@our-bot`` (or
+    no leading mention at all) should be processed.
+    """
+    if not bot_username:
+        return False
+
+    entities = msg.get("entities", [])
+    for entity in entities:
+        if entity.get("type") == "mention" and entity.get("offset", -1) == 0:
+            length = entity.get("length", 0)
+            mentioned = text[:length].lstrip("@")
+            return mentioned.lower() != bot_username.lower()
+
+    if text.startswith("@"):
+        match = re.match(r"@(\w+)", text)
+        if match:
+            return match.group(1).lower() != bot_username.lower()
+
+    return False
+
+
+def _strip_bot_mention_from_text(text: str, msg: dict) -> str:
+    """Strip @bot_username mentions from non-command messages.
+
+    In group chats, users often address the bot with ``@BotName hello``.
+    This strips the mention so the downstream handlers receive clean text.
+    Commands (``/cmd@BotName``) are already handled by ``_strip_bot_mention``
+    in command_handlers.py — this covers plain-text mentions.
+    """
+    if text.startswith("/"):
+        return text
+    entities = msg.get("entities", [])
+    if not entities:
+        return text
+    # Process entities in reverse offset order so earlier offsets stay valid
+    for entity in sorted(entities, key=lambda e: e.get("offset", 0), reverse=True):
+        if entity.get("type") == "mention":
+            offset = entity.get("offset", 0)
+            length = entity.get("length", 0)
+            text = text[:offset] + text[offset + length:]
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +293,9 @@ def _build_chat_prompt(text: str, *, lite: bool = False) -> str:
                 journal_context = journal_content
 
     # Load human preferences for personality context
-    prefs_context = ""
-    prefs_path = INSTANCE_DIR / "memory" / "global" / "human-preferences.md"
-    if prefs_path.exists():
-        prefs_context = prefs_path.read_text().strip()
+    prefs_context = _load_cached_context(
+        INSTANCE_DIR / "memory" / "global" / "human-preferences.md"
+    )
 
     # Load live progress from pending.md (run in progress)
     pending_context = ""
@@ -244,8 +366,9 @@ def _build_chat_prompt(text: str, *, lite: bool = False) -> str:
 
     from app.prompts import load_prompt
 
+    summary = get_summary()
     summary_budget = 0 if lite else 1500
-    summary_block = f"Summary of past sessions:\n{SUMMARY[:summary_budget]}" if SUMMARY and summary_budget else ""
+    summary_block = f"Summary of past sessions:\n{summary[:summary_budget]}" if summary and summary_budget else ""
     prefs_block = f"About the human:\n{prefs_context}" if prefs_context else ""
     journal_block = f"Today's journal (excerpt):\n{journal_context}" if journal_context else ""
     missions_block = f"Current missions state:\n{missions_context}" if missions_context else ""
@@ -253,18 +376,19 @@ def _build_chat_prompt(text: str, *, lite: bool = False) -> str:
     # Load emotional memory for relationship-aware responses
     emotional_context = ""
     if not lite:
-        emotional_path = INSTANCE_DIR / "memory" / "global" / "emotional-memory.md"
-        if emotional_path.exists():
-            content = emotional_path.read_text().strip()
+        emotional_raw = _load_cached_context(
+            INSTANCE_DIR / "memory" / "global" / "emotional-memory.md"
+        )
+        if emotional_raw:
             # Take last 800 chars — enough for tone, not too heavy
-            if len(content) > 800:
-                emotional_context = "...\n" + content[-800:]
+            if len(emotional_raw) > 800:
+                emotional_context = "...\n" + emotional_raw[-800:]
             else:
-                emotional_context = content
+                emotional_context = emotional_raw
 
     prompt = load_prompt(
         "chat",
-        SOUL=SOUL,
+        SOUL=get_soul(),
         TOOLS_DESC=tools_desc or "",
         PREFS=prefs_block,
         SUMMARY=summary_block,
@@ -280,6 +404,19 @@ def _build_chat_prompt(text: str, *, lite: bool = False) -> str:
     if lang_instruction:
         prompt += f"\n\n{lang_instruction}"
 
+    # Inject caveman directive when enabled and the chat skill hasn't opted out.
+    # ``koan/skills/core/chat/SKILL.md`` ships with ``caveman: false`` so this
+    # is a no-op by default — but the resolution honours global config + the
+    # SKILL.md flag, giving operators a single knob to flip.
+    try:
+        from app.caveman import append_caveman
+        chat_skill_dir = (
+            Path(__file__).resolve().parent.parent / "skills" / "core" / "chat"
+        )
+        prompt = append_caveman(prompt, skill_name="chat", skill_dir=chat_skill_dir)
+    except Exception as e:
+        log("warn", f"[chat] caveman injection failed: {e}")
+
     # Inject emotional memory before the user message (if available)
     if emotional_context:
         prompt = prompt.replace(
@@ -292,7 +429,18 @@ def _build_chat_prompt(text: str, *, lite: bool = False) -> str:
     if len(prompt) > MAX_PROMPT_CHARS and not lite:
         return _build_chat_prompt(text, lite=True)
 
+    # Last resort: if lite mode still exceeds the cap, truncate user message
+    if len(prompt) > MAX_PROMPT_CHARS:
+        overflow = len(prompt) - MAX_PROMPT_CHARS
+        max_text_len = max(200, len(text) - overflow - 50)  # 50 chars margin for ellipsis/safety
+        if len(text) > max_text_len:
+            truncated_text = text[:max_text_len] + "… [truncated]"
+            prompt = prompt.replace(text, truncated_text)
+
     return prompt
+
+
+_CHAT_LOCK = threading.Lock()
 
 
 def _clean_chat_response(text: str, user_message: str = "") -> str:
@@ -318,24 +466,44 @@ def handle_chat(text: str):
     # Save user message to history
     save_conversation_message(CONVERSATION_HISTORY_FILE, "user", text)
 
+    # Scan for prompt injection — warn-only (never block chat; tools are read-only)
+    from app.prompt_guard import scan_mission_text
+    from app.config import get_prompt_guard_config
+    from app.command_handlers import quarantine_mission
+
+    guard_config = get_prompt_guard_config()
+    if guard_config["enabled"]:
+        guard_result = scan_mission_text(text)
+        if guard_result.blocked:
+            log("guard", f"WARNING chat: {guard_result.reason} | {text[:100]}")
+            quarantine_mission(text, guard_result.reason, source="telegram-chat")
+
     prompt = _build_chat_prompt(text)
     chat_tools_list = get_chat_tools().split(",")
     models = get_model_config()
+
+    # Run chat from KOAN_ROOT so paths line up with the rest of the system
+    # (reflection, agent loop). Chat only needs to read state under
+    # ./instance/ (journals, memory, missions) — not Kōan's own source code.
+    # The prompt tells Claude where to look.
+    chat_cwd = str(KOAN_ROOT)
 
     cmd = build_full_command(
         prompt=prompt,
         allowed_tools=chat_tools_list,
         model=models["chat"],
         fallback=models["fallback"],
-        max_turns=1,
+        max_turns=5,
     )
 
-    with TypingIndicator():
+    # Serialize chat CLI calls: Claude takes a per-cwd session lock, so two
+    # overlapping chats in INSTANCE_DIR collide and one exits 1.
+    with _CHAT_LOCK, TypingIndicator():
         try:
             result = run_cli(
                 cmd,
                 capture_output=True, text=True, timeout=CHAT_TIMEOUT,
-                cwd=PROJECT_PATH or str(KOAN_ROOT),
+                cwd=chat_cwd,
             )
             response = _clean_chat_response(result.stdout.strip(), text)
             if response:
@@ -347,12 +515,15 @@ def handle_chat(text: str):
                 )
                 log("chat", f"Chat reply: {response[:80]}...")
             elif result.returncode != 0:
-                log("error", f"Claude error: {result.stderr[:200]}")
+                log("error", f"Claude error (exit {result.returncode}): {result.stderr[:200]}")
                 error_msg = "⚠️ Hmm, I couldn't formulate a response. Try again?"
                 send_telegram(error_msg)
                 save_conversation_message(CONVERSATION_HISTORY_FILE, "assistant", error_msg)
             else:
                 log("chat", "Empty response from Claude.")
+                empty_msg = "⚠️ I didn't get a response — please try again."
+                send_telegram(empty_msg)
+                save_conversation_message(CONVERSATION_HISTORY_FILE, "assistant", empty_msg)
         except subprocess.TimeoutExpired:
             log("error", f"Claude timed out ({CHAT_TIMEOUT}s). Retrying with lite context...")
             # Brief backoff before retry to let API pressure ease
@@ -365,13 +536,13 @@ def handle_chat(text: str):
                 allowed_tools=chat_tools_list,
                 model=models["chat"],
                 fallback=models["fallback"],
-                max_turns=1,
+                max_turns=5,
             )
             try:
                 result = run_cli(
                     lite_cmd,
                     capture_output=True, text=True, timeout=retry_timeout,
-                    cwd=PROJECT_PATH or str(KOAN_ROOT),
+                    cwd=chat_cwd,
                 )
                 response = _clean_chat_response(result.stdout.strip(), text)
                 if response:
@@ -405,251 +576,138 @@ def handle_chat(text: str):
 
 
 # ---------------------------------------------------------------------------
-# Outbox
+# Outbox — delegated to OutboxManager (backward-compatible wrappers)
+#
+# These wrappers create a fresh OutboxManager from the current module-level
+# values (OUTBOX_FILE, INSTANCE_DIR, etc.) so that test patches on those
+# names propagate correctly.  In production, the main loop uses
+# _outbox_mgr.flush_async() which goes through the singleton directly.
 # ---------------------------------------------------------------------------
+
+
+def _make_outbox_mgr() -> OutboxManager:
+    """Create an OutboxManager from the current (possibly patched) module values."""
+    return OutboxManager(OUTBOX_FILE, INSTANCE_DIR, CONVERSATION_HISTORY_FILE)
+
 
 def _staging_path():
     """Return path of the outbox staging file (crash-recovery backup)."""
-    return OUTBOX_FILE.parent / "outbox-sending.md"
+    return _make_outbox_mgr().staging_path
+
+
+# Keep _parse_outbox_priority importable from awake for backward compat
+_parse_outbox_priority = parse_outbox_priority
 
 
 def _recover_staged_outbox():
-    """Recover content from a staging file left by a previous crash.
-
-    If outbox-sending.md exists, a previous flush_outbox() was interrupted
-    between truncation and send completion. Re-queue the content so it gets
-    retried on the next cycle.
-    """
-    staging = _staging_path()
-    if not staging.exists():
-        return
-    try:
-        content = staging.read_text().strip()
-        if content:
-            log("outbox", "Recovering staged outbox content from interrupted flush")
-            _requeue_outbox(content)
-        staging.unlink(missing_ok=True)
-    except Exception as e:
-        log("error", f"Staged outbox recovery failed: {e}")
+    """Recover content from a staging file left by a previous crash."""
+    _make_outbox_mgr().recover_staged()
 
 
 def flush_outbox():
-    """Relay messages from the run loop outbox. Uses file locking for concurrency.
-
-    ALL outbox messages are formatted via Claude before sending to Telegram.
-    This ensures consistent personality, French language, and conversational tone
-    regardless of the message source (Claude session, run.py, retrospective).
-
-    The lock is held only during read+clear (microseconds), not during the slow
-    Claude formatting call. This prevents blocking writers (run.py, retrospective)
-    and eliminates the race where content appended during formatting was lost on
-    truncate.
-
-    Crash safety: content is written to a staging file (outbox-sending.md) before
-    truncation. If the process crashes between truncation and send, the next cycle
-    recovers the content from the staging file.
-    """
-    # Recover from any previous interrupted flush
-    _recover_staged_outbox()
-
-    if not OUTBOX_FILE.exists():
-        return
-
-    # Phase 1: Read, stage, and clear under lock (fast — microseconds)
-    content = None
-    staging = _staging_path()
-    try:
-        with open(OUTBOX_FILE, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                content = f.read().strip()
-                if content:
-                    # Write staging file before truncation for crash recovery
-                    staging.write_text(content)
-                    f.seek(0)
-                    f.truncate()
-                    f.flush()
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception as e:
-        log("error", f"Outbox read error: {e}")
-        return
-
-    if not content:
-        return
-
-    # Phase 2: Scan, format, and send (slow — outside lock)
-    scan_result = scan_and_log(content)
-    if scan_result.blocked:
-        quarantine = INSTANCE_DIR / "outbox-quarantine.md"
-        try:
-            with open(quarantine, "a") as qf:
-                from datetime import datetime as _dt
-                qf.write(f"\n---\n[{_dt.now().isoformat()}] BLOCKED: {scan_result.reason}\n")
-                qf.write(content[:500])
-                qf.write("\n")
-        except OSError as e:
-            log("error", f"Quarantine write error: {e}")
-        log("outbox", f"Outbox BLOCKED by scanner: {scan_result.reason}")
-        staging.unlink(missing_ok=True)
-        return
-
-    formatted = _format_outbox_message(content)
-    formatted = _expand_outbox_github_refs(formatted, content)
-    if send_telegram(formatted):
-        msg_id = _get_last_message_id()
-        save_conversation_message(
-            CONVERSATION_HISTORY_FILE, "assistant", formatted,
-            message_id=msg_id, message_type="notification",
-        )
-        preview = formatted[:150].replace("\n", " ")
-        if len(formatted) > 150:
-            preview += "..."
-        log("outbox", f"Outbox flushed: {preview}")
-        staging.unlink(missing_ok=True)
-    else:
-        log("error", "Outbox send failed — re-queuing for retry")
-        _requeue_outbox(content)
-        staging.unlink(missing_ok=True)
+    """Relay messages from the run loop outbox."""
+    _make_outbox_mgr().flush()
 
 
 def _requeue_outbox(content: str):
-    """Re-append content to outbox.md after a failed send attempt.
-
-    If re-appending to outbox.md itself fails, writes the content to
-    outbox-failed.md so it is never silently lost.
-    """
-    try:
-        with open(OUTBOX_FILE, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.write(content + "\n")
-                f.flush()
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception as e:
-        log("error", f"Failed to re-queue outbox message: {e}")
-        _write_outbox_failed(content, e)
+    """Re-append content to outbox.md after a failed send attempt."""
+    _make_outbox_mgr().requeue(content)
 
 
 def _write_outbox_failed(content: str, original_error: Exception):
     """Last-resort persistence: write lost outbox content to outbox-failed.md."""
-    failed_file = OUTBOX_FILE.parent / "outbox-failed.md"
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        entry = f"<!-- lost {timestamp} — {original_error} -->\n{content}\n"
-        with open(failed_file, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.write(entry)
-                f.flush()
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        log("warn", f"Lost outbox content saved to {failed_file.name}")
-    except Exception as e2:
-        log("error", f"Failed to write outbox-failed.md: {e2} — content lost: {content[:120]}")
+    _make_outbox_mgr()._write_failed(content, original_error)
 
 
 def _expand_outbox_github_refs(formatted: str, raw_content: str) -> str:
-    """Expand bare #123 GitHub refs in an outbox message to full URLs.
-
-    Uses the raw (pre-formatted) content to detect the project context,
-    then applies expansion to the formatted output so links are clickable
-    in Telegram.
-    """
-    from app.text_utils import expand_github_refs, extract_project_from_message
-
-    project_name = extract_project_from_message(raw_content)
-    if not project_name:
-        project_name = extract_project_from_message(formatted)
-    if not project_name:
-        return formatted
-
-    try:
-        from app.projects_merged import get_github_url
-        github_url = get_github_url(project_name)
-    except Exception as e:
-        log("error", f"GitHub URL lookup failed for {project_name}: {e}")
-        return formatted
-
-    if not github_url:
-        return formatted
-
-    return expand_github_refs(formatted, github_url)
+    """Expand bare #123 GitHub refs in an outbox message to full URLs."""
+    return OutboxManager._expand_github_refs(formatted, raw_content)
 
 
 def _format_outbox_message(raw_content: str) -> str:
-    """Format outbox content via Claude with full personality context.
-
-    Args:
-        raw_content: Raw message text from outbox.md
-
-    Returns:
-        Formatted message ready for Telegram
-    """
-    try:
-        soul = load_soul(INSTANCE_DIR)
-        prefs = load_human_prefs(INSTANCE_DIR)
-        memory = load_memory_context(INSTANCE_DIR)
-        return format_message(raw_content, soul, prefs, memory)
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
-        log("error", f"Format error, sending fallback: {e}")
-        return fallback_format(raw_content)
-    except Exception as e:
-        # Catch-all for unexpected errors (file corruption, import issues, etc.)
-        log("error", f"Unexpected format error, sending fallback: {e}")
-        return fallback_format(raw_content)
+    """Format outbox content via Claude with full personality context."""
+    return _make_outbox_mgr()._format_message(raw_content)
 
 
 # ---------------------------------------------------------------------------
-# Worker thread — runs handle_chat in background so polling stays responsive
+# Worker lanes — chat replies and background tasks run independently so a
+# long background task never blocks an interactive reply, and neither ever
+# blocks the Telegram poll loop.  One in-flight task per lane (back-pressure).
 # ---------------------------------------------------------------------------
 
-_worker_thread: Optional[threading.Thread] = None
+_WORKER_LANES = ("chat", "bg")
+_worker_threads: Dict[str, Optional[threading.Thread]] = {
+    lane: None for lane in _WORKER_LANES
+}
 _worker_lock = threading.Lock()
 
+# The chat lane tells the user when it is busy; the bg lane stays silent so
+# background work (worker skills like /review, /rebase) never spams the channel.
+_LANE_BUSY_MSG: Dict[str, Optional[str]] = {
+    "chat": "⏳ Busy with a previous message. Try again in a moment.",
+    "bg": None,
+}
 
-def _run_in_worker(fn, *args):
-    """Run fn(*args) in a background thread. One worker at a time."""
-    global _worker_thread
+
+def _run_in_worker(fn, *args, lane: str = "chat") -> bool:
+    """Run fn(*args) in a background thread on a named lane.
+
+    Two lanes exist: ``"chat"`` (interactive replies) and ``"bg"``
+    (background tasks such as worker skills typed in chat — ``/review``,
+    ``/rebase``, etc.).  Each lane allows one worker at a time, but the lanes run
+    concurrently, so a background task never blocks a chat reply and vice
+    versa.  The Telegram poll loop is never blocked by either.
+
+    Captures the current reply context so that send_telegram() calls inside
+    the worker thread reply to the correct message in groups.
+
+    Returns ``True`` when the task was started and ``False`` when the lane
+    was already busy and the task was dropped.  The chat lane notifies the
+    user on its own when busy; the bg lane stays silent, so callers that
+    dispatch *user-initiated* work on the bg lane (e.g. worker skills typed
+    in chat) should inspect this return value and surface their own
+    feedback rather than dropping the command silently.
+    """
+    from app.notify import (
+        clear_reply_context,
+        get_reply_context,
+        send_telegram,
+        set_reply_context,
+    )
+
+    if lane not in _worker_threads:
+        raise ValueError(f"unknown worker lane: {lane!r}")
+
+    reply_to = get_reply_context()
+
+    def _wrapper():
+        set_reply_context(reply_to)
+        try:
+            fn(*args)
+        finally:
+            clear_reply_context()
+
     with _worker_lock:
-        if _worker_thread is not None and _worker_thread.is_alive():
-            send_telegram("⏳ Busy with a previous message. Try again in a moment.")
-            return
-        _worker_thread = threading.Thread(target=fn, args=args, daemon=True)
-        _worker_thread.start()
+        existing = _worker_threads[lane]
+        if existing is not None and existing.is_alive():
+            busy_msg = _LANE_BUSY_MSG.get(lane)
+            if busy_msg:
+                send_telegram(busy_msg)
+            return False
+        thread = threading.Thread(target=_wrapper, daemon=True)
+        _worker_threads[lane] = thread
+        thread.start()
+        return True
 
 
 # ---------------------------------------------------------------------------
-# Outbox flush thread — formats via Claude in background to keep polling fast
+# Outbox flush thread — delegated to OutboxManager
 # ---------------------------------------------------------------------------
-
-_outbox_thread: Optional[threading.Thread] = None
-_outbox_lock = threading.Lock()
 
 
 def _flush_outbox_async():
-    """Run flush_outbox() in a background thread if not already running.
-
-    flush_outbox() calls Claude CLI for message formatting (up to 30s).
-    Running it synchronously in the main loop blocks Telegram polling,
-    making the bridge unresponsive to commands like /list during busy
-    periods (e.g. rebase missions producing frequent outbox messages).
-    """
-    global _outbox_thread
-    with _outbox_lock:
-        if _outbox_thread is not None and _outbox_thread.is_alive():
-            return  # Previous flush still running — skip this cycle
-        _outbox_thread = threading.Thread(target=_flush_outbox_safe, daemon=True)
-        _outbox_thread.start()
-
-
-def _flush_outbox_safe():
-    """Wrapper that catches exceptions so the thread exits cleanly."""
-    try:
-        flush_outbox()
-    except Exception as e:
-        log("error", f"Background flush_outbox failed: {e}")
+    """Run flush_outbox() in a background thread if not already running."""
+    _outbox_mgr.flush_async()
 
 
 # Inject callbacks into command_handlers to break circular dependency
@@ -732,10 +790,99 @@ def handle_message(text: str):
 
     if is_command(text):
         handle_command(text)
-    elif is_mission(text):
+        return
+
+    promoted = promote_bare_skill_command(text)
+    if promoted is not None:
+        handle_command(promoted)
+        return
+
+    if is_mission(text):
         handle_mission(text)
     else:
-        _run_in_worker(handle_chat, text)
+        _run_in_worker(handle_chat, text, lane="chat")
+
+
+def _check_group_chat_mode(provider) -> None:
+    """Detect group chats and verify the bot can actually read every message.
+
+    In groups, bots with Telegram Privacy Mode enabled (the default) only
+    receive /commands, @mentions, and replies — not regular messages. A bot can
+    read *every* message only if privacy mode is disabled
+    (``can_read_all_group_messages``) **or** the bot is a group administrator.
+
+    This probes both via the Bot API. When the bot is blocked, it warns loudly
+    (log + a message into the group itself) so the cause of an apparently
+    "ignored" chat is obvious instead of silent.
+    """
+    import requests
+
+    if provider.get_provider_name() != "telegram":
+        return
+    try:
+        api_base = provider.get_api_base()
+        chat_id = provider.get_channel_id()
+        resp = requests.get(f"{api_base}/getChat", params={"chat_id": chat_id}, timeout=5)
+        data = resp.json()
+        if not data.get("ok"):
+            log("warn", f"getChat failed: {data.get('description', 'unknown')}")
+            return
+        chat_type = data.get("result", {}).get("type", "")
+        if chat_type not in ("group", "supergroup"):
+            return
+
+        log("init", f"Chat type: {chat_type} — group mode active")
+
+        # The bot receives every message only if privacy mode is disabled OR it
+        # is a group admin. Probe getMe (privacy flag + bot id), then — only if
+        # still needed — getChatMember (admin status).
+        can_read_all = False
+        bot_id = None
+        try:
+            me = requests.get(f"{api_base}/getMe", timeout=5).json()
+            if me.get("ok"):
+                result = me.get("result", {})
+                bot_id = result.get("id")
+                can_read_all = bool(result.get("can_read_all_group_messages"))
+        except Exception as e:
+            log("warn", f"getMe failed: {e}")
+
+        is_admin = False
+        if not can_read_all and bot_id is not None:
+            try:
+                member = requests.get(
+                    f"{api_base}/getChatMember",
+                    params={"chat_id": chat_id, "user_id": bot_id},
+                    timeout=5,
+                ).json()
+                if member.get("ok"):
+                    status = member.get("result", {}).get("status", "")
+                    is_admin = status in ("administrator", "creator")
+            except Exception as e:
+                log("warn", f"getChatMember failed: {e}")
+
+        if can_read_all or is_admin:
+            log("init", "Group mode: bot can read all messages ✓")
+            return
+
+        # Blocked: privacy mode on and not an admin → plain messages never arrive.
+        log("warn", "Privacy Mode is ON — bot only sees /commands, @mentions, and replies in this group")
+        log("warn", "Fix: @BotFather /setprivacy → Disable then re-add the bot, OR promote the bot to admin")
+        try:
+            provider.send_message(
+                "⚠️ I can't see regular messages in this group because Telegram "
+                "Privacy Mode is enabled.\n\n"
+                "To let me reply to every message (like a 1:1 chat):\n"
+                "1. Message @BotFather → /setprivacy → select me → Disable, then "
+                "remove and re-add me to this group.\n"
+                "   — or —\n"
+                "2. Promote me to administrator in this group.\n\n"
+                "Until then I only respond to /commands, @mentions, and replies."
+            )
+        except Exception as e:
+            log("warn", f"Failed to send privacy-mode warning: {e}")
+    except Exception as e:
+        log("warn", f"Group chat detection failed: {e}")
 
 
 def _ensure_runner_alive() -> None:
@@ -757,7 +904,12 @@ def _ensure_runner_alive() -> None:
         log("error", f"Failed to start runner: {msg}")
 
 
-def main():
+MAX_BRIDGE_CRASHES = 5
+BRIDGE_BACKOFF_MULTIPLIER = 10
+MAX_BRIDGE_BACKOFF = 60
+
+
+def _bridge_loop():
     from app.banners import print_bridge_banner
     from app.github_auth import setup_github_auth
     from app.pid_manager import acquire_pidfile, release_pidfile
@@ -766,8 +918,8 @@ def main():
     check_config()
 
     # Ensure PYTHONPATH includes the koan/ package directory so that
-    # subprocess calls (e.g. local LLM runner via python -m app.local_llm_runner)
-    # can resolve app.* modules regardless of the subprocess CWD.
+    # subprocess calls (e.g. python -m app.issue_cli) can resolve app.*
+    # modules regardless of the subprocess CWD.
     koan_pkg_dir = str(KOAN_ROOT / "koan")
     current = os.environ.get("PYTHONPATH", "")
     if koan_pkg_dir not in current.split(os.pathsep):
@@ -786,7 +938,8 @@ def main():
 
     setup_github_auth()
 
-    provider_name = "telegram"  # about to become dynamic with provider abstraction
+    from app.messaging import resolve_provider_name
+    provider_name = resolve_provider_name()
     print_bridge_banner(f"messaging bridge — {provider_name.lower()}")
 
     # Record startup time — used to ignore stale signal files in the
@@ -802,8 +955,10 @@ def main():
     heartbeat_file = KOAN_ROOT / HEARTBEAT_FILE
     heartbeat_file.unlink(missing_ok=True)
     write_heartbeat(str(KOAN_ROOT))
-    log("init", f"Token: ...{BOT_TOKEN[-8:]}")
-    log("init", f"Chat ID: {CHAT_ID}")
+    if BOT_TOKEN:
+        log("init", f"Token: ...{BOT_TOKEN[-8:]}")
+    if CHAT_ID:
+        log("init", f"Chat ID: {CHAT_ID}")
     log("init", f"Soul: {len(SOUL)} chars loaded")
     log("init", f"Summary: {len(SUMMARY)} chars loaded")
     registry = _get_registry()
@@ -825,8 +980,30 @@ def main():
         log("error", "Failed to initialize messaging provider")
         sys.exit(1)
 
+    bot_username = provider.get_bot_username()
+    if bot_username:
+        log("init", f"Bot username: @{bot_username}")
+
+    # Detect group chat and warn about privacy mode
+    _check_group_chat_mode(provider)
+
+    # Optional GitHub webhook receiver — push-based notification triggering.
+    # Defaults off; only starts when github.webhook.enabled and a secret are set.
+    try:
+        from app.github_webhook import maybe_start_from_config
+        if maybe_start_from_config(str(KOAN_ROOT)) is not None:
+            log("init", "GitHub webhook receiver started (push-based triggering)")
+    except Exception as e:
+        # Keep the bridge alive on webhook failure, but log the full traceback —
+        # a bare {e} loses the context needed to diagnose startup failures.
+        import traceback
+        log("error",
+            f"GitHub webhook receiver failed to start: {e}\n{traceback.format_exc()}")
+
     log("init", f"Polling every {POLL_INTERVAL}s (chat mode: fast reply)")
-    offset = None
+    offset = _load_offset()
+    if offset is not None:
+        log("init", f"Resuming Telegram polling from persisted offset {offset}")
     first_poll = True
 
     try:
@@ -841,7 +1018,17 @@ def main():
                 continue
 
             for update in updates:
-                offset = update["update_id"] + 1
+                # Telegram uses update_id for offset-based pagination.
+                # Other providers (matrix, slack, discord) manage their own
+                # cursor internally and may hand us updates that don't carry
+                # this key. Never let a missing/malformed update_id crash the
+                # bridge: a single non-conforming update would otherwise take
+                # down main(), the supervisor would restart us, the same
+                # poison message would be re-delivered, and we'd crash-loop
+                # forever (see logs/awake.log KeyError: 'update_id').
+                if "update_id" in update:
+                    offset = update["update_id"] + 1
+                    _save_offset(offset)
 
                 # Handle reaction updates
                 if "message_reaction" in update:
@@ -854,8 +1041,33 @@ def main():
                 msg = update.get("message", {})
                 text = msg.get("text", "")
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-                if chat_id == CHAT_ID and text:
+                # Match against either: (a) the active provider's channel
+                # id (resolved at startup — covers slack/matrix where
+                # CHAT_ID is unset), or (b) CHAT_ID (telegram-only, kept
+                # for backward compat with existing tests that patch it
+                # directly).  For telegram in production the two are the
+                # same value.
+                #
+                # message_id / mention-stripping MUST be derived inside this
+                # block, not a separate `chat_id == CHAT_ID` guard: for matrix
+                # (and any provider where CHAT_ID is unset) chat_id matches
+                # channel_id but never CHAT_ID, so a CHAT_ID-only guard leaves
+                # message_id unbound and set_reply_context() below raises
+                # UnboundLocalError — crashing the bridge on every message.
+                #
+                # Empty strings are stripped from the match set and an empty
+                # chat_id is rejected: with CHAT_ID="" (normal for matrix/slack)
+                # a malformed update missing chat.id would otherwise satisfy
+                # `"" in (channel_id, "")` and slip past the channel filter.
+                valid_chat_ids = {str(channel_id), str(CHAT_ID)} - {""}
+                if text and chat_id and chat_id in valid_chat_ids:
+                    if _is_addressed_to_other_user(text, msg, bot_username):
+                        log("chat", f"Ignoring message addressed to another user: {text[:60]}")
+                        continue
+                    message_id = msg.get("message_id", 0)
+                    text = _strip_bot_mention_from_text(text, msg)
                     log("chat", f"Received: {text[:60]}")
+                    set_reply_context(message_id)
                     try:
                         handle_message(text)
                     except Exception as e:
@@ -864,6 +1076,8 @@ def main():
                             send_telegram(f"⚠️ Error processing message: {type(e).__name__}: {e}")
                         except Exception as notify_err:
                             print(f"[bridge] error notification also failed: {notify_err}", file=sys.stderr)
+                    finally:
+                        clear_reply_context()
 
             # After the first poll cycle, clear any stale signal files
             # left from a previous incarnation.  During the first poll
@@ -873,8 +1087,8 @@ def main():
             # right after so the check below finds nothing.
             if first_poll:
                 # Check if we're coming back from a /restart before clearing
-                was_restart = check_restart(str(KOAN_ROOT))
-                clear_restart(str(KOAN_ROOT))
+                was_restart = check_restart(str(KOAN_ROOT), target="bridge")
+                clear_restart(str(KOAN_ROOT), target="bridge")
                 clear_shutdown(str(KOAN_ROOT))
                 first_poll = False
 
@@ -884,7 +1098,10 @@ def main():
                 if was_restart:
                     _ensure_runner_alive()
 
-            _flush_outbox_async()
+            try:
+                _flush_outbox_async()
+            except Exception as e:
+                log("error", f"flush_outbox failed: {e}")
 
             try:
                 write_heartbeat(str(KOAN_ROOT))
@@ -894,7 +1111,7 @@ def main():
             # Check for restart signal (set by /restart command).
             # Only react to files created AFTER we started — stale files
             # were already cleared above after the first poll.
-            if check_restart(str(KOAN_ROOT), since=startup_time):
+            if check_restart(str(KOAN_ROOT), since=startup_time, target="bridge"):
                 log("init", "Restart signal detected. Re-executing...")
                 release_pidfile(pidfile_lock, KOAN_ROOT, "awake")
                 reexec_bridge()
@@ -911,6 +1128,46 @@ def main():
         release_pidfile(pidfile_lock, KOAN_ROOT, "awake")
         log("init", "Shutting down.")
         sys.exit(0)
+
+
+def main():
+    """Entry point with crash recovery wrapper.
+
+    Handles: normal exit, CTRL-C, and unexpected crashes with backoff.
+    Mirrors the pattern in run.py to keep the bridge alive through transient
+    failures (network blips, provider errors, file I/O hiccups).
+    """
+    import traceback
+
+    crash_count = 0
+    while True:
+        try:
+            _bridge_loop()
+            break
+        except KeyboardInterrupt:
+            break
+        except SystemExit:
+            raise
+        except Exception:
+            crash_count += 1
+            tb = traceback.format_exc()
+            print(
+                f"[bridge] Unexpected crash ({crash_count}/{MAX_BRIDGE_CRASHES}): {tb}",
+                file=sys.stderr,
+            )
+
+            if crash_count >= MAX_BRIDGE_CRASHES:
+                print(
+                    f"[bridge] Too many crashes ({MAX_BRIDGE_CRASHES}). Giving up.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            backoff = min(
+                BRIDGE_BACKOFF_MULTIPLIER * crash_count, MAX_BRIDGE_BACKOFF
+            )
+            print(f"[bridge] Restarting in {backoff}s...", file=sys.stderr)
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":

@@ -14,15 +14,91 @@ Flow:
 
 import json
 import logging
+import os
 import re
+import threading
+import time
+from pathlib import Path
 from typing import Optional
 
 from app.cli_provider import run_command
-from app.github import api
+from app.github import api, sanitize_github_comment
 from app.prompts import load_prompt
 from app.utils import truncate_text
 
 log = logging.getLogger(__name__)
+
+# Throttle for the "thread reply budget exceeded" Telegram heads-up: at most
+# one warning per thread per window so a tripped breaker doesn't itself spam.
+_budget_warn_lock = threading.Lock()
+_last_budget_warning: dict = {}
+_BUDGET_WARN_THROTTLE_SECONDS = 3600
+
+
+def _warn_reply_budget_once(owner: str, repo: str, issue_number: str, cap: int) -> None:
+    """Send a single Telegram heads-up when a thread's reply budget trips."""
+    thread_key = f"{owner}/{repo}#{issue_number}"
+    now = time.monotonic()
+    with _budget_warn_lock:
+        last = _last_budget_warning.get(thread_key, 0.0)
+        if now - last < _BUDGET_WARN_THROTTLE_SECONDS:
+            return
+        _last_budget_warning[thread_key] = now
+    try:
+        from app.notify import NotificationPriority, send_telegram
+
+        send_telegram(
+            f"🛑 Reply circuit breaker tripped on {thread_key}: reached "
+            f"{cap} bot replies within the hour — further replies suppressed.",
+            priority=NotificationPriority.ACTION,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort notification
+        log.warning("Failed to send reply-budget warning for %s: %s", thread_key, e)
+
+
+def _enforce_reply_budget(owner: str, repo: str, issue_number: str) -> bool:
+    """Per-thread circuit breaker. Return True if a reply may be posted.
+
+    Records the reply when allowed. When the rolling-hour cap is reached,
+    suppresses the post (logs + warns the operator once) and returns False.
+    Fails open: if state cannot be read (no KOAN_ROOT, file error), the reply
+    is allowed.
+    """
+    koan_root = os.environ.get("KOAN_ROOT", "")
+    if not koan_root:
+        return True
+    try:
+        from app.github_config import get_github_max_replies_per_thread
+        from app.utils import load_config
+
+        cap = get_github_max_replies_per_thread(load_config())
+    except Exception as e:  # noqa: BLE001 — config failure must not block replies
+        log.warning("Reply budget: config load failed, allowing reply: %s", e)
+        return True
+    if cap <= 0:
+        return True  # breaker disabled
+
+    instance_dir = str(Path(koan_root) / "instance")
+    try:
+        from app.github_notification_tracker import try_consume_reply_budget
+
+        # Atomic check-and-record: the count check and the slot record happen
+        # inside one lock, so concurrent callers can't both pass and overshoot
+        # the cap (no check-then-act race).
+        if not try_consume_reply_budget(
+            instance_dir, owner, repo, str(issue_number), cap,
+        ):
+            log.warning(
+                "GitHub: reply circuit breaker tripped for %s/%s#%s "
+                "(cap=%d/hour) — suppressing reply",
+                owner, repo, issue_number, cap,
+            )
+            _warn_reply_budget_once(owner, repo, str(issue_number), cap)
+            return False
+    except Exception as e:  # noqa: BLE001 — tracker failure must not block replies
+        log.warning("Reply budget: tracker access failed, allowing reply: %s", e)
+        return True
+    return True
 
 # Regex for stripping code blocks before mention extraction
 _CODE_BLOCK_RE = re.compile(r'```.*?```|`[^`]+`', re.DOTALL)
@@ -65,8 +141,16 @@ def fetch_thread_context(
     owner: str,
     repo: str,
     issue_number: str,
+    bot_username: str = "",
 ) -> dict:
     """Fetch issue/PR context for reply generation.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        issue_number: Issue/PR number.
+        bot_username: If provided, comments from this user are excluded
+            from the context to prevent self-reply loops.
 
     Returns:
         Dict with keys: title, body, comments, is_pr, diff_summary.
@@ -101,9 +185,11 @@ def fetch_thread_context(
         )
         comments = json.loads(raw) if raw else []
         if isinstance(comments, list):
+            bot_lower = bot_username.lower() if bot_username else ""
             context["comments"] = [
                 {"author": c.get("author", "?"), "body": truncate_text(c.get("body", ""), 500)}
                 for c in comments
+                if not (bot_lower and c.get("author", "").lower() == bot_lower)
             ]
     except (RuntimeError, json.JSONDecodeError):
         pass
@@ -117,12 +203,11 @@ def fetch_thread_context(
             )
             files = json.loads(raw) if raw else []
             if isinstance(files, list):
-                lines = []
-                for f in files[:30]:  # Cap at 30 files
-                    lines.append(
-                        f"  {f.get('status', '?')} {f.get('filename', '?')} "
-                        f"(+{f.get('additions', 0)}/-{f.get('deletions', 0)})"
-                    )
+                lines = [
+                    f"  {f.get('status', '?')} {f.get('filename', '?')} "
+                    f"(+{f.get('additions', 0)}/-{f.get('deletions', 0)})"
+                    for f in files[:30]
+                ]
                 context["diff_summary"] = "\n".join(lines)
         except (RuntimeError, json.JSONDecodeError):
             pass
@@ -160,9 +245,7 @@ def build_reply_prompt(
     # Format comments for context
     comments_text = ""
     if comments:
-        comment_lines = []
-        for c in comments:
-            comment_lines.append(f"@{c['author']}: {c['body']}")
+        comment_lines = [f"@{c['author']}: {c['body']}" for c in comments]
         comments_text = "\n\n".join(comment_lines)
 
     return load_prompt(
@@ -212,8 +295,9 @@ def generate_reply(
             project_path=project_path,
             allowed_tools=["Read", "Glob", "Grep"],
             model_key="chat",
-            max_turns=1,
-            timeout=120,
+            max_turns=5,
+            timeout=300,
+            max_turns_source=None,
         )
         return clean_reply(reply) if reply else None
     except Exception as e:
@@ -238,15 +322,77 @@ def post_reply(
     Returns:
         True if posted successfully.
     """
+    if not _enforce_reply_budget(owner, repo, issue_number):
+        return False
     try:
+        safe_body = sanitize_github_comment(body)
         api(
             f"repos/{owner}/{repo}/issues/{issue_number}/comments",
             method="POST",
-            extra_args=["-f", f"body={body}"],
+            extra_args=["-f", f"body={safe_body}"],
         )
         return True
     except RuntimeError as e:
         log.warning("Failed to post GitHub reply: %s", e)
+        return False
+
+
+def post_threaded_reply(
+    owner: str,
+    repo: str,
+    issue_number: str,
+    body: str,
+    comment_api_url: str = "",
+    comment_id: str = "",
+    comment_author: str = "",
+    comment_body: str = "",
+) -> bool:
+    """Post a reply threaded to the original comment when possible.
+
+    For PR review comments (pulls/comments/NNN): uses ``in_reply_to``
+    to create a native GitHub review-comment thread.
+    For issue/PR comments: posts a new comment with a blockquote of
+    the original to provide visual threading.
+
+    Falls back to a plain ``post_reply`` when threading metadata is
+    unavailable.
+    """
+    if not _enforce_reply_budget(owner, repo, issue_number):
+        return False
+    safe_body = sanitize_github_comment(body)
+
+    # PR review comments support native threading via in_reply_to
+    if comment_api_url and "/pulls/comments/" in comment_api_url and comment_id:
+        try:
+            api(
+                f"repos/{owner}/{repo}/pulls/{issue_number}/comments",
+                method="POST",
+                extra_args=[
+                    "-f", f"body={safe_body}",
+                    "-F", f"in_reply_to={comment_id}",
+                ],
+            )
+            return True
+        except RuntimeError as e:
+            log.debug("Threaded PR review reply failed, falling back: %s", e)
+
+    # Issue/PR comments: prefix with a blockquote for visual context
+    if comment_author and comment_body:
+        quote_line = comment_body.split("\n")[0]
+        if len(quote_line) > 120:
+            quote_line = quote_line[:120] + "..."
+        threaded_body = f"> @{comment_author}: {quote_line}\n\n{body}"
+        safe_body = sanitize_github_comment(threaded_body)
+
+    try:
+        api(
+            f"repos/{owner}/{repo}/issues/{issue_number}/comments",
+            method="POST",
+            extra_args=["-f", f"body={safe_body}"],
+        )
+        return True
+    except RuntimeError as e:
+        log.warning("Failed to post threaded reply: %s", e)
         return False
 
 

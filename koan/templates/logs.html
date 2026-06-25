@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title_suffix %} — Logs{% endblock %}
+{% block page_title %}Logs{% endblock %}
+{% block content %}
+<style>
+    .logs-controls { display: flex; gap: var(--space-3); margin-bottom: var(--space-4); flex-wrap: wrap; align-items: center; }
+    .logs-controls .k-select, .logs-controls .k-input { width: auto; }
+    .log-output {
+        max-height: 600px; overflow-y: auto;
+        background: var(--graphite-1000); border: 1px solid var(--border);
+        border-radius: var(--radius-md); padding: var(--space-3);
+        font-family: var(--font-mono); font-size: var(--fs-code); line-height: var(--lh-relaxed);
+        color: var(--graphite-300);
+    }
+    .log-line { display: block; white-space: pre-wrap; word-break: break-word; }
+    .log-line.error { color: var(--danger); }
+    .log-line.warn  { color: var(--warning); }
+    .log-line.info  { color: var(--graphite-300); }
+    .log-meta { font-size: var(--fs-caption); color: var(--text-muted); margin-bottom: var(--space-2); }
+</style>
+
+<div class="logs-controls k-card">
+    <select id="source-select" class="k-select" onchange="loadLogs()">
+        <option value="run">Run (agent loop)</option>
+        <option value="awake">Awake (bridge)</option>
+    </select>
+    <input type="text" id="filter-input" class="k-input" placeholder="Filter…" oninput="debouncedFilter()" style="flex:1;min-width:150px;">
+    <label class="k-check" style="white-space:nowrap;">
+        <input type="checkbox" id="autorefresh"> Auto-refresh
+    </label>
+    <button class="k-btn k-btn--secondary" onclick="loadLogs()"><i data-lucide="refresh-cw"></i> Refresh</button>
+</div>
+
+<div class="k-card">
+    <div class="log-meta" id="log-meta">Loading…</div>
+    <div class="log-output" id="log-output">Loading logs…</div>
+</div>
+
+<script>
+(function() {
+    let allLines = [];
+    let filterText = '';
+    let autoRefreshTimer = null;
+
+    const sourceSelect = document.getElementById('source-select');
+    const filterInput = document.getElementById('filter-input');
+    const autorefresh = document.getElementById('autorefresh');
+    const output = document.getElementById('log-output');
+    const meta = document.getElementById('log-meta');
+
+    function classifyLine(line) {
+        const lower = line.toLowerCase();
+        if (lower.includes('error') || lower.includes('traceback') || lower.includes('exception')) return 'error';
+        if (lower.includes('warn')) return 'warn';
+        return 'info';
+    }
+
+    function escHtml(s) {
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function render() {
+        const filtered = filterText
+            ? allLines.filter(l => l.toLowerCase().includes(filterText.toLowerCase()))
+            : allLines;
+        output.innerHTML = filtered.map(l =>
+            `<span class="log-line ${classifyLine(l)}">${escHtml(l)}</span>`
+        ).join('');
+        meta.textContent = `${filtered.length} lines` + (filterText ? ` (filtered from ${allLines.length})` : '');
+        output.scrollTop = output.scrollHeight;
+    }
+
+    function loadLogs() {
+        const source = sourceSelect.value;
+        fetch(`/api/logs?source=${source}&lines=500`)
+            .then(r => r.json())
+            .then(data => { allLines = data.lines || []; render(); })
+            .catch(() => { meta.textContent = 'Failed to load logs'; });
+    }
+
+    function debouncedFilter() {
+        filterText = filterInput.value;
+        clearTimeout(window._filterTimer);
+        window._filterTimer = setTimeout(render, 150);
+    }
+
+    window.loadLogs = loadLogs;
+    window.debouncedFilter = debouncedFilter;
+
+    autorefresh.addEventListener('change', function() {
+        if (autorefresh.checked) {
+            autoRefreshTimer = setInterval(loadLogs, 5000);
+        } else {
+            clearInterval(autoRefreshTimer);
+        }
+    });
+
+    loadLogs();
+})();
+</script>
+{% endblock %}
+{% block scripts %}
+<script>if (window.lucide) lucide.createIcons();</script>
+{% endblock %}

@@ -26,13 +26,18 @@ SKILL.md format:
     ...
 """
 
+import importlib
 import importlib.util
 import logging
+import os
 import re
+import subprocess
+import sys
+import time
 from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 # Returned by _execute_handler() on unhandled exceptions so callers can
 # distinguish handler crashes from intentional error responses.
@@ -77,6 +82,37 @@ class Skill:
     github_context_aware: bool = False
     cli_skill: Optional[str] = None
     group: str = ""
+    emoji: str = ""
+    # ``caveman_enabled`` follows the SKILL.md frontmatter ``caveman:`` flag.
+    # Default ``False`` (opt-in): a skill must declare ``caveman: true`` in
+    # its frontmatter (or be listed in ``optimizations.caveman.include`` in
+    # ``config.yaml``) for the caveman directive to be appended.  Skills
+    # are also free to keep an explicit ``caveman: false`` to document
+    # intent, even though it matches the default.
+    caveman_enabled: bool = False
+    # ``forward_result_enabled`` follows the SKILL.md frontmatter
+    # ``forward_result:`` flag. When True, the post-mission pipeline forwards
+    # the Claude session's result text to outbox.md so the user sees the
+    # response to their slash command / @mention. Auto-derived markers
+    # (slash-command forms of every command + alias, plus ``/{scope}.{name}``)
+    # are matched against the mission title in addition to any explicit
+    # ``title_markers``.
+    forward_result_enabled: bool = False
+    # ``title_markers`` — optional list of additional mission-title substrings
+    # that should also flag a mission as belonging to this skill, for the case
+    # where a handler emits plain-text titles without the slash command.
+    title_markers: List[str] = field(default_factory=list)
+    # ``sub_commands`` — optional list of skill commands to queue when this
+    # skill is triggered.  Combo skills (e.g. /rr → /review + /rebase) declare
+    # their expansion in SKILL.md frontmatter rather than in a hardcoded dict.
+    sub_commands: List[str] = field(default_factory=list)
+    parallel_sub_commands: bool = False
+    requirements: List[str] = field(default_factory=list)
+    # ``model_key`` — optional key used to resolve the model name shown in PR
+    # footers (e.g. "mission"). When set, the agent loop forwards it to the
+    # skill subprocess via ``KOAN_MISSION_MODEL_KEY``.
+    model_key: str = ""
+    iterative: bool = False
 
     @property
     def qualified_name(self) -> str:
@@ -125,7 +161,7 @@ def _parse_yaml_lite(text: str) -> Dict[str, Any]:
         value = match.group(2).strip()
 
         if key == "commands" and not value:
-            # Block list of command dicts
+            # Block list of command dicts (or simple strings)
             commands = []
             i += 1
             current_cmd: Dict[str, Any] = {}
@@ -138,6 +174,11 @@ def _parse_yaml_lite(text: str) -> Dict[str, Any]:
                     if current_cmd:
                         commands.append(current_cmd)
                     current_cmd = {"name": cline[7:].strip()}
+                elif cline.startswith("- ") and ":" not in cline:
+                    # Simple string entry: "- models"
+                    if current_cmd:
+                        commands.append(current_cmd)
+                    current_cmd = {"name": cline[2:].strip()}
                 elif cline.startswith("description:"):
                     current_cmd["description"] = cline[12:].strip()
                 elif cline.startswith("usage:"):
@@ -155,6 +196,8 @@ def _parse_yaml_lite(text: str) -> Dict[str, Any]:
         if value.startswith("[") and value.endswith("]"):
             result[key] = _parse_inline_list(value)
         else:
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
             result[key] = value
 
         i += 1
@@ -176,11 +219,69 @@ def _parse_inline_list(s: str) -> List[str]:
 
 def _parse_bool_flag(meta: Dict[str, Any], key: str) -> bool:
     """Parse a boolean flag from SKILL.md frontmatter metadata.
-    
+
     Accepts: "true", "yes", "1" (case-insensitive) as truthy values.
     Returns False for any other value or if key is missing.
     """
     return meta.get(key, "").lower() in ("true", "yes", "1")
+
+
+# All frontmatter keys recognized by parse_skill_md(). Used to flag typos
+# (e.g. ``descrption:``) as unknown keys at parse time rather than silently
+# dropping them. ``aliases``/``usage`` are command-level keys (nested under
+# ``commands:``), not top-level, so they are excluded here.
+_KNOWN_SKILL_KEYS = frozenset({
+    "name", "scope", "description", "version", "commands", "handler",
+    "worker", "github_enabled", "github_context_aware", "caveman",
+    "forward_result", "iterative", "title_markers", "audience", "cli_skill",
+    "group", "emoji", "requirements", "sub_commands", "parallel", "model_key",
+})
+
+
+def validate_skill_metadata(meta: Dict[str, Any], path: Path) -> List[str]:
+    """Return human-readable warnings about SKILL.md frontmatter problems.
+
+    Catches the silent-failure modes called out in the skill authoring guide:
+    typo'd keys (``descrption:``), missing required fields, and a declared
+    ``handler:`` whose file is absent. Returns an empty list when the metadata
+    is clean. Pure function — never logs or raises — so callers decide how to
+    surface the warnings (logged at registry build, asserted in tests).
+    """
+    import difflib
+
+    warnings: List[str] = []
+
+    # Required non-empty fields. ``name`` is enforced separately by the caller
+    # (a missing name means the file isn't a parseable skill at all).
+    if not str(meta.get("description", "")).strip():
+        warnings.append("missing required field 'description'")
+
+    commands = meta.get("commands")
+    if not commands:
+        warnings.append("missing required field 'commands'")
+    elif isinstance(commands, list) and not any(
+        isinstance(c, dict) and c.get("name") for c in commands
+    ):
+        # Inline form (``commands: [a, b]``) parses to bare strings, which
+        # parse_skill_md() silently drops — the skill ends up uninvokable.
+        warnings.append(
+            "'commands' has no valid entries — use block form with "
+            "'- name: <cmd>' so the command is registered"
+        )
+
+    # Unknown keys — almost always typos. Suggest the nearest known key.
+    for key in meta:
+        if key not in _KNOWN_SKILL_KEYS:
+            suggestion = difflib.get_close_matches(key, _KNOWN_SKILL_KEYS, n=1, cutoff=0.6)
+            hint = f" (did you mean '{suggestion[0]}'?)" if suggestion else ""
+            warnings.append(f"unknown key '{key}'{hint}")
+
+    # Cross-reference: a declared handler must exist on disk.
+    handler_name = str(meta.get("handler", "")).strip()
+    if handler_name and not (path.parent / handler_name).exists():
+        warnings.append(f"declared handler '{handler_name}' not found in skill directory")
+
+    return warnings
 
 
 def parse_skill_md(path: Path) -> Optional[Skill]:
@@ -205,18 +306,22 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
     if "name" not in meta:
         return None
 
+    # Surface frontmatter problems (typos, missing fields, dangling handler)
+    # at parse time so they show up in startup logs instead of failing silently.
+    for warning in validate_skill_metadata(meta, path):
+        _log.warning("Skill %s: %s", path.parent.name, warning)
+
     # Parse commands
-    commands = []
-    for cmd_data in meta.get("commands", []):
-        if isinstance(cmd_data, dict) and "name" in cmd_data:
-            commands.append(
-                SkillCommand(
-                    name=cmd_data["name"],
-                    description=cmd_data.get("description", ""),
-                    aliases=cmd_data.get("aliases", []),
-                    usage=cmd_data.get("usage", ""),
-                )
-            )
+    commands = [
+        SkillCommand(
+            name=cmd_data["name"],
+            description=cmd_data.get("description", ""),
+            aliases=cmd_data.get("aliases", []),
+            usage=cmd_data.get("usage", ""),
+        )
+        for cmd_data in meta.get("commands", [])
+        if isinstance(cmd_data, dict) and "name" in cmd_data
+    ]
 
     # Resolve handler path (always record declared path; has_handler() checks existence)
     handler_path = None
@@ -226,10 +331,22 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
 
     skill_dir = path.parent
 
-    # Parse boolean flags
+    # Parse boolean flags — caveman is opt-in (defaults to False).
     worker = _parse_bool_flag(meta, "worker")
     github_enabled = _parse_bool_flag(meta, "github_enabled")
     github_context_aware = _parse_bool_flag(meta, "github_context_aware")
+    caveman_enabled = _parse_bool_flag(meta, "caveman")
+    forward_result_enabled = _parse_bool_flag(meta, "forward_result")
+    iterative = _parse_bool_flag(meta, "iterative")
+
+    # Parse title_markers (optional inline list or comma-separated scalar).
+    title_markers_raw = meta.get("title_markers", [])
+    if isinstance(title_markers_raw, list):
+        title_markers = [str(m).strip() for m in title_markers_raw if str(m).strip()]
+    elif isinstance(title_markers_raw, str) and title_markers_raw.strip():
+        title_markers = [s.strip() for s in title_markers_raw.split(",") if s.strip()]
+    else:
+        title_markers = []
 
     # Parse audience (default: "bridge" for backward compatibility)
     audience = meta.get("audience", DEFAULT_AUDIENCE).lower()
@@ -241,6 +358,27 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
 
     # Parse group (for /help grouping)
     group = meta.get("group", "")
+
+    # Parse emoji (for /list display)
+    emoji = meta.get("emoji", "")
+
+    # Parse requirements (for auto-install)
+    requirements_raw = meta.get("requirements", [])
+    if isinstance(requirements_raw, str):
+        requirements_raw = [requirements_raw] if requirements_raw else []
+    requirements = [r for r in requirements_raw if r]
+
+    # Parse sub_commands (for combo skill expansion)
+    sub_commands_raw = meta.get("sub_commands", [])
+    if isinstance(sub_commands_raw, str):
+        sub_commands_raw = [sub_commands_raw] if sub_commands_raw else []
+    sub_commands = [s for s in sub_commands_raw if s]
+
+    # Parse parallel flag (for combo skills batch insertion)
+    parallel_sub_commands = _parse_bool_flag(meta, "parallel")
+
+    # Parse model_key (for PR footer model resolution)
+    model_key = str(meta.get("model_key", "") or "").strip()
 
     return Skill(
         name=meta["name"],
@@ -257,6 +395,15 @@ def parse_skill_md(path: Path) -> Optional[Skill]:
         github_context_aware=github_context_aware,
         cli_skill=cli_skill,
         group=group,
+        emoji=emoji,
+        caveman_enabled=caveman_enabled,
+        forward_result_enabled=forward_result_enabled,
+        title_markers=title_markers,
+        sub_commands=sub_commands,
+        parallel_sub_commands=parallel_sub_commands,
+        requirements=requirements,
+        model_key=model_key,
+        iterative=iterative,
     )
 
 
@@ -289,25 +436,35 @@ class SkillRegistry:
         """Register a skill and build command lookup."""
         key = skill.qualified_name
 
-        # Reject skills whose command names or aliases contain hyphens.
+        # Reject individual commands/aliases whose names contain hyphens.
         # Hyphens break Telegram command parsing (treated as word boundary).
         # See CLAUDE.md "No hyphens in skill names or aliases".
+        # Only the offending command/alias is skipped — the rest of the skill
+        # is still registered.
+        valid_commands: List[SkillCommand] = []
         for cmd in skill.commands:
             if "-" in cmd.name:
-                _log.warning(
+                _log.error(
                     "Skill %s: command '%s' contains a hyphen — "
-                    "skipping registration. Use underscores instead.",
+                    "skipping this command. Use underscores instead.",
                     key, cmd.name,
                 )
-                return
-            for alias in cmd.aliases:
-                if "-" in alias:
-                    _log.warning(
-                        "Skill %s: alias '%s' contains a hyphen — "
-                        "skipping registration. Use underscores instead.",
-                        key, alias,
-                    )
-                    return
+                continue
+            # Filter out hyphenated aliases, keep the rest
+            bad_aliases = [a for a in cmd.aliases if "-" in a]
+            if bad_aliases:
+                _log.error(
+                    "Skill %s: alias(es) %s contain a hyphen — "
+                    "skipping these aliases. Use underscores instead.",
+                    key, ", ".join(repr(a) for a in bad_aliases),
+                )
+            clean_aliases = [a for a in cmd.aliases if "-" not in a]
+            valid_commands.append(SkillCommand(
+                name=cmd.name,
+                description=cmd.description,
+                aliases=clean_aliases,
+                usage=cmd.usage,
+            ))
 
         self._skills[key] = skill
 
@@ -320,11 +477,24 @@ class SkillRegistry:
                 key,
             )
 
-        # Map each command name and alias to this skill
-        for cmd in skill.commands:
+        # Map each valid command name and alias to this skill
+        for cmd in valid_commands:
+            self._check_collision(cmd.name, skill, is_alias=False)
             self._command_map[cmd.name] = skill
             for alias in cmd.aliases:
+                self._check_collision(alias, skill, is_alias=True)
                 self._command_map[alias] = skill
+
+    def _check_collision(self, name: str, skill: Skill, *, is_alias: bool) -> None:
+        """Log a warning if *name* is already registered by a different skill."""
+        existing = self._command_map.get(name)
+        if existing is not None and existing.qualified_name != skill.qualified_name:
+            kind = "alias" if is_alias else "command"
+            _log.warning(
+                "Skill %s: %s '%s' collides with skill %s — "
+                "the earlier registration will be overwritten.",
+                skill.qualified_name, kind, name, existing.qualified_name,
+            )
 
     def get(self, scope: str, name: str) -> Optional[Skill]:
         return self._skills.get(f"{scope}.{name}")
@@ -352,7 +522,7 @@ class SkillRegistry:
         if extra_commands:
             candidates.extend(extra_commands)
 
-        matches = difflib.get_close_matches(command_name, candidates, n=1, cutoff=0.6)
+        matches = difflib.get_close_matches(command_name, candidates, n=1, cutoff=0.5)
         return matches[0] if matches else None
 
     def list_all(self) -> List[Skill]:
@@ -369,6 +539,15 @@ class SkillRegistry:
         """Return core skills belonging to the given help group."""
         return [s for s in self._skills.values()
                 if s.scope == "core" and s.group == group]
+
+    def list_by_group_any_scope(self, group: str) -> List[Skill]:
+        """Return all skills in the given group, regardless of scope.
+
+        Used for the ``integrations`` help group, which is deliberately
+        reserved for non-core skills (e.g. skills under
+        ``instance/skills/<scope>/``).
+        """
+        return [s for s in self._skills.values() if s.group == group]
 
     def groups(self) -> List[str]:
         """Return sorted list of distinct help groups from core skills."""
@@ -426,6 +605,60 @@ class SkillRegistry:
         return qualified_name in self._skills
 
 
+def collect_forward_result_markers(registry: "SkillRegistry") -> List[str]:
+    """Return mission-title substrings for every skill that opted into result forwarding.
+
+    For each skill with ``forward_result_enabled``:
+      - emit ``/{cmd.name}`` and ``/{alias}`` for every command + alias,
+      - emit ``/{scope}.{name}`` (the scoped form used when a project tag is
+        present — see ``command_handlers._queue_cli_skill_mission``),
+      - emit every entry from ``title_markers`` (for handler-composed
+        plain-text mission titles).
+
+    All markers are lower-cased and deduplicated so the caller can do a flat
+    case-insensitive substring check against the mission title.
+    """
+    markers: set[str] = set()
+    for skill in registry.list_all():
+        if not skill.forward_result_enabled:
+            continue
+        markers.add(f"/{skill.scope}.{skill.name}".lower())
+        for cmd in skill.commands:
+            markers.add(f"/{cmd.name}".lower())
+            for alias in cmd.aliases:
+                markers.add(f"/{alias}".lower())
+        for raw in skill.title_markers:
+            text = (raw or "").strip().lower()
+            if text:
+                markers.add(text)
+    return sorted(markers)
+
+
+ComboSkill = namedtuple("ComboSkill", ["commands", "parallel"], defaults=[False])
+
+
+def collect_combo_skills(registry: "SkillRegistry") -> Dict[str, "ComboSkill"]:
+    """Build a mapping of command names/aliases to combo skill info.
+
+    Iterates all skills with ``sub_commands`` defined in their SKILL.md
+    frontmatter and maps every command name + alias to the expansion info.
+
+    Returns:
+        Dict mapping command name or alias to ComboSkill(commands, parallel).
+        Example: {"rr": ComboSkill(["review", "rebase"], False)}
+    """
+    mapping: Dict[str, ComboSkill] = {}
+    for skill in registry.list_all():
+        if not skill.sub_commands:
+            continue
+        combo = ComboSkill(commands=skill.sub_commands, parallel=skill.parallel_sub_commands)
+        for cmd in skill.commands:
+            mapping[cmd.name] = combo
+            for alias in cmd.aliases:
+                mapping[alias] = combo
+    return mapping
+
+
 # ---------------------------------------------------------------------------
 # Skill execution
 # ---------------------------------------------------------------------------
@@ -440,6 +673,21 @@ class SkillContext:
     args: str = ""
     send_message: Optional[Callable[[str], Any]] = None
     handle_chat: Optional[Callable[[str], Any]] = None
+    project_name: str = ""
+    _memory: Any = field(init=False, default=None, repr=False)
+
+    @property
+    def memory(self):
+        """Lazy :class:`~app.skill_memory_accessor.MemoryAccessor` instance.
+
+        Constructed on first access so skills that never touch memory pay
+        nothing. Read methods take ``project`` as a parameter; pass
+        ``ctx.project_name`` when no explicit project is in scope.
+        """
+        if self._memory is None:
+            from app.skill_memory_accessor import MemoryAccessor
+            self._memory = MemoryAccessor(self.instance_dir)
+        return self._memory
 
 
 def execute_skill(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillError]]:
@@ -447,6 +695,7 @@ def execute_skill(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillE
 
     Handler-based skills: imports handler.py and calls handle(ctx).
     Prompt-based skills: returns the prompt body (caller sends to Claude).
+    Combo skills (sub_commands, no handler): expands into pending missions.
 
     Returns:
         Response text, SkillError on handler crash, or None if no handler.
@@ -455,7 +704,174 @@ def execute_skill(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillE
         return _execute_handler(skill, ctx)
     if skill.prompt_body:
         return _execute_prompt(skill, ctx)
+    if skill.sub_commands:
+        return _execute_combo_skill(skill, ctx)
     return None
+
+
+def _execute_combo_skill(skill: Skill, ctx: SkillContext) -> str:
+    """Expand a combo skill into pending missions via expand_combo_skill()."""
+    from app.skill_dispatch import expand_combo_skill
+    from app.utils import get_known_projects, resolve_project_alias
+
+    args = ctx.args.strip()
+    project = None
+    mission_args = args
+
+    words = args.split(None, 1)
+    if words:
+        known_map = {name.lower(): name for name, _ in get_known_projects()}
+        matched = known_map.get(words[0].lower())
+        if not matched:
+            matched = resolve_project_alias(words[0])
+        if matched:
+            project = matched
+            mission_args = words[1] if len(words) > 1 else ""
+
+    tag = f"[project:{project}] " if project else ""
+    mission_text = f"{tag}/{ctx.command_name} {mission_args}".rstrip()
+
+    expanded = expand_combo_skill(mission_text, str(ctx.instance_dir))
+    if not expanded:
+        return f"Failed to expand combo /{ctx.command_name} — skill not found in dispatch cache"
+
+    sub_list = ", ".join(f"/{c}" for c in skill.sub_commands)
+    ack = f"Combo /{ctx.command_name} expanded into: {sub_list}"
+    if project:
+        ack += f" (project: {project})"
+    return ack
+
+
+# Captured at import time so first-time observations in
+# _refresh_stale_app_modules can tell whether a module's source file has been
+# rewritten by auto-update since this process started (Python had no chance to
+# pick up the new content because sys.modules still holds the pre-update copy).
+_PROCESS_START_TIME: float = time.time()
+# mtime cache: module_name -> last-seen mtime (float)
+_module_mtimes: Dict[str, float] = {}
+
+# Track which skills have already had their requirements satisfied this session
+_requirements_satisfied: Set[str] = set()
+
+
+def _reset_requirements_cache() -> None:
+    """Clear the per-session requirements cache (used by tests)."""
+    _requirements_satisfied.clear()
+
+
+def ensure_requirements(skill: Skill) -> Optional[str]:
+    """Check and install missing Python packages declared in a skill's requirements.
+
+    Returns None on success, or an error message string on failure.
+    """
+    reqs = getattr(skill, "requirements", [])
+    if not reqs:
+        return None
+
+    # Skip if already checked this session
+    if skill.qualified_name in _requirements_satisfied:
+        return None
+
+    # Reject entries that look like pip CLI flags (e.g. --index-url)
+    for pkg in reqs:
+        if pkg.startswith("-"):
+            return f"Invalid requirement '{pkg}' for skill {skill.qualified_name}: flags not allowed"
+
+    missing = []
+    for pkg in reqs:
+        # Normalize: pip package names use hyphens, but import names use underscores
+        # Split on any PEP 440 version operator (~=, >=, <=, !=, ===, ==, >, <)
+        import_name = re.split(r'[><=!~]', pkg)[0].replace("-", "_").strip()
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            missing.append(pkg)
+
+    if not missing:
+        _requirements_satisfied.add(skill.qualified_name)
+        return None
+
+    # Install missing packages
+    _log.info(
+        "[skills] auto-installing %s for skill %s",
+        ", ".join(missing), skill.qualified_name,
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            error_msg = (
+                f"Failed to install requirements for skill {skill.qualified_name}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            _log.error(error_msg)
+            return error_msg
+
+        _requirements_satisfied.add(skill.qualified_name)
+        return None
+    except subprocess.TimeoutExpired:
+        error_msg = f"Timeout installing requirements for skill {skill.qualified_name}"
+        _log.error(error_msg)
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error installing requirements for skill {skill.qualified_name}: {e}"
+        _log.error(error_msg)
+        return error_msg
+
+
+def _refresh_stale_app_modules() -> None:
+    """Reload app.* modules whose source files changed on disk.
+
+    Skill handlers are loaded fresh via exec_module() each invocation, but
+    their ``import app.foo`` statements resolve from sys.modules.  After an
+    auto-update the cached entry may be stale (missing new functions/args),
+    causing TypeErrors at call sites.
+
+    Instead of maintaining a hardcoded list of modules to refresh, this
+    checks the mtime of every loaded ``app.*`` module's source file.  Only
+    modules whose file actually changed are reloaded — typically zero on
+    most invocations, making this cheap in the common case.
+
+    If reload fails (e.g. partial write during update), the stale entry is
+    evicted so the handler's own ``import`` fetches a fresh copy from disk.
+    """
+    for name in list(sys.modules):
+        if not name.startswith("app."):
+            continue
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        source = getattr(mod, "__file__", None)
+        if source is None:
+            continue
+        try:
+            current_mtime = os.path.getmtime(source)
+        except OSError:
+            continue
+        cached_mtime = _module_mtimes.get(name)
+        if cached_mtime is not None and current_mtime == cached_mtime:
+            continue
+        # Reload when either: (a) we have a baseline and the file changed, or
+        # (b) this is the first observation but the file was modified after the
+        # process started — i.e. auto-update rewrote it before we built a baseline.
+        should_reload = (
+            cached_mtime is not None
+            or current_mtime > _PROCESS_START_TIME
+        )
+        if should_reload:
+            try:
+                importlib.reload(mod)
+                _log.debug("Reloaded stale module %s", name)
+            except Exception as e:
+                _log.debug("Failed to reload %s, evicting: %s", name, e)
+                sys.modules.pop(name, None)
+                _module_mtimes.pop(name, None)
+                continue
+        _module_mtimes[name] = current_mtime
 
 
 def _execute_handler(skill: Skill, ctx: SkillContext) -> Optional[Union[str, SkillError]]:
@@ -464,7 +880,39 @@ def _execute_handler(skill: Skill, ctx: SkillContext) -> Optional[Union[str, Ski
     if handler_path is None:
         return None
 
+    # Auto-install declared requirements before first execution
+    req_error = ensure_requirements(skill)
+    if req_error:
+        return SkillError(
+            skill_name=skill.qualified_name,
+            exception=str(RuntimeError(req_error)),
+            message=req_error,
+        )
+
     try:
+        _refresh_stale_app_modules()
+
+        # Ensure the parent of the skills/ package directory resolves BEFORE
+        # every other sys.path entry so handler imports like
+        # ``from skills.core.X import Y`` resolve to the koan/skills/ *package*.
+        # A ``python app/run.py`` launch puts koan/app/ at sys.path[0], and that
+        # directory contains app/skills.py — a module that shadows the package
+        # and makes such imports fail with "'skills' is not a package".  Merely
+        # appending koan/ (it is usually already present via PYTHONPATH=.) is not
+        # enough; it must come first.
+        _skills_pkg_parent = str(get_default_skills_dir().resolve().parent)
+        if not sys.path or sys.path[0] != _skills_pkg_parent:
+            while _skills_pkg_parent in sys.path:
+                sys.path.remove(_skills_pkg_parent)
+            sys.path.insert(0, _skills_pkg_parent)
+
+        # If a prior import already resolved bare ``skills`` to app/skills.py (a
+        # module, not the package), evict it so the corrected sys.path order
+        # re-imports the real koan/skills/ package on the handler's first import.
+        _cached_skills = sys.modules.get("skills")
+        if _cached_skills is not None and not hasattr(_cached_skills, "__path__"):
+            sys.modules.pop("skills", None)
+
         spec = importlib.util.spec_from_file_location(
             f"skill_handler_{skill.qualified_name}",
             str(handler_path),
@@ -481,9 +929,12 @@ def _execute_handler(skill: Skill, ctx: SkillContext) -> Optional[Union[str, Ski
         return handle_fn(ctx)
     except Exception as e:
         _log.error("Skill handler %s failed: %s", skill.qualified_name, e, exc_info=True)
+        # Store exception as string — raw exception objects are not JSON-
+        # serializable and leak into requests.post(json=...) if the SkillError
+        # bypasses isinstance() checks after a module reload.
         return SkillError(
             skill_name=skill.qualified_name,
-            exception=e,
+            exception=f"{type(e).__name__}: {e}",
             message=f"Skill error ({skill.qualified_name}): {e}",
         )
 
@@ -510,15 +961,24 @@ def build_registry(extra_dirs: Optional[List[Path]] = None) -> SkillRegistry:
 
     Args:
         extra_dirs: Additional directories to scan (e.g., instance/skills/).
+
+    Skills under ``extra_dirs`` are filtered through the approval gate:
+    any SKILL.md whose own directory or an ancestor up to the extra dir
+    carries a ``.koan-pending`` marker is silently skipped so the bridge
+    cannot exec a handler that has not been approved.
     """
     registry = SkillRegistry(get_default_skills_dir())
 
     if extra_dirs:
+        from app.skill_approval import find_pending_ancestor
         for d in extra_dirs:
-            if d.is_dir():
-                for skill_md in sorted(d.rglob("SKILL.md")):
-                    skill = parse_skill_md(skill_md)
-                    if skill:
-                        registry._register(skill)
+            if not d.is_dir():
+                continue
+            for skill_md in sorted(d.rglob("SKILL.md")):
+                if find_pending_ancestor(skill_md, d) is not None:
+                    continue
+                skill = parse_skill_md(skill_md)
+                if skill:
+                    registry._register(skill)
 
     return registry

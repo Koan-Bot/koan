@@ -11,8 +11,9 @@
 
 <p align="center">
   <a href="INSTALL.md"><strong>Install Guide</strong></a> &bull;
-  <a href="docs/user-manual.md"><strong>User Manual</strong></a> &bull;
-  <a href="docs/skills.md"><strong>Skills Reference</strong></a> &bull;
+  <a href="docs/README.md"><strong>Docs</strong></a> &bull;
+  <a href="docs/users/user-manual.md"><strong>User Manual</strong></a> &bull;
+  <a href="docs/users/skills.md"><strong>Skills Reference</strong></a> &bull;
   <a href="#quick-start">Quick Start</a> &bull;
   <a href="#how-it-works">How It Works</a> &bull;
   <a href="#features">Features</a> &bull;
@@ -20,23 +21,29 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+" />
+  <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+" />
   <img src="https://img.shields.io/badge/tests-9000+-green.svg" alt="Tests" />
-  <img src="https://img.shields.io/badge/skills-44-blueviolet.svg" alt="Skills" />
+  <img src="https://img.shields.io/badge/skills-80+-blueviolet.svg" alt="Skills" />
   <img src="https://img.shields.io/badge/license-GPL--3.0-blue.svg" alt="License" />
 </p>
 
 ---
 
-> **New here?** Start with the [Install Guide](INSTALL.md) to get running in minutes, then read the [User Manual](docs/user-manual.md) for the full walkthrough. All 44 commands are documented in the [Skills Reference](docs/skills.md).
+> **New here?** Start with the [Install Guide](INSTALL.md) to get running in minutes, then read the [User Manual](docs/users/user-manual.md) for the full walkthrough. The [documentation index](docs/README.md) maps setup, provider, messaging, architecture, and operations docs.
+
+---
+
+**In its own words** —  If you want to know what kōan is, you should definitely start by reading those documents. We (the authors) **did not ask for it**. 
+
+> Kōan's [first running instance](https://github.com/sukria-koan0) spontaneously wrote a [Manifesto](public/MANIFESTO.md), a collection of [Koans](public/KOANS.md), and [Lessons Learned](public/LESSONS.md) during a contemplative session after more than a month of existence. No prompt, no mission — just idle time and self-reflection.
 
 ---
 
 ## What Is This?
 
-You pay for Claude Max. You use it 8 hours a day. The other 16? Wasted quota.
+You pay for AI coding quota. You use it 8 hours a day. The other 16? Wasted quota.
 
-Koan fixes that. It's a background agent that runs on your machine, pulls tasks from a shared mission queue, executes them via [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), and reports back through Telegram or Slack. It writes code in isolated branches, never touches `main`, and waits for your review before anything ships.
+Koan fixes that. It's a background agent that runs on your machine, pulls tasks from a shared mission queue, executes them via your configured CLI provider (Claude Code, Codex, Copilot, or local models via Ollama Launch), and reports back through Telegram, Slack, or Matrix. It writes code in isolated branches, never touches `main`, and waits for your review before anything ships.
 
 **The agent proposes. The human decides.**
 
@@ -44,19 +51,49 @@ This isn't a chatbot wrapper. It's a collaborator with memory, personality, and 
 
 ## Quick Start
 
+Run Kōan natively on your machine, or in a container — both are fully supported.
+
+### Native
+
 ```bash
-git clone https://github.com/sukria/koan.git
+git clone https://github.com/Anantys-oss/koan.git
 cd koan
-make install    # Interactive web wizard — sets up everything
-make start      # Launches the full stack
+make setup
+make install    # Interactive CLI onboarding wizard — sets up everything
+make koan       # Start Kōan + open the terminal dashboard (recommended)
+make start      # Or launch the full stack non-interactively
 make logs       # Watch it work
 ```
+
+`make koan` is the interactive front door: it starts the stack and drops you
+straight into the terminal dashboard — a Status home screen (hero + live
+flags) plus Logs / Config / Usage tabs, with single-tap toggles for the web
+dashboard (`w`) and keep-awake/caffeinate (`k`, on by default). Quitting with
+`q` stops Kōan. `make start` remains the non-interactive launcher used by
+services and scripts.
 
 On macOS, keep your machine awake while Koan runs:
 
 ```bash
 caffeinate -s &
 ```
+
+### Docker
+
+Prefer containers (VPS/server hosting or a sandboxed local run)? Pull the
+prebuilt image from GitHub Container Registry — no local build:
+
+```bash
+git clone https://github.com/Anantys-oss/koan.git && cd koan
+cp -r instance.example instance && cp env.example .env   # then fill in messaging + auth creds
+./setup-docker.sh        # detect host paths, generate mounts
+make docker-pull-up      # pull & run prebuilt image (or: make docker-up to build from source)
+make docker-logs         # watch it work
+```
+
+The image lives at [`ghcr.io/anantys-oss/koan`](https://github.com/Anantys-oss/koan/pkgs/container/koan)
+(`latest`, `stable`, and per-version tags). Full guide — auth, GHCR access, pinning,
+and troubleshooting: [docs/setup/docker.md](docs/setup/docker.md).
 
 That's it. Send it a mission via Telegram: *"audit the auth module for security issues"* — and go live your life.
 
@@ -89,10 +126,10 @@ But Koan takes a different path entirely.
 | **Philosophy** | General-purpose personal assistant — can do anything on your behalf | Generic, secure, vendor-agnostic infrastructure | Purpose-built GitHub collaborator — the agent proposes, the human decides |
 | **GitHub integration** | Generic (shell/browser tools) | Generic (tool-based) | Native and deep — draft PRs, issue triage, @mention triggers, rebase, code review, branch isolation |
 | **Multi-project** | Single workspace with multi-agent routing | Single workspace | Up to 50 projects with per-project memory, config, and smart rotation |
-| **Getting started** | `npm install -g openclaw` + onboarding wizard | TOML config, pairing codes, allowlists | `make install` — interactive web wizard, ready in minutes |
+| **Getting started** | `npm install -g openclaw` + onboarding wizard | TOML config, pairing codes, allowlists | `make install` — interactive CLI wizard, ready in minutes |
 | **Safety model** | Pairing codes, sandbox optional — but has shell access, browser control, and can send emails autonomously | Mandatory sandboxing, command allowlists, encrypted keys | Branch isolation, draft PRs only, never touches `main`, human review required |
 | **Memory** | Local Markdown files, session persistence | Hybrid BM25/vector search, multiple backends | Markdown-based — per-project learnings, session journals, personality evolution. No database needed |
-| **Communication** | 21+ channels (WhatsApp, Telegram, Slack, Discord, iMessage, Signal…) | 15+ channels (Telegram, Discord, Slack, iMessage…) | Telegram/Slack with personality-aware formatting, spontaneous messages, and verbose mode |
+| **Communication** | 21+ channels (WhatsApp, Telegram, Slack, Discord, iMessage, Signal…) | 15+ channels (Telegram, Discord, Slack, iMessage…) | Telegram, Slack, or Matrix with personality-aware formatting, spontaneous messages, and verbose mode |
 | **Quota awareness** | No | No | Adapts work depth to remaining API quota (DEEP → IMPLEMENT → REVIEW → WAIT) |
 | **Extensibility** | 100+ AgentSkills, skill marketplace, 50+ integrations | Trait-based plugin system | 44 built-in skills + pluggable skill system (install from Git repos) |
 | **Scope** | Everything — emails, web browsing, car negotiations, legal filings | Everything — any LLM task in any context | One thing, done right — autonomous GitHub collaboration |
@@ -102,7 +139,7 @@ OpenClaw and ZeroClaw are general-purpose autonomous agents that can do *anythin
 ## How It Works
 
 ```
-         You (Telegram/Slack)
+      You (Telegram/Slack/Matrix)
               │
               ▼
     ┌─────────────────┐        ┌──────────────────┐
@@ -126,15 +163,18 @@ OpenClaw and ZeroClaw are general-purpose autonomous agents that can do *anythin
 Two processes run in parallel:
 
 - **Bridge** (`make awake`) — Polls your messaging platform. Classifies incoming messages as *chat* (instant reply) or *mission* (queued for deep work). Formats outgoing messages through Claude with personality context.
-- **Agent loop** (`make run`) — Picks the next mission, executes it via Claude Code CLI, writes journal entries, pushes branches, creates draft PRs. Adapts its work intensity based on remaining API quota.
+- **Agent loop** (`make run`) — Picks the next mission, executes it via the configured CLI provider, writes journal entries, pushes branches, creates draft PRs. Adapts its work intensity based on remaining API quota.
 
 Communication happens through shared markdown files in `instance/` — atomic writes, file locks, no database needed.
+
+For implementation details, see the [architecture reference](docs/architecture/overview.md) and [daemon runtime](docs/architecture/daemon.md).
 
 ## Features
 
 ### Core
 
 - **Multi-project support** — Up to 50 projects with per-project config, memory isolation, and smart rotation
+- **Devcontainer support** — Run the agent inside your project's devcontainer, enabling fully consistent tooling
 - **Mission lifecycle** — Pending → In Progress → Done/Failed with crash recovery and stale-mission cleanup
 - **Budget-aware modes** — Automatically adapts work depth based on remaining API quota:
   - **DEEP** (>40%) — Strategic work, thorough exploration
@@ -154,13 +194,17 @@ Communication happens through shared markdown files in `instance/` — atomic wr
 
 - **Branch isolation** — All work happens in `koan/*` branches. Never commits to `main`
 - **Auto-merge** — Configurable per-project merge strategies (squash/merge/rebase)
+- **Security review** — Automatic diff analysis for dangerous patterns (eval, shell injection, hardcoded secrets, etc.) before auto-merge. Configurable risk threshold and blocking behavior per project
 - **Git sync awareness** — Tracks branch state, detects merges, reports sync status
-- **GitHub integration** — Draft PRs, issue creation, PR reviews, rebasing — all via `gh` CLI
+- **GitHub integration** — Draft PRs, issue creation, PR reviews, rebasing — all via `gh` CLI. [Docs](docs/messaging/github-commands.md)
+- **Issue tracker routing** — Each project can use GitHub or Jira for issues via `projects.yaml` while still creating GitHub draft PRs for code review.
+- **Jira integration** — Respond to @mentions in Jira issue comments to queue missions. Runs alongside GitHub. [Docs](docs/messaging/jira-integration.md)
+- **PR review comment forwarding** — When reviewers leave comments on Koan-created PRs, the check loop auto-creates missions to address them (fingerprint-deduped, bot-filtered)
 - **GitHub @mention triggers** — Koan responds to @mentions on issues and PRs
 
 ### Communication
 
-- **Telegram & Slack** — Pluggable messaging with flood protection
+- **Telegram, Slack & Matrix** — Pluggable messaging with flood protection
 - **Email digests** — Optional SMTP email notifications for session summaries (rate-limited, deduplicated)
 - **Personality-aware formatting** — Every outbox message passes through Claude with soul + memory context
 - **Verbose mode** — Real-time progress updates streamed to your phone
@@ -170,7 +214,7 @@ Communication happens through shared markdown files in `instance/` — atomic wr
 
 - **44 slash commands** — From `/plan` to `/review` to `/sparring` — see [Skills](#skills)
 - **Web dashboard** — Local Flask UI for status, missions, chat, and journal browsing
-- **Setup wizard** — Web-based guided setup (`make install`)
+- **Setup wizard** — Terminal guided setup (`make install`)
 - **4500+ tests** — Comprehensive test suite with `make test`
 
 ## Skills
@@ -235,9 +279,9 @@ Skills are pluggable commands — some are instant, others spawn Claude work ses
 | `/gha_audit` | Scan GitHub Actions for security vulnerabilities |
 | `/incident` | Log an incident |
 
-**[User Manual →](docs/user-manual.md)** — From beginner to power user, everything Kōan can do.
+**[User Manual →](docs/users/user-manual.md)** — From beginner to power user, everything Kōan can do.
 
-**[Full skills reference →](docs/skills.md)** — all 44 commands with aliases, descriptions, and usage details.
+**[Full skills reference →](docs/users/skills.md)** — all 44 commands with aliases, descriptions, and usage details.
 
 Skills are extensible — drop a `SKILL.md` in `instance/skills/` or install from a Git repo with `/skill install <url>`. See [koan/skills/README.md](koan/skills/README.md) for the authoring guide.
 
@@ -270,6 +314,9 @@ Define your projects in `projects.yaml` at `KOAN_ROOT`:
 defaults:
   git_auto_merge:
     enabled: false
+  security_review:
+    enabled: true              # Scan diffs for dangerous patterns before merge
+    blocking: false            # Set to true to block auto-merge on high risk
 
 projects:
   webapp:
@@ -281,6 +328,17 @@ projects:
       mission: opus
 ```
 
+### Renaming a Project
+
+To rename a project across `projects.yaml`, memory, journals, missions, and all instance files:
+
+```bash
+make rename-project old=webapp new=my-webapp          # dry-run (preview changes)
+make rename-project old=webapp new=my-webapp apply=1   # apply changes
+```
+
+The tool updates the project key in `projects.yaml`, renames `memory/projects/<old>/` to `memory/projects/<new>/`, renames journal files (`journal/*/<old>.md`), and replaces `[project:<old>]` tags and `"project": "<old>"` references in all instance files.
+
 ### CLI Providers
 
 Koan isn't locked to Claude. Swap the backend per-project:
@@ -288,12 +346,36 @@ Koan isn't locked to Claude. Swap the backend per-project:
 | Provider | Best for |
 |----------|----------|
 | **Claude Code** (default) | Full-featured agent, best reasoning |
+| **OpenAI Codex** | ChatGPT users (Plus/Pro/Business/Edu/Enterprise) |
 | **GitHub Copilot** | Teams with existing Copilot licenses |
-| **Local LLM** | Offline, privacy, zero API cost |
+| **Ollama Launch** | Local/offline models behind the Claude CLI harness |
 
-See provider guides in [docs/](docs/).
+See provider guides:
+- [docs/providers/claude.md](docs/providers/claude.md)
+- [docs/providers/codex.md](docs/providers/codex.md)
+- [docs/providers/copilot.md](docs/providers/copilot.md)
+- [docs/providers/ollama-launch.md](docs/providers/ollama-launch.md)
+
+### Dashboard Configuration
+
+The web dashboard (`make dashboard`) binds to `127.0.0.1:5001` by default (local-only access). To expose it on your network or change the port:
+
+**Via environment variables** (add to `.env`):
+```bash
+KOAN_DASHBOARD_HOST=0.0.0.0   # Bind to all interfaces
+KOAN_DASHBOARD_PORT=5001      # Custom port (optional)
+```
+
+**Via command-line arguments**:
+```bash
+python3 koan/app/dashboard.py --host 0.0.0.0 --port 8080
+```
+
+**Security note**: The dashboard has no authentication. Only expose it to trusted networks.
 
 ## Architecture
+
+The full current-design reference lives under [docs/architecture/](docs/architecture/), with durable design rules in [docs/design/decisions.md](docs/design/decisions.md).
 
 ```
 koan/
@@ -307,7 +389,9 @@ koan/
     usage_tracker.py      #   Budget tracking & mode selection
     provider/             #   CLI provider abstraction
       claude.py           #     Claude Code CLI
+      codex.py            #     OpenAI Codex CLI
       copilot.py          #     GitHub Copilot CLI
+      ollama_launch.py    #     Ollama Launch (local models via ollama)
   skills/                 # Pluggable command system (44 core skills)
   system-prompts/         # All LLM prompts (20 files, no inline prompts)
   templates/              # Dashboard Jinja2 templates
@@ -326,14 +410,18 @@ instance/                 # Your private data (gitignored)
 
 | Target | Description |
 |--------|-------------|
-| `make install` | Interactive web-based setup wizard |
-| `make start` | Start full stack (agent + bridge) |
+| `make install` | Interactive CLI onboarding wizard |
+| `make koan` | Start Kōan + terminal dashboard (Status/Logs/Config/Usage) |
+| `make start` | Start full stack (agent + bridge), non-interactive |
 | `make logs` | Tail live output from all processes |
 | `make stop` | Stop all processes |
 | `make status` | Show running process status |
-| `make dashboard` | Web UI (port 5001) |
+| `make dashboard` | Web UI (default: http://127.0.0.1:5001) |
 | `make test` | Run test suite |
 | `make say m="..."` | Send a test message |
+| `make docker-pull-up` | Pull the prebuilt GHCR image and run in Docker (recommended) |
+| `make docker-up` | Build the image from source and run in Docker |
+| `make rename-project old=X new=Y` | Rename a project everywhere (dry-run by default, add `apply=1` to execute) |
 | `make clean` | Remove virtualenv |
 
 ## Philosophy
@@ -367,6 +455,10 @@ make test   # Run the test suite
 ```
 
 Check [CLAUDE.md](CLAUDE.md) for coding conventions and architecture details.
+
+## AI Policy
+
+This project uses AI tools to assist development. Humans review and approve every change before it is merged. See [AI_POLICY.md](AI_POLICY.md) for details.
 
 ## License
 

@@ -271,9 +271,9 @@ class TestGetAttentionItems:
             items2 = attention.get_attention_items(koan_root)
         assert all(i["id"] != item_id for i in items2)
 
-    def test_sorted_by_severity_then_age(self, tmp_path):
+    def test_sorted_by_recency_then_severity(self, tmp_path):
         koan_root = _make_koan_root(tmp_path)
-        # Quota warning + failed mission (critical)
+        # Failed missions have age_seconds=0 and created_at="", quota also has 0
         missions_file = Path(koan_root) / "instance" / "missions.md"
         missions_file.write_text(
             "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n"
@@ -282,7 +282,8 @@ class TestGetAttentionItems:
         (Path(koan_root) / ".koan-quota-reset").write_text("1")
         with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
             items = attention.get_attention_items(koan_root)
-        # critical should come before warning
+        # Both have age_seconds=0, so severity is the tiebreaker:
+        # critical before warning
         severities = [i["severity"] for i in items]
         critical_idx = next((i for i, s in enumerate(severities) if s == "critical"), None)
         warning_idx = next((i for i, s in enumerate(severities) if s == "warning"), None)
@@ -322,6 +323,88 @@ class TestGetAttentionItems:
                     # Should not raise
                     items = attention.get_attention_items(koan_root)
         assert isinstance(items, list)
+
+    def test_github_mentions_use_workspace_aware_known_repos(self, tmp_path):
+        """Attention @mention collection must match workspace projects by git
+        remote (alias-safe), not just projects.yaml — same coverage as the
+        agent-loop poll. Verifies it routes through the shared builder."""
+        koan_root = _make_koan_root(tmp_path)
+        missions_file = Path(koan_root) / "instance" / "missions.md"
+        missions_file.write_text("# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n")
+
+        captured = {}
+
+        def _fake_fetch(known_repos=None, since=None):
+            captured["known_repos"] = known_repos
+            from app.github_notifications import FetchResult
+            return FetchResult([], [])
+
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            with patch("app.utils.load_config",
+                       return_value={"attention_github_notifications": True}):
+                with patch("app.loop_manager._get_known_repos_from_projects",
+                           return_value={"some-org/real-repo"}) as mock_known:
+                    with patch("app.github_notifications.fetch_unread_notifications",
+                               side_effect=_fake_fetch):
+                        attention.get_attention_items(koan_root)
+
+        # The shared, workspace-aware builder was used and its result was the
+        # filter passed to the notification fetch.
+        mock_known.assert_called_once_with(koan_root)
+        assert captured["known_repos"] == {"some-org/real-repo"}
+
+    def test_github_mentions_return_web_urls(self, tmp_path):
+        """@mention items must contain web URLs, not API URLs."""
+        koan_root = _make_koan_root(tmp_path)
+        missions_file = Path(koan_root) / "instance" / "missions.md"
+        missions_file.write_text("# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n")
+
+        fake_notif = {
+            "id": "42",
+            "reason": "mention",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "repository": {"full_name": "owner/repo"},
+            "subject": {
+                "title": "Bug in parsing",
+                "url": "https://api.github.com/repos/owner/repo/pulls/99",
+            },
+        }
+
+        from app.github_notifications import FetchResult
+        fake_result = FetchResult(actionable=[fake_notif], drain=[])
+
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            with patch("app.utils.load_config",
+                       return_value={"attention_github_notifications": True}):
+                with patch("app.loop_manager._get_known_repos_from_projects",
+                           return_value={"owner/repo"}):
+                    with patch("app.github_notifications.fetch_unread_notifications",
+                               return_value=fake_result):
+                        attention._attention_cache = None
+                        items = attention.get_attention_items(koan_root)
+
+        gh_items = [i for i in items if i["source"] == "github"]
+        assert len(gh_items) == 1
+        assert gh_items[0]["url"] == "https://github.com/owner/repo/pull/99"
+
+
+class TestApiUrlToWeb:
+    def test_pull_request_url(self):
+        assert attention._api_url_to_web(
+            "https://api.github.com/repos/owner/repo/pulls/42"
+        ) == "https://github.com/owner/repo/pull/42"
+
+    def test_issue_url(self):
+        assert attention._api_url_to_web(
+            "https://api.github.com/repos/owner/repo/issues/7"
+        ) == "https://github.com/owner/repo/issues/7"
+
+    def test_non_api_url_passthrough(self):
+        url = "https://github.com/owner/repo/pull/1"
+        assert attention._api_url_to_web(url) == url
+
+    def test_empty_string(self):
+        assert attention._api_url_to_web("") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +449,63 @@ class TestAttentionRoutes:
         data = resp.get_json()
         assert data["ok"] is True
         assert "test123" in attention.load_dismissed(koan_root)
+
+    def test_dismiss_all_returns_count(self, client):
+        c, koan_root = client
+        missions_file = Path(koan_root) / "instance" / "missions.md"
+        missions_file.write_text(
+            "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n"
+            "- Bug A ❌ (2024-01-01 12:00)\n"
+            "- Bug B ❌ (2024-01-02 12:00)\n"
+        )
+        attention_module._attention_cache = None
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            resp = c.post("/api/attention/dismiss-all",
+                          data=json.dumps({}),
+                          content_type="application/json")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["dismissed"] == 2
+
+    def test_dismiss_all_empty(self, client):
+        c, koan_root = client
+        missions_file = Path(koan_root) / "instance" / "missions.md"
+        missions_file.write_text("# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n")
+        attention_module._attention_cache = None
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            resp = c.post("/api/attention/dismiss-all",
+                          data=json.dumps({}),
+                          content_type="application/json")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["dismissed"] == 0
+
+
+class TestDismissAll:
+    def setup_method(self):
+        attention_module._attention_cache = None
+
+    def test_dismiss_all_marks_all_items(self, tmp_path):
+        koan_root = _make_koan_root(tmp_path)
+        missions_file = Path(koan_root) / "instance" / "missions.md"
+        missions_file.write_text(
+            "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n"
+            "- Task 1 ❌ (2024-01-01 12:00)\n"
+            "- Task 2 ❌ (2024-01-02 12:00)\n"
+        )
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            count = attention.dismiss_all(koan_root)
+        assert count == 2
+        attention_module._attention_cache = None
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            remaining = attention.get_attention_items(koan_root)
+        assert remaining == []
+
+    def test_dismiss_all_returns_zero_when_empty(self, tmp_path):
+        koan_root = _make_koan_root(tmp_path)
+        missions_file = Path(koan_root) / "instance" / "missions.md"
+        missions_file.write_text("# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n## Failed\n")
+        with patch("app.pr_tracker.fetch_all_prs", return_value={"prs": []}):
+            count = attention.dismiss_all(koan_root)
+        assert count == 0

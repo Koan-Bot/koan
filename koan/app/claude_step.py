@@ -7,20 +7,64 @@ pipeline modules.
 """
 
 import json
+import logging
+import os
 import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
+from app.cli_exec import popen_cli, stream_with_timeout
 from app.cli_provider import build_full_command, run_command
-from app.config import get_model_config
+from app.config import get_model_config, is_strip_co_authored_by_enabled
+from app.git_utils import GitCommandError
 from app.git_utils import get_current_branch as _git_utils_get_current_branch
 from app.git_utils import ordered_remotes, run_git_strict
-from app.github import pr_create, run_gh
+from app.github import pr_create, run_gh, sanitize_github_comment
 from app.prompts import load_prompt_or_skill
+from app.run_log import log_safe
+
+
+class StepResult:
+    """Result of a :func:`run_claude_step` invocation.
+
+    Behaves as a bool (truthy when a commit was created) for backward
+    compatibility, while also carrying the Claude CLI output text for
+    callers that need it (e.g. extracting change summaries).  Failed steps
+    also expose quota classification so CI loops can stop as transient quota
+    exhaustion instead of treating the result as "no changes".
+    """
+
+    __slots__ = ("committed", "error", "output", "quota_exhausted")
+
+    def __init__(
+        self,
+        committed: bool,
+        output: str = "",
+        *,
+        quota_exhausted: bool = False,
+        error: str = "",
+    ):
+        self.committed = committed
+        self.output = output
+        self.quota_exhausted = quota_exhausted
+        self.error = error
+
+    def __bool__(self) -> bool:
+        return self.committed
+
+    def __repr__(self) -> str:
+        return (
+            "StepResult("
+            f"committed={self.committed!r}, "
+            f"quota_exhausted={self.quota_exhausted!r}, "
+            f"output={self.output[:60]!r}...)"
+        )
+
 
 # Backward-compatible alias — callers should import from app.cli_provider
 run_claude_command = run_command
@@ -38,6 +82,22 @@ def _run_git(cmd: list, cwd: str = None, timeout: int = 60) -> str:
 
 
 _REBASE_EXCEPTIONS = (RuntimeError, subprocess.TimeoutExpired, OSError)
+CI_QUOTA_STOP_ACTION = "CI fix stopped: API quota exhausted"
+
+
+def _fetch_branch(remote: str, branch: str, cwd: str = None, timeout: int = 60) -> str:
+    """Fetch a branch using an explicit refspec to guarantee tracking ref update.
+
+    ``git fetch <remote> <branch>`` fetches objects but does NOT update
+    ``refs/remotes/<remote>/<branch>`` — it only writes to FETCH_HEAD.
+    A subsequent ``git checkout -B branch remote/branch`` then uses the
+    **stale** tracking ref instead of the freshly fetched state.
+
+    Using an explicit refspec ``+refs/heads/X:refs/remotes/R/X`` ensures
+    the remote tracking ref is always up-to-date after fetch.
+    """
+    refspec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+    return _run_git(["git", "fetch", remote, refspec], cwd=cwd, timeout=timeout)
 
 
 def _abort_rebase_safely(project_path: str) -> None:
@@ -53,8 +113,52 @@ def _abort_rebase_safely(project_path: str) -> None:
         print(f"[claude_step] rebase --abort failed (non-fatal): {e}", file=sys.stderr)
 
 
+def has_rebase_in_progress(project_path: str) -> bool:
+    """Check if a git rebase is in progress (typically due to conflicts)."""
+    git_dir = Path(project_path) / ".git"
+    return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+
+
 # Re-export for backward compatibility — canonical source is git_utils.ordered_remotes
 _ordered_remotes = ordered_remotes
+
+
+def _is_ancestor(maybe_ancestor: str, descendant: str, cwd: str) -> bool:
+    """Return True if *maybe_ancestor* is an ancestor of (or equal to) *descendant*."""
+    try:
+        _run_git(
+            ["git", "merge-base", "--is-ancestor", maybe_ancestor, descendant],
+            cwd=cwd, timeout=10,
+        )
+        return True
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _prefetch_all_remotes(
+    base: str,
+    project_path: str,
+    preferred_remote: Optional[str] = None,
+    head_remote: Optional[str] = None,
+) -> None:
+    """Eagerly fetch the base branch from all relevant remotes.
+
+    Ensures every remote tracking ref is current before the rebase loop
+    starts, so that ancestry checks and --onto calculations use fresh data.
+    Failures are logged but never prevent the rebase attempt.
+    """
+    remotes_to_fetch: List[str] = list(
+        _ordered_remotes(preferred_remote, cwd=project_path)
+    )
+    if head_remote and head_remote not in remotes_to_fetch:
+        remotes_to_fetch.append(head_remote)
+    for remote in remotes_to_fetch:
+        try:
+            _fetch_branch(remote, base, cwd=project_path)
+        except _REBASE_EXCEPTIONS as e:
+            print(f"[claude_step] Pre-fetch {remote}/{base} failed (non-fatal): {e}",
+                  file=sys.stderr)
+
 
 
 def _rebase_onto_target(
@@ -62,6 +166,7 @@ def _rebase_onto_target(
     project_path: str,
     preferred_remote: Optional[str] = None,
     head_remote: Optional[str] = None,
+    on_conflict: Optional[Callable[[str], bool]] = None,
 ) -> Optional[str]:
     """Rebase onto target branch, trying *preferred_remote* first.
 
@@ -70,31 +175,47 @@ def _rebase_onto_target(
     ``upstream`` fallbacks.  When *head_remote* is known and differs from
     the target remote, uses ``--onto`` to replay only the PR's commits.
 
+    All relevant remotes are pre-fetched before the rebase loop so that
+    tracking refs are guaranteed fresh for ancestry checks and --onto.
+
+    Args:
+        on_conflict: Optional callback invoked when a rebase fails and a
+            rebase-in-progress is detected (i.e. conflicts exist).
+            Receives ``project_path`` and should return True if the
+            conflicts were resolved and the rebase completed, False
+            otherwise.  When None (default), conflicts cause an immediate
+            abort.
+
     Returns:
         Remote name used (e.g. "origin" or "upstream") on success, None on failure.
     """
-    for remote in _ordered_remotes(preferred_remote):
-        try:
-            _run_git(["git", "fetch", remote, base], cwd=project_path)
-        except _REBASE_EXCEPTIONS as e:
-            print(f"[claude_step] Fetch {remote}/{base} failed: {e}", file=sys.stderr)
-            continue
+    _prefetch_all_remotes(base, project_path, preferred_remote, head_remote)
 
-        # When head_remote differs from target, use --onto to limit
-        # replay to only the PR's commits.
+    for remote in _ordered_remotes(preferred_remote, cwd=project_path):
         if head_remote and head_remote != remote:
-            try:
-                _run_git(["git", "fetch", head_remote, base], cwd=project_path)
-                _run_git(
-                    ["git", "rebase", "--onto", f"{remote}/{base}",
-                     f"{head_remote}/{base}", "--autostash"],
-                    cwd=project_path,
-                )
-                return remote
-            except _REBASE_EXCEPTIONS as e:
-                print(f"[claude_step] --onto rebase failed: {e}", file=sys.stderr)
-                _abort_rebase_safely(project_path)
-                # Fall through to plain rebase
+            # Only use --onto when the fork has genuinely diverged from
+            # upstream (i.e. has commits that upstream doesn't).  When the
+            # fork is simply behind, --onto replays upstream commits that
+            # already exist on the target, causing spurious conflicts in
+            # files the PR never touched.
+            use_onto = not _is_ancestor(
+                f"{head_remote}/{base}", f"{remote}/{base}", project_path,
+            )
+            if use_onto:
+                try:
+                    _run_git(
+                        ["git", "rebase", "--onto", f"{remote}/{base}",
+                         f"{head_remote}/{base}", "--autostash"],
+                        cwd=project_path,
+                    )
+                    return remote
+                except _REBASE_EXCEPTIONS as e:
+                    print(f"[claude_step] --onto rebase failed: {e}", file=sys.stderr)
+                    if on_conflict and has_rebase_in_progress(project_path):
+                        if on_conflict(project_path):
+                            return remote
+                    _abort_rebase_safely(project_path)
+                    # Fall through to plain rebase
 
         # Fallback: plain rebase
         try:
@@ -105,6 +226,9 @@ def _rebase_onto_target(
             return remote
         except _REBASE_EXCEPTIONS as e:
             print(f"[claude_step] Rebase onto {remote}/{base} failed: {e}", file=sys.stderr)
+            if on_conflict and has_rebase_in_progress(project_path):
+                if on_conflict(project_path):
+                    return remote
             _abort_rebase_safely(project_path)
     return None
 
@@ -124,57 +248,384 @@ def strip_cli_noise(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def run_claude(cmd: list, cwd: str, timeout: int = 600) -> dict:
-    """Run a Claude Code CLI command.
+class _HeartbeatTimer:
+    """Periodic heartbeat emitter for keeping outer watchdogs alive.
+
+    Prints a marker to sys.stdout at a fixed interval while the inner
+    CLI process runs in print mode (silent during tool use). The marker
+    goes to the skill subprocess's stdout, which the parent run.py reads
+    to reset its LivenessWatchdog. It does NOT appear in the inner CLI's
+    captured output (separate pipe).
+    """
+
+    def __init__(self, proc: subprocess.Popen, interval: int):
+        self._proc = proc
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "_HeartbeatTimer":
+        self._thread.start()
+        return self
+
+    def cancel(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            if self._proc.poll() is not None:
+                break
+            try:
+                print("[still working...]", flush=True)
+            except (OSError, ValueError):
+                break
+
+
+def _start_heartbeat(proc: subprocess.Popen, interval: int) -> _HeartbeatTimer:
+    """Start a heartbeat timer for the given subprocess."""
+    return _HeartbeatTimer(proc, interval).start()
+
+
+def run_claude(
+    cmd: list,
+    cwd: str,
+    timeout: int = 600,
+    *,
+    idle_timeout: Optional[int] = None,
+    max_duration: Optional[int] = None,
+    heartbeat_interval: Optional[int] = None,
+) -> dict:
+    """Run a Claude Code CLI command, streaming stdout in real time.
+
+    Thin wrapper around :func:`app.cli_exec.stream_with_timeout`. Each
+    Claude stdout line is forwarded to ``sys.stdout`` while also being
+    captured. Streaming serves two purposes:
+
+    1. Each emitted line resets the parent process's liveness watchdog
+       in ``run.py`` (default 600s), so long but still-progressing
+       Claude calls no longer get killed for "no output".
+    2. ``/live`` and the bridge see Claude's progress in real time
+       instead of a silent wait.
+
+    The subprocess is started with a new POSIX session
+    (``start_new_session=True``) so that on timeout the entire process
+    group can be killed — preventing grandchildren (e.g. tool-call
+    subprocesses) from holding the stdout pipe open and turning a
+    ``TimeoutExpired`` into an indefinite hang during pipe drain.
+
+    Args:
+        heartbeat_interval: When set, a daemon thread prints a periodic
+            marker to sys.stdout while the CLI is running. This keeps
+            the parent process's LivenessWatchdog alive even when the
+            CLI runs in print mode (no output during tool use).
 
     Returns:
         Dict with keys: success (bool), output (str), error (str).
     """
-    from app.cli_exec import run_cli_with_retry
-
     from app.security_audit import SUBPROCESS_EXEC, _redact_list, log_event
 
     try:
-        result = run_cli_with_retry(
+        proc, cleanup = popen_cli(
             cmd,
-            capture_output=True, text=True,
-            timeout=timeout, cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            start_new_session=True,
         )
-        if result.returncode != 0:
-            stderr_snippet = result.stderr[-500:] if result.stderr else "no stderr"
-            log_event(SUBPROCESS_EXEC, details={
-                "cmd": _redact_list(cmd),
-                "cwd": cwd,
-                "exit_code": result.returncode,
-            }, result="failure")
-            return {
-                "success": False,
-                "output": result.stdout.strip(),
-                "error": f"Exit code {result.returncode}: {stderr_snippet}",
-            }
+    except Exception as e:
         log_event(SUBPROCESS_EXEC, details={
             "cmd": _redact_list(cmd),
             "cwd": cwd,
-            "exit_code": 0,
-        })
+        }, result="failure")
         return {
-            "success": True,
-            "output": result.stdout.strip(),
-            "error": "",
+            "success": False,
+            "output": "",
+            "error": f"Failed to spawn CLI: {e}",
         }
-    except subprocess.TimeoutExpired:
+
+    heartbeat_thread = None
+    if heartbeat_interval and heartbeat_interval > 0:
+        heartbeat_thread = _start_heartbeat(proc, heartbeat_interval)
+
+    try:
+        stream_result = stream_with_timeout(
+            proc,
+            timeout=timeout,
+            on_line=lambda line: print(line, flush=True),
+            idle_timeout=idle_timeout,
+            max_duration=max_duration,
+        )
+    finally:
+        if heartbeat_thread is not None:
+            heartbeat_thread.cancel()
+        cleanup()
+
+    stdout_text = stream_result.stdout
+    stderr_text = stream_result.stderr
+
+    if stream_result.timed_out:
+        timeout_kind = getattr(stream_result, "timeout_kind", "")
+        if timeout_kind == "idle":
+            timeout_error = f"Timeout (idle {idle_timeout}s)"
+        elif timeout_kind == "max_duration":
+            max_duration_value = max_duration if max_duration is not None else timeout
+            timeout_error = f"Timeout (max duration {max_duration_value}s)"
+        else:
+            timeout_error = f"Timeout ({timeout}s)"
         log_event(SUBPROCESS_EXEC, details={
             "cmd": _redact_list(cmd),
             "cwd": cwd,
         }, result="timeout")
         return {
             "success": False,
-            "output": "",
-            "error": f"Timeout ({timeout}s)",
+            "output": stdout_text,
+            "error": timeout_error,
+            "stderr": stderr_text,
+            "timeout_kind": timeout_kind or "timeout",
         }
 
+    returncode = proc.returncode
+    if returncode != 0:
+        stderr_snippet = stderr_text[-500:] if stderr_text else "no stderr"
+        # When stderr is empty, stdout often contains the actual error
+        # (e.g. "Error: context window exceeded").  Include it so callers
+        # get actionable diagnostics instead of just "no stderr".
+        if not stderr_text and stdout_text:
+            stderr_snippet = f"no stderr | stdout: {stdout_text[-500:]}"
+        log_event(SUBPROCESS_EXEC, details={
+            "cmd": _redact_list(cmd),
+            "cwd": cwd,
+            "exit_code": returncode,
+        }, result="failure")
+        return {
+            "success": False,
+            "output": stdout_text,
+            "error": f"Exit code {returncode}: {stderr_snippet}",
+            "stderr": stderr_text,
+            "exit_code": returncode,
+        }
 
-def commit_if_changes(project_path: str, message: str) -> bool:
+    log_event(SUBPROCESS_EXEC, details={
+        "cmd": _redact_list(cmd),
+        "cwd": cwd,
+        "exit_code": 0,
+    })
+    return {
+        "success": True,
+        "output": stdout_text,
+        "error": "",
+        "stderr": stderr_text,
+        "exit_code": returncode,
+    }
+
+
+def _precommit_hook_path(repo_path: str) -> Optional[Path]:
+    """Return the path to an executable pre-commit hook, or ``None``.
+
+    Checks the standard git hook location plus Husky (the common JS toolchain
+    layout). Only files that exist and are executable count.
+    """
+    candidates = [
+        Path(repo_path) / ".git" / "hooks" / "pre-commit",
+        Path(repo_path) / ".husky" / "pre-commit",
+    ]
+    for path in candidates:
+        try:
+            if path.is_file() and os.access(path, os.X_OK):
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def is_hook_rejection(exc: GitCommandError, repo_path: str) -> bool:
+    """Heuristically decide whether *exc* came from a pre-commit hook objecting.
+
+    git reserves exit code 128 for its *own* fatal errors (bad ref, lock
+    contention, etc.); a hook rejection propagates the hook's own exit code
+    (typically 1/2). git's "nothing to commit" is the one common exit-1
+    false-positive, so it is filtered out. Finally, an executable pre-commit
+    hook must actually be present. Together these separate "the hook ran and
+    said no" from "git itself failed".
+    """
+    if exc.returncode == 128:
+        return False
+    if "nothing to commit" in (exc.stderr or ""):
+        return False
+    return _precommit_hook_path(repo_path) is not None
+
+
+# Matches a Co-Authored-By trailer line or the "Generated with Claude Code"
+# promo line that Claude Code appends to commit messages by default. Anchored
+# to line starts (MULTILINE) so it only strips whole trailer lines.
+_CO_AUTHOR_LINE = re.compile(
+    r"^[ \t]*Co-Authored-By:.*$"
+    r"|^[ \t]*🤖[ \t]*Generated with .*Claude Code.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def strip_co_authored_by(message: str) -> str:
+    """Remove Co-Authored-By / "Generated with Claude Code" trailers.
+
+    Kōan commits land under the operator's own git identity; the agent must
+    not attribute a co-author. Claude Code appends these trailers by default,
+    so this guard scrubs them from any commit message before it reaches git.
+    Collapses the blank lines left behind so the message ends cleanly.
+    """
+    if not message:
+        return message
+    cleaned = _CO_AUTHOR_LINE.sub("", message)
+    # Collapse 3+ consecutive newlines (left by removed lines) down to two,
+    # then trim trailing whitespace/newlines.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.rstrip()
+
+
+def _sanitize_commit_args(commit_args: list) -> list:
+    """Return a copy of *commit_args* with any ``-m``/``--message`` value
+    scrubbed of Co-Authored-By trailers. Handles the two-arg forms
+    (``-m <value>``, ``--message <value>``) and the combined
+    ``--message=<value>`` form. Other args pass through untouched."""
+    if not is_strip_co_authored_by_enabled():
+        return list(commit_args)
+    sanitized = list(commit_args)
+    for i in range(len(sanitized)):
+        if sanitized[i] in ("-m", "--message") and i + 1 < len(sanitized):
+            sanitized[i + 1] = strip_co_authored_by(sanitized[i + 1])
+        elif sanitized[i].startswith("--message="):
+            sanitized[i] = "--message=" + strip_co_authored_by(sanitized[i][len("--message="):])
+    return sanitized
+
+
+def _has_hook_created_worktree_changes(cwd: str) -> bool:
+    """Return True when a hook left unstaged/untracked changes behind.
+
+    On an *undeterminable* worktree state (``git status`` cannot run or exits
+    non-zero) this returns True, not False: assume the hook *may* have written
+    formatter edits and let the caller stage-and-retry rather than drop them.
+    The retry re-runs the hook, which re-rejects harmlessly if there were in
+    fact no edits — so the optimistic assumption never loses valid work.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, cwd=cwd, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_safe(
+            "git",
+            f"could not inspect worktree after hook rejection; "
+            f"assuming possible formatter edits: {exc}",
+        )
+        return True
+    if result.returncode != 0:
+        log_safe(
+            "git",
+            f"git status failed (exit {result.returncode}) inspecting worktree "
+            f"after hook rejection; assuming possible formatter edits",
+        )
+        return True
+    for line in result.stdout.splitlines():
+        if line.startswith("??"):
+            return True
+        if len(line) >= 2 and line[1] != " ":
+            return True
+    return False
+
+
+def _commit_with_hook_fallback(
+    commit_args: list,
+    cwd: str,
+    run_git=None,
+    bypass_hook_failures: bool = False,
+) -> None:
+    """Commit, attempting target-repo pre-commit hooks first.
+
+    Project pre-commit hooks (lint/format/test) can exceed the git timeout on
+    first run — a cold env install (nvm/node) easily outlasts the default. A
+    blanket ``--no-verify`` would never let hooks run; an unguarded hooked
+    commit crashes the whole pipeline on timeout.
+
+    The two failure modes are distinct and handled differently:
+
+    * **Timeout** (``subprocess.TimeoutExpired``) — the hook *hung* (e.g. a
+      watch-mode test runner, or a cold env install). Retry with ``--no-verify``
+      so the pipeline makes progress; CI remains the real gate.
+    * **Fast non-zero exit** (:class:`GitCommandError`) — when this is a hook
+      *rejection* (see :func:`is_hook_rejection`), retry once if the hook left
+      formatter changes in the worktree. If ``bypass_hook_failures`` is set,
+      a remaining hook rejection is committed with ``--no-verify``; otherwise
+      surface its output and re-raise. Genuine git errors (exit 128, etc.) also
+      re-raise unchanged.
+
+    ``run_git`` defaults to :func:`_run_git`; callers may pass their own
+    module-level reference so patches in tests resolve correctly.
+    """
+    runner = run_git or _run_git
+    commit_args = _sanitize_commit_args(commit_args)
+    try:
+        runner(["git", "commit", *commit_args], cwd=cwd, timeout=180)
+    except subprocess.TimeoutExpired:
+        # Hook hung past the budget — bypass it so the pipeline can proceed.
+        runner(["git", "commit", "--no-verify", *commit_args], cwd=cwd)
+    except GitCommandError as exc:
+        if is_hook_rejection(exc, cwd):
+            if _has_hook_created_worktree_changes(cwd):
+                log_safe(
+                    "git",
+                    "pre-commit hook modified files; staging and retrying commit once",
+                )
+                runner(["git", "add", "-A"], cwd=cwd)
+                try:
+                    runner(["git", "commit", *commit_args], cwd=cwd, timeout=180)
+                    return
+                except subprocess.TimeoutExpired:
+                    # Hook hung on the retry — same as the first attempt, a
+                    # hung hook is always bypassed so the pipeline proceeds.
+                    runner(["git", "commit", "--no-verify", *commit_args], cwd=cwd)
+                    return
+                except GitCommandError as retry_exc:
+                    if not bypass_hook_failures or not is_hook_rejection(retry_exc, cwd):
+                        raise
+                    log_safe(
+                        "git",
+                        "pre-commit hook still rejected after retry; committing with --no-verify",
+                    )
+                    runner(["git", "commit", "--no-verify", *commit_args], cwd=cwd)
+                    return
+            if bypass_hook_failures:
+                log_safe(
+                    "git",
+                    "pre-commit hook rejected commit; committing with --no-verify",
+                )
+                runner(["git", "commit", "--no-verify", *commit_args], cwd=cwd)
+                return
+            # Hook ran, evaluated quickly, and objected without auto-fixing.
+            log_safe(
+                "git",
+                f"pre-commit hook rejected the commit (exit {exc.returncode}): "
+                f"{(exc.stderr or '').strip()[:200]}",
+            )
+        raise
+    except RuntimeError as exc:
+        # A non-GitCommandError runner (e.g. a test double) that reports a
+        # timeout in its message still means the hook hung — bypass it.
+        if "timed out" in str(exc).lower():
+            runner(["git", "commit", "--no-verify", *commit_args], cwd=cwd)
+            return
+        raise
+
+
+def commit_if_changes(
+    project_path: str,
+    message: str,
+    *,
+    bypass_hook_failures: bool = False,
+) -> bool:
     """Stage all changes and commit if there are any.
 
     Returns True if a commit was created.
@@ -188,7 +639,12 @@ def commit_if_changes(project_path: str, message: str) -> bool:
         return False
 
     _run_git(["git", "add", "-A"], cwd=project_path)
-    _run_git(["git", "commit", "-m", message], cwd=project_path)
+    _commit_with_hook_fallback(
+        ["-m", message],
+        project_path,
+        _run_git,
+        bypass_hook_failures=bypass_hook_failures,
+    )
     return True
 
 
@@ -201,15 +657,25 @@ def run_claude_step(
     actions_log: List[str],
     max_turns: int = 20,
     timeout: int = 600,
+    idle_timeout: Optional[int] = None,
+    max_duration: Optional[int] = None,
     use_skill: bool = False,
-) -> bool:
+    use_convention_subject: bool = False,
+    bypass_hook_failures: bool = False,
+) -> StepResult:
     """Run a Claude Code step: invoke CLI, commit changes, log result.
 
     Args:
         use_skill: If True, include the Skill tool in allowed tools
                    so Claude can invoke registered skills (e.g. /refactor).
+        use_convention_subject: If True, parse COMMIT_SUBJECT from Claude's
+                   output and use it instead of *commit_msg*. Falls back to
+                   *commit_msg* if no valid subject is found.
 
-    Returns True if the step produced a commit.
+    Returns:
+        A :class:`StepResult` — truthy when a commit was created (backward
+        compatible with ``bool``), with ``.output`` carrying the cleaned
+        Claude CLI output text.
     """
     models = get_model_config()
 
@@ -225,15 +691,84 @@ def run_claude_step(
         max_turns=max_turns,
     )
 
-    result = run_claude(cmd, project_path, timeout=timeout)
+    from app.commit_conventions import parse_commit_subject
+    from app.config import get_first_output_timeout
+
+    # Emit periodic heartbeat to keep the parent process's LivenessWatchdog
+    # alive. Print-mode CLI sessions produce no stdout during tool use,
+    # which would trigger the outer first_output_timeout (default 600s).
+    # Heartbeat at half the timeout interval ensures the watchdog is reset
+    # well before it fires.
+    _fot = get_first_output_timeout()
+    _heartbeat = max(60, _fot // 2) if _fot > 0 else 120
+
+    result = run_claude(
+        cmd,
+        project_path,
+        timeout=timeout,
+        idle_timeout=idle_timeout,
+        max_duration=max_duration,
+        heartbeat_interval=_heartbeat,
+    )
+    cleaned_output = strip_cli_noise(result.get("output", ""))
     if result["success"]:
-        committed = commit_if_changes(project_path, commit_msg)
+        effective_msg = commit_msg
+        if use_convention_subject:
+            parsed = parse_commit_subject(cleaned_output)
+            if parsed:
+                effective_msg = _sanitize_commit_subject(parsed)
+        committed = commit_if_changes(
+            project_path,
+            effective_msg,
+            bypass_hook_failures=bypass_hook_failures,
+        )
         if committed and success_label:
             actions_log.append(success_label)
-            return True
+        return StepResult(committed=committed, output=cleaned_output)
     elif failure_label:
-        actions_log.append(f"{failure_label}: {result['error'][:200]}")
-    return False
+        error_detail = result['error'][:200]
+        # Claude CLI often reports errors via stdout, not stderr.
+        # Include stdout snippet when stderr is empty to aid debugging.
+        if "no stderr" in error_detail and result.get("output"):
+            stdout_snippet = result["output"][-300:]
+            error_detail = f"{error_detail} | stdout: {stdout_snippet}"
+        actions_log.append(f"{failure_label}: {error_detail}")
+
+    quota_exhausted = False
+    try:
+        from app.cli_errors import ErrorCategory, classify_cli_error
+        from app.provider import get_provider_name
+        from app.quota_handler import cli_runtime_quota_signal
+
+        # ``result["output"]`` is the assistant's response transcript (plain
+        # ``-p`` mode). It is DATA: a CI-fix step legitimately quotes failing
+        # tests, CI logs, and source identifiers — which on this project carry
+        # quota phrases ("out of extra usage", "rate_limit_rejected"). Scanning
+        # the transcript with the generic quota patterns falsely reported
+        # "API quota exhausted" and paused the daemon for hours. Trust the
+        # stderr channel for the full pattern set; from the transcript only
+        # honor signals the CLI runtime itself emits.
+        stderr_text = result.get("stderr", result.get("error", ""))
+        quota_exhausted = (
+            classify_cli_error(
+                int(result.get("exit_code") or 1),
+                stdout="",
+                stderr=stderr_text,
+                provider_name=get_provider_name(),
+            )
+            == ErrorCategory.QUOTA
+            or cli_runtime_quota_signal(result.get("output", ""))
+        )
+    except Exception as exc:
+        logging.warning("Failed to classify Claude step error: %s", exc)
+        quota_exhausted = False
+
+    return StepResult(
+        committed=False,
+        output=cleaned_output,
+        quota_exhausted=quota_exhausted,
+        error=result.get("error", ""),
+    )
 
 
 def run_project_tests(project_path: str, test_cmd: str = "make test",
@@ -322,6 +857,140 @@ def _safe_checkout(branch: str, project_path: str) -> None:
         print(f"[claude_step] Safe checkout failed for {branch}: {e}", file=sys.stderr)
 
 
+# Conclusions that don't signal a real CI outcome. The classic case is
+# "Dependabot auto-merge", which runs on every PR but only acts on
+# Dependabot-authored PRs — on every other PR it completes with
+# conclusion="skipped". Treating that as a CI failure sends Kōan into a
+# fix loop against a workflow that isn't actually broken.
+_IGNORED_CI_CONCLUSIONS = frozenset(
+    {"skipped", "cancelled", "neutral", "action_required"}
+)
+
+# Workflow run statuses that mean "blocked, awaiting manual action".
+# GitHub sets `status="action_required"` on fork PRs from first-time
+# contributors until a maintainer approves the run, and `status="waiting"`
+# when a job is gated on environment approval. In both cases, polling
+# forever — or, worse, pushing new commits to "fix" CI — never unsticks
+# the run. Kōan must treat these as terminal so the PR drops out of the
+# ## CI queue with a human-readable note.
+_APPROVAL_BLOCKED_STATUSES = frozenset({"action_required", "waiting"})
+
+# Canonical CI status string returned by aggregate_ci_runs() and
+# wait_for_ci() when a workflow run is blocked on maintainer or
+# environment approval.  Use the constant instead of the raw string
+# to avoid typos across modules.
+CI_STATUS_BLOCKED_APPROVAL = "blocked_approval"
+
+# Upper bound on runs fetched per branch — enough to cover all workflows
+# triggered by a single push (typically <10), small enough to keep the
+# `gh run list` call cheap.
+_CI_RUN_LIMIT = 20
+
+
+def _filter_runs_to_latest_sha(runs: list) -> list:
+    """Return only the runs whose ``headSha`` matches the latest SHA.
+
+    The latest SHA is the ``headSha`` of the run with the greatest
+    ``createdAt`` value. When ``createdAt`` is missing for the candidate,
+    the run's position in the input list (later = newer, matching
+    ``gh run list`` ordering) breaks the tie.
+
+    Runs without a ``headSha`` field are left untouched (treated as a
+    single anonymous group) — this preserves behaviour for legacy callers
+    and the bulk of existing tests.
+    """
+    has_sha = [r for r in runs if r.get("headSha")]
+    if not has_sha:
+        return runs
+
+    def _sort_key(r):
+        # createdAt is ISO-8601 and lexicographically sortable; fallback
+        # to the run's index in the original list so the most-recently
+        # returned entry still wins when timestamps are missing.
+        return (r.get("createdAt") or "", runs.index(r))
+
+    latest_sha = max(has_sha, key=_sort_key).get("headSha")
+    return [r for r in runs if r.get("headSha") == latest_sha]
+
+
+def aggregate_ci_runs(runs: list) -> Tuple[str, Optional[int]]:
+    """Reduce a list of workflow runs to a single (status, run_id) tuple.
+
+    Restricts aggregation to runs on the **latest** commit SHA seen in
+    *runs* (by ``createdAt``), so a failed run from a prior commit on the
+    same branch doesn't masquerade as a current failure. Runs whose entry
+    omits ``headSha`` are treated as a single anonymous group — preserving
+    backward compatibility with callers that don't supply the field.
+
+    Then filters out runs whose conclusion is in
+    :data:`_IGNORED_CI_CONCLUSIONS` (notably the "Dependabot auto-merge"
+    skip case) so a benign skipped workflow doesn't masquerade as a CI
+    failure.
+
+    Aggregation rules over the remaining runs:
+    - any failed completed run → ("failure", failed_run_id)
+    - else any run blocked on maintainer/environment approval →
+      ("blocked_approval", blocked_run_id) — Kōan can't unstick it, so
+      callers should stop retrying and surface a notification.
+    - else any non-completed run → ("pending", pending_run_id)
+    - else all completed + success → ("success", first_run_id)
+    - empty input or every run filtered out → ("none", None)
+
+    Failure takes precedence over blocked_approval so a genuinely broken
+    workflow on the same push still gets surfaced for a fix attempt.
+    """
+    if not runs:
+        return ("none", None)
+
+    runs = _filter_runs_to_latest_sha(runs)
+
+    relevant = [
+        r for r in runs
+        if (r.get("conclusion") or "").lower() not in _IGNORED_CI_CONCLUSIONS
+    ]
+    if not relevant:
+        return ("none", None)
+
+    failed_run = None
+    blocked_run = None
+    pending_run = None
+    for run in relevant:
+        status = (run.get("status") or "").lower()
+        conclusion = (run.get("conclusion") or "").lower()
+        if status == "completed":
+            if conclusion != "success" and failed_run is None:
+                failed_run = run
+        elif status in _APPROVAL_BLOCKED_STATUSES:
+            if blocked_run is None:
+                blocked_run = run
+        elif pending_run is None:
+            pending_run = run
+
+    if failed_run is not None:
+        return ("failure", failed_run.get("databaseId"))
+    if blocked_run is not None:
+        return (CI_STATUS_BLOCKED_APPROVAL, blocked_run.get("databaseId"))
+    if pending_run is not None:
+        return ("pending", pending_run.get("databaseId"))
+    return ("success", relevant[0].get("databaseId"))
+
+
+def fetch_branch_ci_runs(branch: str, full_repo: str) -> list:
+    """Return raw `gh run list` entries for a branch.
+
+    Raises on `gh` failure so callers can decide between fall-back
+    behaviours (e.g. "treat as pending" vs "treat as none").
+    """
+    raw = run_gh(
+        "run", "list",
+        "--branch", branch,
+        "--repo", full_repo,
+        "--json", "databaseId,status,conclusion,name,workflowName,headSha,createdAt",
+        "--limit", str(_CI_RUN_LIMIT),
+    )
+    return json.loads(raw) if raw.strip() else []
+
+
 def wait_for_ci(
     branch: str,
     full_repo: str,
@@ -339,7 +1008,7 @@ def wait_for_ci(
 
     Returns:
         (status, run_id, logs) where:
-        - status: "success", "failure", "timeout", or "none"
+        - status: "success", "failure", "blocked_approval", "timeout", or "none"
         - run_id: GitHub Actions run ID (None if no runs found)
         - logs: Failed job logs (empty unless status is "failure")
     """
@@ -350,37 +1019,34 @@ def wait_for_ci(
 
     while time.time() < deadline:
         try:
-            raw = run_gh(
-                "run", "list",
-                "--branch", branch,
-                "--repo", full_repo,
-                "--json", "databaseId,status,conclusion",
-                "--limit", "1",
-            )
-            runs = json.loads(raw) if raw.strip() else []
+            runs = fetch_branch_ci_runs(branch, full_repo)
         except Exception as e:
             print(f"[claude_step] CI poll error: {e}", file=sys.stderr)
             time.sleep(poll_interval)
             continue
 
-        if not runs:
-            # No CI runs found for this branch — common for repos without CI
+        status, run_id = aggregate_ci_runs(runs)
+
+        if status == "none":
+            # No CI signal — either no runs, or every run was filtered as
+            # non-CI (e.g. a Dependabot auto-merge skip with nothing else
+            # registered yet). Mirror the original "no runs" exit.
             return ("none", None, "")
 
-        run = runs[0]
-        run_id = run.get("databaseId")
-        status = run.get("status", "").lower()
-        conclusion = run.get("conclusion", "").lower()
+        if status == "success":
+            return ("success", run_id, "")
 
-        if status == "completed":
-            if conclusion == "success":
-                return ("success", run_id, "")
-
-            # CI failed — fetch logs for failed jobs
-            logs = _fetch_failed_logs(run_id, full_repo)
+        if status == "failure":
+            logs = _fetch_failed_logs(run_id, full_repo) if run_id else ""
             return ("failure", run_id, logs)
 
-        # Still running — wait and poll again
+        if status == CI_STATUS_BLOCKED_APPROVAL:
+            # A maintainer (or environment reviewer) must click Approve in
+            # the GitHub UI; polling won't change that. Exit so the caller
+            # can surface a notification instead of burning quota.
+            return (CI_STATUS_BLOCKED_APPROVAL, run_id, "")
+
+        # status == "pending" — keep polling
         time.sleep(poll_interval)
 
     return ("timeout", None, "")
@@ -389,19 +1055,454 @@ def wait_for_ci(
 def _fetch_failed_logs(run_id: int, full_repo: str, max_chars: int = 8000) -> str:
     """Fetch logs for failed jobs in a GitHub Actions run.
 
-    Returns truncated log output for context.
+    Returns truncated log output for context.  Retries once after a
+    short delay when the first attempt returns empty — GitHub sometimes
+    needs a few seconds to make logs available after a run completes.
+    """
+    import time
+
+    for attempt in range(2):
+        try:
+            raw = run_gh(
+                "run", "view", str(run_id),
+                "--repo", full_repo,
+                "--log-failed",
+            )
+            if raw:
+                if len(raw) > max_chars:
+                    return "... (truncated)\n" + raw[-max_chars:]
+                return raw
+            # Empty response — retry after a brief pause
+            if attempt == 0:
+                time.sleep(5)
+        except Exception as e:
+            return f"(Could not fetch logs: {e})"
+    return ""
+
+
+def check_existing_ci(
+    branch: str,
+    full_repo: str,
+) -> Tuple[str, Optional[int], str]:
+    """Check the most recent CI run on a branch without polling.
+
+    Unlike ``wait_for_ci`` which polls until completion, this does a single
+    check to see the current CI state.  Useful for inspecting pre-existing
+    failures before pushing a new version.
+
+    Returns:
+        (status, run_id, logs) where:
+        - status: "success", "failure", "pending", "blocked_approval", or "none"
+        - run_id: GitHub Actions run ID (None if no runs found)
+        - logs: Failed job logs (empty unless status is "failure")
     """
     try:
-        raw = run_gh(
-            "run", "view", str(run_id),
-            "--repo", full_repo,
-            "--log-failed",
-        )
-        if len(raw) > max_chars:
-            return "... (truncated)\n" + raw[-max_chars:]
-        return raw
+        runs = fetch_branch_ci_runs(branch, full_repo)
     except Exception as e:
-        return f"(Could not fetch logs: {e})"
+        print(f"[claude_step] CI check error: {e}", file=sys.stderr)
+        return ("none", None, "")
+
+    status, run_id = aggregate_ci_runs(runs)
+
+    if status == "failure":
+        logs = _fetch_failed_logs(run_id, full_repo) if run_id else ""
+        return ("failure", run_id, logs)
+
+    return (status, run_id, "")
+
+
+def _force_push(remote: str, branch: str, project_path: str) -> None:
+    """Force-push branch, trying --force-with-lease first then --force.
+
+    Raises on total failure.
+    """
+    try:
+        _run_git(
+            ["git", "push", remote, branch, "--force-with-lease"],
+            cwd=project_path,
+        )
+    except Exception as e:
+        print(f"[claude_step] --force-with-lease failed, falling back to --force: {e}", file=sys.stderr)
+        _run_git(
+            ["git", "push", remote, branch, "--force"],
+            cwd=project_path,
+        )
+
+
+def _default_ci_fix_step_runner(
+    *,
+    prompt: str,
+    project_path: str,
+    commit_msg: str,
+    success_label: str,
+    failure_label: str,
+    actions_log: List[str],
+    use_convention_subject: bool,
+) -> Tuple[object, bool, int]:
+    """Default CI-fix step runner: a single plain ``run_claude_step`` call.
+
+    Returns ``(step_result, timed_out, attempts_used)`` to match the pluggable
+    ``step_runner`` contract.  The plain runner never reports a timeout, so the
+    middle element is always ``False`` and ``attempts_used`` is always ``1``.
+    """
+    from app.config import get_skill_max_turns, get_skill_timeout
+
+    result = run_claude_step(
+        prompt=prompt,
+        project_path=project_path,
+        commit_msg=commit_msg,
+        success_label=success_label,
+        failure_label=failure_label,
+        actions_log=actions_log,
+        max_turns=get_skill_max_turns(),
+        timeout=get_skill_timeout(),
+        use_convention_subject=use_convention_subject,
+    )
+    return result, False, 1
+
+
+# ---------------------------------------------------------------------------
+# Generic retry-with-evidence loop
+# ---------------------------------------------------------------------------
+
+def run_skill_loop(
+    step_fn: Callable[[str], object],
+    evidence_fn: Callable[[int, object], str],
+    should_continue_fn: Callable[[int, object], Tuple[bool, str]],
+    *,
+    max_attempts: int = 1,
+    outcome: Optional[dict] = None,
+) -> dict:
+    """Generic retry-with-evidence loop for iterative skill execution.
+
+    Executes *step_fn* up to *max_attempts* times, threading evidence
+    collected by *evidence_fn* between attempts and consulting
+    *should_continue_fn* after each non-final attempt.
+
+    Control flow per iteration:
+        1. Call ``step_fn(evidence)`` (empty string on first attempt).
+        2. Record the result in the outcome's ``attempts`` list.
+        3. If ``attempt < max_attempts``, call ``evidence_fn`` then
+           ``should_continue_fn``.  If the latter returns
+           ``(False, reason)``, stop early.
+        4. On the final attempt (``attempt == max_attempts``), exit
+           without calling ``evidence_fn`` or ``should_continue_fn``.
+
+    Args:
+        step_fn: ``(evidence) -> result`` — executes one attempt.
+        evidence_fn: ``(attempt, prev_result) -> evidence_str`` —
+            collects evidence after each non-final step.  Exceptions
+            are caught and logged; the previous evidence is used as
+            fallback.
+        should_continue_fn: ``(attempt, result) -> (cont, reason)`` —
+            called after evidence collection on non-final attempts.
+            Return ``(False, reason)`` to stop early.
+        max_attempts: Maximum number of step invocations (default 1).
+        outcome: Optional mutable dict populated with ``total_step_attempts``
+            and ``attempts`` list.
+
+    Returns:
+        The outcome dict (same object as *outcome* if provided, otherwise
+        a new dict).
+    """
+    if outcome is None:
+        outcome = {}
+
+    attempts_list: List[dict] = []
+    outcome["attempts"] = attempts_list
+    outcome["total_step_attempts"] = 0
+
+    if max_attempts < 1:
+        return outcome
+
+    evidence = ""
+
+    for attempt in range(1, max_attempts + 1):
+        # Execute one step
+        try:
+            result = step_fn(evidence)
+            error = None
+        except Exception as exc:
+            result = None
+            error = exc
+            print(
+                f"[skill_loop] step_fn failed on attempt {attempt}: {exc}",
+                file=sys.stderr,
+            )
+
+        outcome["total_step_attempts"] = attempt
+        entry: dict = {"attempt": attempt, "result": result}
+        if error is not None:
+            entry["error"] = error
+        attempts_list.append(entry)
+
+        # On the final attempt, exit without calling evidence_fn / should_continue_fn
+        if attempt >= max_attempts:
+            break
+
+        # Collect evidence for next attempt
+        try:
+            evidence = evidence_fn(attempt, result)
+        except Exception as exc:
+            print(
+                f"[skill_loop] evidence_fn failed on attempt {attempt}: {exc}",
+                file=sys.stderr,
+            )
+
+        # Ask caller whether to continue
+        try:
+            should_continue, stop_reason = should_continue_fn(attempt, result)
+        except Exception as exc:
+            print(
+                f"[skill_loop] should_continue_fn failed on attempt {attempt}: {exc}",
+                file=sys.stderr,
+            )
+            should_continue, stop_reason = False, f"should_continue_fn error: {exc}"
+
+        if not should_continue:
+            outcome["stop_reason"] = stop_reason
+            break
+
+    return outcome
+
+
+def run_ci_fix_loop(
+    branch: str,
+    base: str,
+    full_repo: str,
+    project_path: str,
+    ci_logs: str,
+    actions_log: List[str],
+    *,
+    max_attempts: int = 2,
+    commit_conventions: str = "",
+    use_polling: bool = False,
+    prompt_builder: Callable[[str, str], str],
+    commit_msg_template: str = "fix: resolve CI failures (attempt {attempt})",
+    base_remote: str = "origin",
+    step_runner: Optional[Callable[..., Tuple[object, bool, int]]] = None,
+    push_fn: Optional[Callable[[str, str], None]] = None,
+    recheck_fn: Optional[Callable[[str, str], Tuple[str, object, str]]] = None,
+    outcome: Optional[dict] = None,
+) -> Tuple[bool, str]:
+    """Core CI fix loop: diff-fetch -> prompt -> Claude step -> push -> recheck.
+
+    Single source of truth for the CI-fix retry loop shared by
+    ``_attempt_ci_fixes`` (ci_queue_runner) and ``_run_ci_check_and_fix``
+    (rebase_pr).  Callers tune behaviour through the injectable hooks below
+    rather than re-implementing the loop.
+
+    Args:
+        branch: Git branch to fix.
+        base: Base branch for diff context.
+        full_repo: ``"owner/repo"`` string.
+        project_path: Local path to the project repository.
+        ci_logs: Initial CI failure logs.
+        actions_log: Mutable list for logging actions.
+        max_attempts: Maximum fix attempts.
+        commit_conventions: Project commit convention guidance.
+        use_polling: If True, use ``wait_for_ci`` (blocking poll); else use
+            ``check_existing_ci`` after a brief sleep (non-blocking). Ignored
+            when *recheck_fn* is supplied.
+        prompt_builder: ``(ci_logs, diff) -> prompt`` callable. Keeps
+            caller-specific prompt logic out of this module.
+        commit_msg_template: Template with ``{attempt}`` placeholder.
+        base_remote: Remote name for diff base (default ``"origin"``).
+        step_runner: Optional ``(**kwargs) -> (step_result, timed_out,
+            attempts_used)`` callable that runs one CI-fix Claude step. Lets
+            callers add activity-aware timeouts, heartbeats, or retries. When
+            omitted, a single plain ``run_claude_step`` is used.
+        push_fn: Optional ``(branch, project_path) -> None`` callable used to
+            push a fix. Defaults to a force-push of ``origin/<branch>``.
+        recheck_fn: Optional ``(branch, full_repo) -> (status, run_id, logs)``
+            callable used to re-read CI status after a push. Overrides
+            *use_polling* when provided.
+        outcome: Optional mutable dict populated with a structured result for
+            callers that need richer reporting than ``(success, logs)``. Keys:
+            ``result`` (one of ``fixed``/``quota``/``timeout``/``no_changes``/
+            ``push_failed``/``blocked_approval``/``pending``/``exhausted``),
+            ``attempt``, ``total_step_attempts``, ``last_logs``, and (for
+            ``push_failed``) ``push_error``.
+
+    Returns:
+        ``(success, last_ci_logs)`` — *success* is True if CI passes or a fix
+        was pushed and CI is pending/running. Callers decide what to do with
+        the pending state (e.g. re-enqueue for monitoring).
+    """
+    from app.utils import truncate_diff
+
+    if step_runner is None:
+        step_runner = _default_ci_fix_step_runner
+
+    def _do_push(b: str, p: str) -> None:
+        if push_fn is not None:
+            push_fn(b, p)
+        else:
+            _force_push("origin", b, p)
+
+    def _do_recheck(b: str, repo: str) -> Tuple[str, object, str]:
+        if recheck_fn is not None:
+            return recheck_fn(b, repo)
+        if use_polling:
+            return wait_for_ci(b, repo)
+        time.sleep(15)
+        return check_existing_ci(b, repo)
+
+    total_step_attempts = 0
+    current_ci_logs = ci_logs
+    attempt_counter = [0]
+
+    def _set_outcome(result: str, attempt: int, last_logs: str, **extra) -> None:
+        if outcome is None:
+            return
+        outcome.update({
+            "result": result,
+            "attempt": attempt,
+            "total_step_attempts": total_step_attempts,
+            "last_logs": last_logs,
+        })
+        outcome.update(extra)
+
+    def _ci_step_fn(evidence: str) -> dict:
+        nonlocal total_step_attempts, current_ci_logs
+        attempt_counter[0] += 1
+        attempt = attempt_counter[0]
+        if evidence:
+            current_ci_logs = evidence
+
+        print(f"[claude_step] CI fix attempt {attempt}/{max_attempts}", file=sys.stderr)
+        actions_log.append(f"CI fix attempt {attempt}/{max_attempts}")
+
+        diff = ""
+        try:
+            diff = _run_git(
+                ["git", "diff", f"{base_remote}/{base}..HEAD"],
+                cwd=project_path, timeout=30,
+            )
+        except Exception as e:
+            print(f"[claude_step] diff fetch failed: {e}", file=sys.stderr)
+        diff = truncate_diff(diff, 32000)
+
+        prompt = prompt_builder(current_ci_logs, diff)
+
+        fixed, timed_out, step_attempts = step_runner(
+            prompt=prompt,
+            project_path=project_path,
+            commit_msg=commit_msg_template.format(attempt=attempt),
+            success_label=f"Applied CI fix (attempt {attempt})",
+            failure_label=f"CI fix step failed (attempt {attempt})",
+            actions_log=actions_log,
+            use_convention_subject=bool(commit_conventions),
+        )
+        total_step_attempts += step_attempts
+
+        result: dict = {"ci_logs": current_ci_logs}
+
+        if getattr(fixed, "quota_exhausted", False):
+            actions_log.append(CI_QUOTA_STOP_ACTION)
+            result["_terminal"] = ("quota", False, current_ci_logs)
+            return result
+
+        if not fixed:
+            if timed_out:
+                actions_log.append(
+                    f"CI fix timed out after {total_step_attempts} CI-fix step(s)"
+                )
+                result["_terminal"] = ("timeout", False, current_ci_logs)
+            else:
+                actions_log.append("Claude produced no changes — giving up")
+                result["_terminal"] = ("no_changes", False, current_ci_logs)
+            return result
+
+        try:
+            _do_push(branch, project_path)
+        except Exception as e:
+            actions_log.append(f"Push failed: {str(e)[:100]}")
+            result["_terminal"] = ("push_failed", False, current_ci_logs)
+            result["push_error"] = str(e)
+            return result
+
+        actions_log.append(f"Pushed CI fix (attempt {attempt})")
+
+        status, _run_id, new_logs = _do_recheck(branch, full_repo)
+        result["new_logs"] = new_logs
+
+        if status == "success":
+            actions_log.append(f"CI passed after fix attempt {attempt}")
+            result["_terminal"] = ("fixed", True, new_logs)
+            return result
+
+        if status == CI_STATUS_BLOCKED_APPROVAL:
+            actions_log.append(
+                f"CI waiting for approval after fix attempt {attempt} — stopping"
+            )
+            result["_terminal"] = ("blocked_approval", False, new_logs)
+            return result
+
+        if use_polling and recheck_fn is None and status in ("timeout", "none"):
+            actions_log.append(f"CI {status} after fix attempt {attempt}")
+            result["_terminal"] = ("pending", True, new_logs)
+            return result
+
+        if recheck_fn is not None and status in ("timeout", "none"):
+            actions_log.append(f"CI {status} after fix attempt {attempt}")
+            result["_terminal"] = ("pending", True, new_logs)
+            return result
+
+        if not use_polling and recheck_fn is None and status == "pending":
+            actions_log.append(
+                f"CI running after fix push (attempt {attempt})"
+            )
+            result["_terminal"] = ("pending", True, new_logs)
+            return result
+
+        if new_logs:
+            current_ci_logs = new_logs
+
+        return result
+
+    def _ci_evidence_fn(_attempt: int, result: object) -> str:
+        if result and isinstance(result, dict) and result.get("new_logs"):
+            return result["new_logs"]
+        return current_ci_logs
+
+    def _ci_should_continue_fn(_attempt: int, result: object) -> Tuple[bool, str]:
+        if result and isinstance(result, dict) and "_terminal" in result:
+            return False, result["_terminal"][0]
+        if result is None:
+            return False, "step_error"
+        return True, ""
+
+    loop_outcome: dict = {}
+    run_skill_loop(
+        step_fn=_ci_step_fn,
+        evidence_fn=_ci_evidence_fn,
+        should_continue_fn=_ci_should_continue_fn,
+        max_attempts=max_attempts,
+        outcome=loop_outcome,
+    )
+
+    # Translate loop results into CI-specific outcome and return value
+    attempts = loop_outcome.get("attempts", [])
+    last_result = attempts[-1]["result"] if attempts else None
+
+    if last_result and isinstance(last_result, dict) and "_terminal" in last_result:
+        term_name, success, term_logs = last_result["_terminal"]
+        extra: dict = {}
+        if "push_error" in last_result:
+            extra["push_error"] = last_result["push_error"]
+        _set_outcome(term_name, attempt_counter[0], term_logs, **extra)
+
+        if term_name == "no_changes":
+            actions_log.append(f"CI still failing after {max_attempts} fix attempts")
+            return False, current_ci_logs
+
+        return success, term_logs
+
+    actions_log.append(f"CI still failing after {max_attempts} fix attempts")
+    if outcome is not None and "result" not in outcome:
+        _set_outcome("exhausted", max_attempts, current_ci_logs)
+    return False, current_ci_logs
 
 
 def _is_permission_error(error_msg: str) -> bool:
@@ -415,10 +1516,81 @@ def _is_permission_error(error_msg: str) -> bool:
     return any(ind in lower for ind in indicators)
 
 
+def resolve_pr_location(
+    owner: str,
+    repo: str,
+    pr_number: str,
+    project_path: str,
+) -> Tuple[str, str]:
+    """Resolve the actual GitHub owner/repo where a PR lives.
+
+    When a user provides a PR URL from a different fork (e.g.,
+    ``sukria/koan/pull/171`` instead of ``Anantys-oss/koan/pull/171``),
+    the PR may not exist at the given owner/repo.  This helper verifies
+    the PR exists, and if not, tries all git remotes of the local project
+    to find the repository that actually hosts the PR.
+
+    Args:
+        owner: Owner from the URL
+        repo: Repo name from the URL
+        pr_number: PR number as string
+        project_path: Local path to the project (for git remote discovery)
+
+    Returns:
+        Tuple of (resolved_owner, resolved_repo) where the PR exists.
+
+    Raises:
+        RuntimeError: If the PR cannot be found at any known remote.
+    """
+    # Fast path: check if PR exists at the given owner/repo
+    try:
+        run_gh(
+            "pr", "view", str(pr_number),
+            "--repo", f"{owner}/{repo}",
+            "--json", "number",
+        )
+        return owner, repo
+    except RuntimeError:
+        pass
+
+    # Fallback: try all git remotes from the local project
+    from app.utils import get_all_github_remotes
+
+    remotes = get_all_github_remotes(project_path)
+    tried = {f"{owner}/{repo}".lower()}
+
+    for remote_slug in remotes:
+        slug_lower = remote_slug.lower()
+        if slug_lower in tried:
+            continue
+        tried.add(slug_lower)
+        try:
+            run_gh(
+                "pr", "view", str(pr_number),
+                "--repo", remote_slug,
+                "--json", "number",
+            )
+            parts = remote_slug.split("/", 1)
+            logging.info(
+                "PR #%s not found at %s/%s, resolved to %s",
+                pr_number, owner, repo, remote_slug,
+            )
+            return parts[0], parts[1]
+        except RuntimeError:
+            continue
+
+    raise RuntimeError(
+        f"PR #{pr_number} not found at {owner}/{repo} "
+        f"or any known remote ({', '.join(sorted(tried))})"
+    )
+
+
 def _build_pr_prompt(
     prompt_name: str,
     context: dict,
     skill_dir: Optional[Path] = None,
+    max_diff_chars: int = 80_000,
+    commit_conventions: str = "",
 ) -> str:
     """Build a prompt for Claude to process PR feedback.
 
@@ -429,18 +1601,86 @@ def _build_pr_prompt(
         prompt_name: Prompt template name (e.g. "rebase", "recreate").
         context: PR context dict from fetch_pr_context().
         skill_dir: Optional skill directory for prompt resolution.
+        max_diff_chars: Maximum characters for the diff section to prevent
+            context window overflow on large PRs.
+        commit_conventions: Project commit convention guidance to include
+            in the prompt. When non-empty, also loads the commit subject
+            instruction fragment.
     """
+    diff = context.get("diff", "")
+    if len(diff) > max_diff_chars:
+        diff = diff[:max_diff_chars] + "\n\n... (diff truncated — too large for context window)"
+        print(
+            f"[claude_step] Diff truncated from {len(context.get('diff', ''))} "
+            f"to {max_diff_chars} chars",
+            file=sys.stderr,
+        )
+
+    commit_subject_instruction = ""
+    if commit_conventions:
+        commit_subject_instruction = _load_commit_subject_instruction(skill_dir)
+
+    from app.prompt_guard import fence_external_data
+
     kwargs = dict(
-        TITLE=context["title"],
-        BODY=context.get("body", ""),
+        TITLE=fence_external_data(context["title"], "PR title"),
+        BODY=fence_external_data(context.get("body", ""), "PR body"),
         BRANCH=context["branch"],
         BASE=context["base"],
-        DIFF=context.get("diff", ""),
-        REVIEW_COMMENTS=context.get("review_comments", ""),
-        REVIEWS=context.get("reviews", ""),
-        ISSUE_COMMENTS=context.get("issue_comments", ""),
+        DIFF=fence_external_data(diff, "PR diff", scan=False),
+        REVIEW_COMMENTS=fence_external_data(
+            context.get("review_comments", ""), "review comments"
+        ),
+        REVIEWS=fence_external_data(
+            context.get("reviews", ""), "reviews"
+        ),
+        ISSUE_COMMENTS=fence_external_data(
+            context.get("issue_comments", ""), "issue comments"
+        ),
+        COMMIT_CONVENTIONS=commit_conventions,
+        COMMIT_SUBJECT_INSTRUCTION=commit_subject_instruction,
     )
     return load_prompt_or_skill(skill_dir, prompt_name, **kwargs)
+
+
+def _sanitize_commit_subject(subject: str) -> str:
+    """Sanitize a parsed commit subject for safe use in git commit messages.
+
+    Strips control characters and collapses whitespace to prevent
+    malformed or adversarial subjects from breaking git log output.
+    """
+    import unicodedata
+
+    # Strip control characters (keep printable + spaces)
+    cleaned = "".join(
+        ch for ch in subject
+        if not unicodedata.category(ch).startswith("C") or ch == "\t"
+    )
+    # Collapse whitespace and strip
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned
+
+
+def _load_commit_subject_instruction(skill_dir: Optional[Path] = None) -> str:
+    """Load the commit subject instruction prompt fragment.
+
+    Tries the skill directory first, then falls back to system prompts.
+    Returns empty string if the fragment is not found.
+    """
+    if skill_dir is not None:
+        path = skill_dir / "prompts" / "commit_subject_instruction.md"
+        try:
+            return path.read_text()
+        except (FileNotFoundError, OSError):
+            pass
+
+    # Fall back to system-prompts directory
+    from app.prompts import PROMPT_DIR
+    path = PROMPT_DIR / "commit_subject_instruction.md"
+    try:
+        return path.read_text()
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 # -- Push with PR fallback (shared config) ----------------------------------
@@ -510,10 +1750,7 @@ def _push_with_pr_fallback(
 
     # Option 1: Try force-pushing to the existing branch
     try:
-        _run_git(
-            ["git", "push", "origin", branch, "--force-with-lease"],
-            cwd=project_path,
-        )
+        _force_push("origin", branch, project_path)
         actions.append(cfg["force_label"].format(branch=branch))
         return {"success": True, "actions": actions, "error": ""}
     except Exception as push_error:
@@ -534,10 +1771,24 @@ def _push_with_pr_fallback(
         )
 
         title = context.get("title", f"{cfg['title_prefix'].strip('[]')} of #{pr_number}")
-        pr_body = cfg["pr_body"].format(
+        boilerplate = cfg["pr_body"].format(
             pr_number=pr_number, branch=branch, base=base,
             url=context.get("url", f"#{pr_number}"),
         )
+        from app.pr_footer import append_koan_footer, build_pr_footer
+
+        boilerplate = append_koan_footer(
+            boilerplate,
+            build_pr_footer(project_path=project_path),
+        )
+        pr_body = boilerplate
+        try:
+            from app.describe_pr import describe_pr, format_description
+            desc = describe_pr(project_path, base)
+            if desc:
+                pr_body = f"{format_description(desc)}\n\n{boilerplate}"
+        except Exception as _desc_err:
+            logging.warning("[%s_pr] describe_pr failed, using boilerplate: %s", pr_type, _desc_err)
         new_pr_url = pr_create(
             title=f"{cfg['title_prefix']} {title}",
             body=pr_body,
@@ -553,14 +1804,18 @@ def _push_with_pr_fallback(
         new_pr_ref = new_pr_match.group(0) if new_pr_match else new_pr_url.strip()
 
         try:
+            crosslink = append_koan_footer(
+                cfg["crosslink"].format(ref=new_pr_ref, base=base),
+                build_pr_footer(action="Automated by", project_path=project_path),
+            )
             run_gh(
                 "pr", "comment", pr_number,
                 "--repo", full_repo,
-                "--body", cfg["crosslink"].format(ref=new_pr_ref, base=base),
+                "--body", sanitize_github_comment(crosslink),
             )
             actions.append("Cross-linked original PR")
         except Exception as e:
-            print(f"[{pr_type}_pr] Cross-link comment failed: {e}", file=sys.stderr)
+            log_safe("warning", f"[{pr_type}_pr] Cross-link comment failed: {e}")
 
         return {
             "success": True,

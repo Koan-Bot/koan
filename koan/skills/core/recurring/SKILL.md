@@ -2,8 +2,9 @@
 name: recurring
 scope: core
 group: missions
+emoji: 🔁
 description: Manage recurring missions (hourly, daily, weekly, custom interval)
-version: 1.2.0
+version: 1.5.0
 audience: bridge
 commands:
   - name: daily
@@ -19,10 +20,12 @@ commands:
     description: Add a custom-interval recurring mission
     usage: /every <interval> <text> [project:<name>]
   - name: recurring
-    description: List all recurring missions
-    usage: /recurring
-  - name: cancel_recurring
-    description: Cancel a recurring mission
-    usage: /cancel_recurring <n>, /cancel_recurring <keyword>
+    description: List recurring missions, or manage with resume/run/pause/cancel/days sub-commands
+    usage: /recurring, /recurring resume <n>, /recurring run [n], /recurring pause <n>, /recurring cancel <n>, /recurring days <n> <days>
 handler: handler.py
 ---
+
+Use `project:all` to make a recurring mission **org-wide**: it runs once at the
+workspace root and its instructions iterate over every repo in the workspace
+(see `docs/architecture/mission-lifecycle.md`). Without a `project:` tag, a
+mission defaults to the first configured project.

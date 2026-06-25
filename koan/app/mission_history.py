@@ -8,7 +8,7 @@ import json
 import time
 from pathlib import Path
 
-from app.utils import _PROJECT_TAG_STRIP_RE, atomic_write
+from app.utils import PROJECT_TAG_STRIP_RE, atomic_write
 
 
 _HISTORY_FILE = "mission_history.json"
@@ -25,10 +25,14 @@ def _normalize_key(mission_text: str) -> str:
     Strips leading ``- ``, ``[project:X]`` / ``[projet:X]`` tags, and
     whitespace so the same mission recorded with or without a project tag
     shares one dedup counter.
+
+    Note: this is intentionally *not* ``missions.canonical_mission_key`` — that
+    keeps the project tag (mission identity for the stagnation tracker), whereas
+    history dedup wants to collapse across projects. Different concern (S2).
     """
     line = mission_text.strip().split("\n")[0]
-    line = line.lstrip("- ").strip()
-    line = _PROJECT_TAG_STRIP_RE.sub("", line).strip()
+    line = line.removeprefix("- ").strip()
+    line = PROJECT_TAG_STRIP_RE.sub("", line).strip()
     return line
 
 

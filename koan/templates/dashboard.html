@@ -1,15 +1,15 @@
 {% extends "base.html" %}
-{% block title %}Kōan — Dashboard{% endblock %}
+{% block title_suffix %} — Dashboard{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
 
 {# Attention zone — rendered by JS after /api/attention fetch #}
 <div id="attention-zone" class="attention-zone" style="display:none;"></div>
 
-<div class="grid">
-    <div class="card">
-        <div class="stat-label">Status</div>
-        <div class="stat-value" style="font-size:1.3rem;">
+<div class="grid k-mb-6">
+    <div class="k-stat">
+        <div class="k-stat__label">Status</div>
+        <div class="k-stat__value" style="font-size: var(--fs-heading-md);">
             <span id="state-badge" class="badge badge-{{ agent_state.badge_color }}">
                 <span id="activity-dot" class="activity-dot activity-dot-{{ agent_state.state }}"></span>
                 <span id="state-label">{{ state_label }}</span>
@@ -17,17 +17,17 @@
         </div>
         <div id="state-elapsed" class="stat-detail"></div>
     </div>
-    <div class="card">
-        <div class="stat-label">Pending</div>
-        <div class="stat-value" id="count-pending">{{ pending_count }}</div>
+    <div class="k-stat">
+        <div class="k-stat__label">Pending</div>
+        <div class="k-stat__value" id="count-pending">{{ pending_count }}</div>
     </div>
-    <div class="card">
-        <div class="stat-label">In Progress</div>
-        <div class="stat-value" id="count-in-progress">{{ in_progress_count }}</div>
+    <div class="k-stat">
+        <div class="k-stat__label">In Progress</div>
+        <div class="k-stat__value" id="count-in-progress">{{ in_progress_count }}</div>
     </div>
-    <div class="card">
-        <div class="stat-label">Done</div>
-        <div class="stat-value" id="count-done">{{ done_count }}</div>
+    <div class="k-stat">
+        <div class="k-stat__label">Done</div>
+        <div class="k-stat__value" id="count-done">{{ done_count }}</div>
     </div>
 </div>
 
@@ -40,6 +40,15 @@
     <span id="focus-indicator">Focused — <span id="focus-remaining"></span> remaining</span>
 </div>
 {% endif %}
+
+<div id="agent-controls" class="card" style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap;padding:var(--space-3) var(--space-4);">
+    <div id="ctrl-pause-group" style="{% if agent_state.state == 'paused' or agent_state.state == 'stopped' %}display:none;{% else %}display:flex;{% endif %}align-items:center;gap:var(--space-2);">
+        <button id="ctrl-pause" class="btn btn-sm btn-secondary" onclick="agentAction('pause')">Pause</button>
+        <input id="ctrl-pause-duration" type="text" placeholder="e.g. 2h" style="width:6rem;font-size:var(--fs-body-sm);padding:var(--space-1) var(--space-2);border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text-primary);">
+    </div>
+    <button id="ctrl-resume" class="btn btn-sm btn-secondary" onclick="agentAction('resume')" style="{% if agent_state.state != 'paused' %}display:none;{% endif %}">Resume</button>
+    <button id="ctrl-restart" class="btn btn-sm btn-secondary" onclick="agentAction('restart')" style="{% if agent_state.state == 'stopped' %}display:none;{% endif %}">Restart</button>
+</div>
 
 <div id="state-detail" class="card state-detail" {% if agent_state.state == 'idle' %}style="display:none;"{% endif %}>
     <div class="state-detail-grid">
@@ -69,17 +78,71 @@
     </div>
 </div>
 
+<div id="forecast-card" class="card" style="display:none;padding:var(--space-3) var(--space-4);font-size:var(--fs-body-sm);">
+    <span style="color:var(--text-muted);margin-right:var(--space-2);">Quota Forecast</span>
+    <span id="forecast-text" style="font-weight:var(--fw-semibold);">Warming up...</span>
+    <span id="forecast-rate" style="color:var(--text-muted);margin-left:var(--space-3);"></span>
+</div>
+
+<div id="provider-card" class="card" style="display:none;">
+    <h2 style="margin-top:0;">Provider &amp; Models</h2>
+    <div style="display:flex;gap:var(--space-6);flex-wrap:wrap;font-size:var(--fs-body-sm);align-items:flex-start;">
+        <div style="display:flex;align-items:center;gap:var(--space-2);">
+            <span class="activity-dot" id="provider-dot" style="background:var(--text-muted);"></span>
+            <span>Provider: <strong id="provider-name">—</strong></span>
+        </div>
+        <div id="provider-models" style="display:flex;gap:var(--space-4);flex-wrap:wrap;"></div>
+    </div>
+</div>
+
+<div id="health-card" class="card" style="display:none;">
+    <h2 style="margin-top:0;">Health</h2>
+    <div style="display:flex;gap:var(--space-6);flex-wrap:wrap;font-size:var(--fs-body-sm);">
+        <div id="health-disk" style="display:flex;align-items:center;gap:var(--space-2);">
+            <span class="activity-dot" id="health-disk-dot"></span>
+            <span>Disk: <span id="health-disk-pct">—</span></span>
+        </div>
+        <div id="health-run" style="display:flex;align-items:center;gap:var(--space-2);">
+            <span class="activity-dot" id="health-run-dot"></span>
+            <span>Run process: <span id="health-run-label">—</span></span>
+        </div>
+        <div id="health-awake" style="display:flex;align-items:center;gap:var(--space-2);">
+            <span class="activity-dot" id="health-awake-dot"></span>
+            <span>Awake process: <span id="health-awake-label">—</span></span>
+        </div>
+    </div>
+</div>
+
 {% if project_stats %}
-<h2>Projects</h2>
+<h2 style="display:flex;align-items:center;gap:var(--space-3);">Projects{% if selected_project %} <a href="/?project=" style="font-size:var(--fs-body-sm);font-weight:normal;color:var(--accent);">View all</a>{% endif %}</h2>
 <div class="grid">
 {% for pname, pdata in project_stats.items() %}
-    <a href="/?project={{ pname }}" class="card project-card" style="text-decoration:none;color:var(--text);">
-        <div style="font-weight:600;margin-bottom:0.5rem;">{{ "untagged" if pname == "default" else pname }}</div>
-        <div style="font-size:0.85rem;color:var(--text-muted);">
+    <a href="/?project={{ pname }}" class="card project-card{% if selected_project == pname %} card-active{% endif %}" style="text-decoration:none;color:var(--text-primary);">
+        <div style="font-weight:var(--fw-semibold);margin-bottom:var(--space-2);">{{ "untagged" if pname == "default" else pname }}</div>
+        <div style="font-size:var(--fs-body-sm);color:var(--text-muted);">
             <span>{{ pdata.pending }} pending</span>
-            {% if pdata.in_progress %}<span style="margin-left:0.75rem;">{{ pdata.in_progress }} in progress</span>{% endif %}
+            {% if pdata.in_progress %}<span style="margin-left:var(--space-3);">{{ pdata.in_progress }} in progress</span>{% endif %}
         </div>
     </a>
+{% endfor %}
+</div>
+{% endif %}
+
+{% if skill_metrics %}
+<h2>Skill Metrics <span style="font-size:var(--fs-caption);color:var(--text-muted);font-weight:normal;">(30d)</span></h2>
+<div class="grid">
+{% for pname, sm in skill_metrics.items() %}
+    <div class="card">
+        <div style="font-weight:var(--fw-semibold);margin-bottom:var(--space-2);">{{ pname }}</div>
+        <div style="font-size:var(--fs-body-sm);color:var(--text-muted);">
+            {% if sm.plan_total > 0 %}
+            <div>Plan approval: <strong>{{ "%.0f"|format(sm.plan_approval_rate * 100) }}%</strong> ({{ sm.plan_approved }}/{{ sm.plan_total }}), avg {{ "%.1f"|format(sm.plan_avg_rounds) }} rounds</div>
+            {% endif %}
+            {% if sm.pr_total > 0 %}
+            <div>PR CI pass: <strong>{{ "%.0f"|format(sm.pr_ci_pass_rate * 100) }}%</strong> ({{ sm.pr_ci_pass }}/{{ sm.pr_total }})</div>
+            {% endif %}
+        </div>
+    </div>
 {% endfor %}
 </div>
 {% endif %}
@@ -88,7 +151,7 @@
 <h2>In Progress</h2>
 {% for m in missions.in_progress %}
 <div class="card">
-    <div class="mission-item">{% if not selected_project %}{{ m|project_badge|safe }}{% endif %}{{ m|strip_project_tag }}</div>
+    <div class="mission-item">{% if not selected_project %}{{ m|project_badge|safe }}{% endif %}{{ m|strip_project_tag|linkify }}</div>
 </div>
 {% endfor %}
 {% endif %}
@@ -97,7 +160,7 @@
 <h2>Pending</h2>
 {% for m in missions.pending %}
 <div class="card">
-    <div class="mission-item">{% if not selected_project %}{{ m|project_badge|safe }}{% endif %}{{ m|strip_project_tag }}</div>
+    <div class="mission-item">{% if not selected_project %}{{ m|project_badge|safe }}{% endif %}{{ m|strip_project_tag|linkify }}</div>
 </div>
 {% endfor %}
 {% endif %}
@@ -109,7 +172,6 @@
     const dotEl = document.getElementById('activity-dot');
     const elapsedEl = document.getElementById('state-elapsed');
 
-    // Badge color CSS class mapping
     const colorClasses = ['badge-green', 'badge-orange', 'badge-red', 'badge-blue', 'badge-muted'];
     const dotClasses = ['activity-dot-working', 'activity-dot-sleeping', 'activity-dot-contemplating',
                         'activity-dot-paused', 'activity-dot-stopped', 'activity-dot-error_recovery',
@@ -131,28 +193,22 @@
         elapsedEl.textContent = current > 0 ? formatElapsed(current) : '';
     }
 
-    // Tick elapsed locally between SSE updates
     setInterval(updateElapsed, 5000);
     updateElapsed();
 
     function applyState(data) {
-        // Update label
         labelEl.textContent = data.label;
 
-        // Update badge color
         colorClasses.forEach(c => badgeEl.classList.remove(c));
         badgeEl.classList.add('badge-' + data.badge_color);
 
-        // Update activity dot
         dotClasses.forEach(c => dotEl.classList.remove(c));
         dotEl.classList.add('activity-dot-' + data.state);
 
-        // Update elapsed tracking
         lastElapsed = data.elapsed;
         lastUpdate = Date.now();
         updateElapsed();
 
-        // Update focus card
         const focusCard = document.getElementById('focus-card');
         if (focusCard) {
             if (data.focus) {
@@ -163,7 +219,6 @@
             }
         }
 
-        // Update detail panel
         const detailPanel = document.getElementById('state-detail');
         if (detailPanel) {
             detailPanel.style.display = data.state === 'idle' ? 'none' : '';
@@ -202,7 +257,6 @@
             }
         }
 
-        // Update mission counts
         if (data.missions) {
             const ids = {pending: 'count-pending', in_progress: 'count-in-progress', done: 'count-done'};
             for (const [key, id] of Object.entries(ids)) {
@@ -212,9 +266,55 @@
                 }
             }
         }
+
+        // Update forecast row
+        if (data.forecast) {
+            const fc = data.forecast;
+            const fcCard = document.getElementById('forecast-card');
+            const fcText = document.getElementById('forecast-text');
+            const fcRate = document.getElementById('forecast-rate');
+            if (fcCard && fcText) {
+                fcCard.style.display = '';
+                if (fc.status === 'paused') {
+                    fcText.textContent = 'Paused';
+                    if (fcRate) fcRate.textContent = '';
+                } else if (fc.status === 'warming_up' || fc.time_to_exhaustion_minutes === null) {
+                    fcText.textContent = 'Warming up...';
+                    if (fcRate) fcRate.textContent = '';
+                } else {
+                    const mins = fc.time_to_exhaustion_minutes;
+                    let timeStr;
+                    if (mins < 60) {
+                        timeStr = Math.round(mins) + 'm';
+                    } else if (mins < 1440) {
+                        const h = Math.floor(mins / 60);
+                        const m = Math.round(mins % 60);
+                        timeStr = m > 0 ? h + 'h ' + m + 'm' : h + 'h';
+                    } else {
+                        const d = Math.floor(mins / 1440);
+                        const h = Math.round((mins % 1440) / 60);
+                        timeStr = h > 0 ? d + 'd ' + h + 'h' : d + 'd';
+                    }
+                    const modeLabel = fc.autonomous_mode || 'base';
+                    fcText.textContent = modeLabel + ' ≈ ' + timeStr + ' remaining';
+                    if (fcRate && fc.burn_rate_pct_per_minute !== null) {
+                        fcRate.textContent = '(' + fc.burn_rate_pct_per_minute.toFixed(3) + '%/min)';
+                    }
+                }
+            }
+        }
+
+        // Show/hide agent control buttons based on state
+        const pauseGroup = document.getElementById('ctrl-pause-group');
+        const resumeBtn = document.getElementById('ctrl-resume');
+        const restartBtn = document.getElementById('ctrl-restart');
+        const isStopped = data.state === 'stopped';
+        const isPaused = data.state === 'paused';
+        if (pauseGroup) pauseGroup.style.display = (isPaused || isStopped) ? 'none' : 'flex';
+        if (resumeBtn) resumeBtn.style.display = isPaused ? '' : 'none';
+        if (restartBtn) restartBtn.style.display = isStopped ? 'none' : '';
     }
 
-    // SSE connection for live state updates
     function connectSSE() {
         const source = new EventSource('/api/state/stream');
         source.onmessage = function(event) {
@@ -225,13 +325,11 @@
         };
         source.onerror = function() {
             source.close();
-            // Reconnect after 3s
             setTimeout(connectSSE, 3000);
         };
     }
     connectSSE();
 
-    // Fallback: poll /api/status every 10s in case SSE fails
     setInterval(() => {
         fetch('/api/status')
             .then(r => r.json())
@@ -242,6 +340,40 @@
             })
             .catch(() => {});
     }, 10000);
+
+    window.agentAction = function agentAction(action) {
+        if (action === 'restart') {
+            if (!confirm('Restart the agent loop?')) return;
+        }
+        const btn = document.getElementById('ctrl-' + action) ||
+                    document.getElementById('ctrl-' + action + '-group');
+        const pauseBtn = document.getElementById('ctrl-pause');
+        const activeBtn = action === 'pause' ? pauseBtn : btn;
+        if (activeBtn) activeBtn.disabled = true;
+
+        const body = {};
+        if (action === 'pause') {
+            const dur = (document.getElementById('ctrl-pause-duration') || {}).value || '';
+            if (dur) body.duration = dur;
+        }
+
+        fetch('/api/agent/' + action, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.ok) {
+                    alert('Error: ' + (data.error || 'unknown'));
+                } else if (action === 'pause') {
+                    const durInput = document.getElementById('ctrl-pause-duration');
+                    if (durInput) durInput.value = '';
+                }
+            })
+            .catch(e => alert('Request failed: ' + e))
+            .finally(() => { if (activeBtn) activeBtn.disabled = false; });
+    }
 })();
 </script>
 
@@ -306,6 +438,15 @@
         }
         zone.style.display = '';
 
+        if (items.length > 1) {
+            const header = document.createElement('div');
+            header.className = 'attention-header';
+            header.innerHTML =
+                `<span class="attention-header-count">${items.length} notification${items.length > 1 ? 's' : ''}</span>` +
+                `<button class="attention-ack-all" id="ack-all-btn">Acknowledge All</button>`;
+            zone.appendChild(header);
+        }
+
         const visible = items.slice(0, MAX_VISIBLE);
         const hidden = items.slice(MAX_VISIBLE);
 
@@ -334,7 +475,6 @@
                 el.style.opacity = '0';
                 setTimeout(() => {
                     el.remove();
-                    // Hide zone if empty
                     const remaining = zone.querySelectorAll('.attention-item');
                     if (!remaining.length) zone.style.display = 'none';
                 }, 300);
@@ -342,7 +482,31 @@
         }).catch(() => {});
     }
 
+    function dismissAll() {
+        const params = new URLSearchParams(window.location.search);
+        const project = params.get('project') || '';
+        const body = project ? {project: project} : {};
+        const btn = document.getElementById('ack-all-btn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Dismissing…'; }
+        fetch('/api/attention/dismiss-all', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        }).then(resp => {
+            if (!resp.ok) throw new Error(resp.status);
+            zone.querySelectorAll('.attention-item, .attention-header').forEach(el => { el.style.opacity = '0'; });
+            setTimeout(() => { zone.innerHTML = ''; zone.style.display = 'none'; }, 300);
+        }).catch(() => {
+            if (btn) { btn.disabled = false; btn.textContent = 'Acknowledge All'; btn.style.borderColor = 'var(--danger)'; }
+        });
+    }
+
     zone.addEventListener('click', function(e) {
+        if (e.target.closest('.attention-ack-all')) {
+            e.preventDefault();
+            dismissAll();
+            return;
+        }
         const btn = e.target.closest('.attention-item-dismiss');
         if (btn) {
             e.preventDefault();
@@ -362,6 +526,104 @@
 
     loadAttention();
     setInterval(loadAttention, 30000);
+})();
+</script>
+
+<script>
+// Provider & Models card — polls /api/provider every 60s
+(function() {
+    var SLOT_LABELS = {
+        mission: 'Mission', chat: 'Chat', lightweight: 'Lightweight',
+        fallback: 'Fallback', review_mode: 'Review', reflect: 'Reflect'
+    };
+
+    function loadProvider() {
+        fetch('/api/provider')
+            .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+            .then(function(data) {
+                var card = document.getElementById('provider-card');
+                if (card) card.style.display = '';
+
+                var dot = document.getElementById('provider-dot');
+                if (dot) dot.style.background = data.provider !== 'unknown' ? 'var(--success)' : 'var(--danger)';
+
+                var nameEl = document.getElementById('provider-name');
+                if (nameEl) nameEl.textContent = data.provider;
+
+                var container = document.getElementById('provider-models');
+                if (container && data.models) {
+                    container.innerHTML = '';
+                    data.models.forEach(function(m) {
+                        var label = SLOT_LABELS[m.slot] || m.slot;
+                        var el = document.createElement('span');
+                        el.textContent = label + ': ' + m.model;
+                        el.style.cssText = 'white-space:nowrap;';
+                        container.appendChild(el);
+                    });
+                }
+            })
+            .catch(function(err) {
+                console.warn('provider fetch failed', err);
+                var dot = document.getElementById('provider-dot');
+                if (dot) dot.style.background = 'var(--text-muted)';
+            });
+    }
+
+    loadProvider();
+    function scheduleProvider() {
+        setTimeout(function() { loadProvider(); scheduleProvider(); }, 60000);
+    }
+    scheduleProvider();
+})();
+</script>
+
+<script>
+// Health card — polls /api/health every 60s
+(function() {
+    var dotColors = {ok: 'var(--success)', warn: 'var(--warning)', error: 'var(--danger)'};
+
+    function setDot(dotEl, status) {
+        dotEl.style.background = dotColors[status] || 'var(--text-muted)';
+    }
+
+    function loadHealth() {
+        fetch('/api/health')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                var card = document.getElementById('health-card');
+                if (card) card.style.display = '';
+
+                var diskDot = document.getElementById('health-disk-dot');
+                var diskPct = document.getElementById('health-disk-pct');
+                if (data.disk && diskDot && diskPct) {
+                    setDot(diskDot, data.disk.status);
+                    diskPct.textContent = data.disk.used_pct !== null
+                        ? data.disk.used_pct + '%'
+                        : '—';
+                }
+
+                var runDot   = document.getElementById('health-run-dot');
+                var runLabel = document.getElementById('health-run-label');
+                if (data.run && runDot && runLabel) {
+                    setDot(runDot, data.run.status);
+                    runLabel.textContent = data.run.alive ? 'running' : 'stopped';
+                }
+
+                var awakeDot   = document.getElementById('health-awake-dot');
+                var awakeLabel = document.getElementById('health-awake-label');
+                if (data.awake && awakeDot && awakeLabel) {
+                    setDot(awakeDot, data.awake.status);
+                    awakeLabel.textContent = data.awake.alive ? 'running' : 'stopped';
+                }
+            })
+            .catch(function() {});
+    }
+
+    loadHealth();
+    function scheduleHealth() {
+        setTimeout(function() { loadHealth(); scheduleHealth(); }, 60000);
+    }
+    scheduleHealth();
 })();
 </script>
 {% endblock %}

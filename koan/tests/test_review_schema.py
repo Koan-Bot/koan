@@ -51,8 +51,8 @@ class TestValidateReviewValid:
                 "lgtm": False,
                 "summary": "Blocking SQL injection issue.",
                 "checklist": [
-                    {"item": "No hardcoded secrets", "passed": True, "finding_ref": ""},
-                    {"item": "Input validation", "passed": False, "finding_ref": "critical #1"},
+                    {"item": "No hardcoded secrets", "passed": True, "finding_refs": []},
+                    {"item": "Input validation", "passed": False, "finding_refs": [0]},
                 ],
             },
         }
@@ -184,7 +184,7 @@ class TestValidateReviewInvalid:
             "file_comments": [],
             "review_summary": {
                 "lgtm": True, "summary": "s",
-                "checklist": [{"item": "x", "passed": "yes", "finding_ref": ""}],
+                "checklist": [{"item": "x", "passed": "yes", "finding_refs": []}],
             },
         }
         valid, errors = validate_review(data)
@@ -196,12 +196,50 @@ class TestValidateReviewInvalid:
             "file_comments": [],
             "review_summary": {
                 "lgtm": True, "summary": "s",
-                "checklist": [{"item": "x", "passed": True}],  # missing finding_ref
+                "checklist": [{"item": "x"}],  # missing required 'passed'
             },
         }
         valid, errors = validate_review(data)
         assert valid is False
-        assert any("finding_ref" in e for e in errors)
+        assert any("passed" in e for e in errors)
+
+    def test_checklist_item_without_finding_refs_is_valid(self):
+        """finding_refs is optional — normalize backfills it, so its absence is valid."""
+        data = {
+            "file_comments": [],
+            "review_summary": {
+                "lgtm": True, "summary": "s",
+                "checklist": [{"item": "x", "passed": True}],
+            },
+        }
+        valid, errors = validate_review(data)
+        assert valid is True, errors
+
+    def test_checklist_finding_refs_accepts_int_list(self):
+        data = {
+            "file_comments": [{
+                "file": "a.py", "line_start": 1, "line_end": 1,
+                "severity": "critical", "title": "t", "comment": "c", "code_snippet": "",
+            }],
+            "review_summary": {
+                "lgtm": False, "summary": "s",
+                "checklist": [{"item": "x", "passed": False, "finding_refs": [0, 1]}],
+            },
+        }
+        valid, errors = validate_review(data)
+        assert valid is True, errors
+
+    def test_checklist_finding_refs_rejects_non_int(self):
+        data = {
+            "file_comments": [],
+            "review_summary": {
+                "lgtm": False, "summary": "s",
+                "checklist": [{"item": "x", "passed": False, "finding_refs": ["critical #1"]}],
+            },
+        }
+        valid, errors = validate_review(data)
+        assert valid is False
+        assert any("finding_refs" in e for e in errors)
 
     def test_float_line_numbers_accepted(self):
         """JSON has no int type — float values like 42.0 should be accepted."""
@@ -304,3 +342,101 @@ class TestValidateCommentReplies:
         }
         valid, errors = validate_review(data)
         assert valid is True
+
+    def test_valid_reply_with_action(self):
+        """Reply with a valid action field passes validation."""
+        data = {
+            "file_comments": [],
+            "review_summary": {"lgtm": True, "summary": "s", "checklist": []},
+            "comment_replies": [
+                {"comment_id": 123, "reply": "Fixed in latest commit.", "action": "fixed"},
+            ],
+        }
+        valid, errors = validate_review(data)
+        assert valid is True
+        assert errors == []
+
+    def test_reply_without_action_still_valid(self):
+        """Omitting action is valid (backward compat)."""
+        data = {
+            "file_comments": [],
+            "review_summary": {"lgtm": True, "summary": "s", "checklist": []},
+            "comment_replies": [
+                {"comment_id": 123, "reply": "Noted."},
+            ],
+        }
+        valid, errors = validate_review(data)
+        assert valid is True
+
+    def test_reply_action_wrong_type(self):
+        """Non-string action triggers validation error."""
+        data = {
+            "file_comments": [],
+            "review_summary": {"lgtm": True, "summary": "s", "checklist": []},
+            "comment_replies": [
+                {"comment_id": 123, "reply": "text", "action": 42},
+            ],
+        }
+        valid, errors = validate_review(data)
+        assert valid is False
+        assert any("action" in e for e in errors)
+
+    def test_reply_unrecognized_action_passes_validation(self):
+        """Unrecognized action string passes validation (clamped in normalization)."""
+        data = {
+            "file_comments": [],
+            "review_summary": {"lgtm": True, "summary": "s", "checklist": []},
+            "comment_replies": [
+                {"comment_id": 123, "reply": "text", "action": "some_unknown"},
+            ],
+        }
+        valid, errors = validate_review(data)
+        assert valid is True
+
+    def test_all_valid_actions(self):
+        """Each defined action value passes validation."""
+        for action in ("fixed", "wont_fix", "needs_clarification", "acknowledged"):
+            data = {
+                "file_comments": [],
+                "review_summary": {"lgtm": True, "summary": "s", "checklist": []},
+                "comment_replies": [
+                    {"comment_id": 1, "reply": "text", "action": action},
+                ],
+            }
+            valid, errors = validate_review(data)
+            assert valid is True, f"action={action!r} should be valid, got errors: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# REFLECT_SCHEMA
+# ---------------------------------------------------------------------------
+
+class TestReflectSchema:
+    def test_schema_is_array_type(self):
+        """REFLECT_SCHEMA top-level type is array."""
+        from app.review_schema import REFLECT_SCHEMA
+        assert REFLECT_SCHEMA["type"] == "array"
+
+    def test_schema_items_required_fields(self):
+        """REFLECT_SCHEMA items require finding_index, score, reason."""
+        from app.review_schema import REFLECT_SCHEMA
+        required = set(REFLECT_SCHEMA["items"]["required"])
+        assert required == {"finding_index", "score", "reason"}
+
+    def test_schema_finding_index_is_integer(self):
+        """finding_index property has integer type."""
+        from app.review_schema import REFLECT_SCHEMA
+        props = REFLECT_SCHEMA["items"]["properties"]
+        assert props["finding_index"]["type"] == "integer"
+
+    def test_schema_score_is_integer(self):
+        """score property has integer type."""
+        from app.review_schema import REFLECT_SCHEMA
+        props = REFLECT_SCHEMA["items"]["properties"]
+        assert props["score"]["type"] == "integer"
+
+    def test_schema_reason_is_string(self):
+        """reason property has string type."""
+        from app.review_schema import REFLECT_SCHEMA
+        props = REFLECT_SCHEMA["items"]["properties"]
+        assert props["reason"]["type"] == "string"

@@ -6,7 +6,6 @@ lifecycle notifications.
 
 Usage:
     python -m app.run              # Normal start
-    python -m app.run --restart    # Re-exec after restart signal (exit 42)
 
 Features:
 - Double-tap CTRL-C protection across ALL phases (missions, rituals,
@@ -14,12 +13,17 @@ Features:
   activity name; second press within 10s aborts.
 - Automatic exception recovery with backoff (survives crashes)
 - protected_phase() context manager for easy phase protection
-- Restart wrapper (exit code 42 → re-exec)
+- Restart wrapper: a restart signal (exit code 42) triggers os.execv so
+  the interpreter reloads updated code from disk — without this, /update
+  and auto-update would pull new code yet keep running the old modules
+  already imported into this long-lived process.
 - Process group isolation for Claude subprocess (SIGINT ignored)
 - Colored log output with TTY detection
 """
 
+import contextlib
 import os
+import json
 import signal
 import subprocess
 import sys
@@ -28,12 +32,18 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
+from app.constants import IDLE_LOOP_BREATH_SECONDS
 from app.iteration_manager import plan_iteration
 from app.loop_manager import check_pending_missions, interruptible_sleep
 from app.pid_manager import acquire_pidfile, release_pidfile
-from app.restart_manager import check_restart, clear_restart, RESTART_EXIT_CODE
+from app.restart_manager import (
+    check_restart,
+    clear_restart,
+    RESTART_EXIT_CODE,
+    RESTART_RUN_FILE,
+)
 from app.run_log import (  # noqa: F401 — re-exported for backward compat
     _ANSI_RESET,
     _CATEGORY_COLORS,
@@ -44,35 +54,24 @@ from app.run_log import (  # noqa: F401 — re-exported for backward compat
     bold_cyan,
     bold_green,
     log,
+    suppress_logged,
 )
 from app.shutdown_manager import is_shutdown_requested, clear_shutdown
 from app.signals import (
+    CYCLE_FILE,
+    CYCLE_RELEASE_FILE,
     PAUSE_FILE,
     PROJECT_FILE,
+    RESET_COUNTER_FILE,
     SHUTDOWN_FILE,
+    ABORT_FILE,
     STATUS_FILE,
     STOP_FILE,
 )
-from app.utils import atomic_write
-
-
-# ---------------------------------------------------------------------------
-# Recovery configuration
-# ---------------------------------------------------------------------------
-
-# Maximum consecutive iteration errors before entering pause mode.
-MAX_CONSECUTIVE_ERRORS = 10
-
-# Maximum crashes in main() before giving up.
-MAX_MAIN_CRASHES = 5
-
-# Backoff parameters (in seconds).
-BACKOFF_MULTIPLIER = 10
-MAX_BACKOFF_MAIN = 60
-MAX_BACKOFF_ITERATION = 300
-
-# Notification throttling: notify on first error, then every N errors.
-ERROR_NOTIFICATION_INTERVAL = 5
+from app.config import get_recovery_config
+from app.messaging_level import is_debug
+from app.subprocess_runner import kill_process_group
+from app.utils import atomic_write, koan_tmp_dir
 
 
 # ---------------------------------------------------------------------------
@@ -82,17 +81,34 @@ ERROR_NOTIFICATION_INTERVAL = 5
 def _calculate_backoff(attempt: int, max_backoff: int) -> int:
     """Calculate linear backoff capped at max_backoff.
 
-    Returns: attempt * BACKOFF_MULTIPLIER, capped at max_backoff.
+    Reads ``backoff_multiplier`` from ``recovery`` config section.
+    Returns: attempt * multiplier, capped at max_backoff.
     """
-    return min(BACKOFF_MULTIPLIER * attempt, max_backoff)
+    cfg = get_recovery_config()
+    return min(cfg["backoff_multiplier"] * attempt, max_backoff)
 
 
 def _should_notify_error(attempt: int) -> bool:
     """Determine if error notification should be sent.
 
-    Notifies on first error and every ERROR_NOTIFICATION_INTERVAL errors.
+    Notifies on first error and every ``error_notification_interval`` errors.
     """
-    return attempt == 1 or attempt % ERROR_NOTIFICATION_INTERVAL == 0
+    cfg = get_recovery_config()
+    interval = cfg["error_notification_interval"]
+    return attempt == 1 or attempt % interval == 0
+
+
+def _provider_identity() -> Tuple[str, str]:
+    """Return the active provider name and a human-friendly label.
+
+    Centralizes the ``get_provider_name() + .title()`` lookup so notification
+    text and quota/auth handlers stay consistent across mission, skill, and
+    contemplative code paths.
+    """
+    from app.provider import get_provider_name
+
+    name = get_provider_name()
+    return name, name.title()
 
 
 # ---------------------------------------------------------------------------
@@ -177,35 +193,8 @@ class protected_phase:
 
 
 def _kill_process_group(proc):
-    """Terminate a subprocess and its entire process group.
-
-    When a subprocess is started with ``start_new_session=True``, it becomes
-    the leader of a new process group.  A simple ``proc.terminate()`` only
-    sends SIGTERM to the leader — children survive.  This helper sends
-    SIGTERM to the whole group, then SIGKILL if still alive after 3 s.
-    """
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(pgid, signal.SIGKILL)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                # Process didn't die even after SIGKILL — give up to
-                # avoid blocking the caller.  The OS will reap the
-                # zombie eventually.
-                print(
-                    f"[run] warning: pid {proc.pid} did not exit after SIGKILL",
-                    file=sys.stderr,
-                )
-    except (ProcessLookupError, PermissionError, OSError):
-        # Process already gone or we lack permissions — nothing to do.
-        pass
+    """Delegate to :func:`app.subprocess_runner.kill_process_group`."""
+    kill_process_group(proc)
 
 
 def _on_sigint(signum, frame):
@@ -230,6 +219,73 @@ def _on_sigint(signum, frame):
     print()
     phase_hint = f" ({_sig.phase})" if _sig.phase else ""
     log("koan", f"⚠️  Press CTRL-C again within {_sig.timeout}s to abort.{phase_hint}")
+
+
+def _on_sigusr1(signum, frame):
+    """SIGUSR1 handler: instant /abort from the bridge.
+
+    The /abort skill writes ``.koan-abort`` and sends SIGUSR1 so the runner
+    reacts within milliseconds instead of waiting up to ``proc.wait``'s 30 s
+    poll cycle. Idempotent: a no-op when no Claude subprocess is running.
+    """
+    global _last_mission_aborted
+    proc = _sig.claude_proc
+    if proc is None or proc.poll() is not None:
+        return
+
+    _last_mission_aborted = True
+    koan_root_path = os.environ.get("KOAN_ROOT", "")
+    if koan_root_path:
+        Path(koan_root_path, ABORT_FILE).unlink(missing_ok=True)
+    log("koan", "Abort signal received — killing current mission")
+    _kill_process_group(proc)
+
+
+def _start_stagnation_monitor(stdout_file: str, proc, project_name: str):
+    """Launch a StagnationMonitor for a running Claude subprocess.
+
+    Returns ``None`` when stagnation detection is disabled (via config
+    or per-project override) or if any setup error occurs — the monitor
+    is strictly a best-effort safety net and must never block mission
+    execution.
+    """
+    try:
+        from app.config import get_stagnation_config
+        from app.stagnation_monitor import StagnationMonitor
+    except Exception as e:
+        log("error", f"stagnation monitor import failed: {e}")
+        return None
+
+    try:
+        cfg = get_stagnation_config(project_name)
+    except Exception as e:
+        log("error", f"stagnation config error: {e}")
+        return None
+
+    if not cfg.get("enabled", True):
+        return None
+
+    def _on_warn(count: int) -> None:
+        log("koan", f"⚠️  Possible stagnation detected (identical output {count}x)")
+
+    def _on_abort() -> None:
+        log("error", "Stagnation confirmed — killing stuck Claude session")
+        _kill_process_group(proc)
+
+    try:
+        monitor = StagnationMonitor(
+            stdout_file=stdout_file,
+            on_abort=_on_abort,
+            on_warn=_on_warn,
+            check_interval_seconds=cfg["check_interval_seconds"],
+            abort_after_cycles=cfg["abort_after_cycles"],
+            sample_lines=cfg["sample_lines"],
+        )
+        monitor.start()
+        return monitor
+    except Exception as e:
+        log("error", f"stagnation monitor start failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +316,13 @@ def run_claude_task(
 
     Returns the child exit code.
     """
-    global _last_mission_timed_out
+    global _last_mission_timed_out, _last_mission_aborted
+    global _stagnation_pattern_type, _stagnation_pattern_excerpt
     _last_mission_timed_out = False
+    _last_mission_aborted = False
+    _last_mission_stagnated.clear()
+    _stagnation_pattern_type = ""
+    _stagnation_pattern_excerpt = ""
 
     _sig.task_running = True
     _sig.first_ctrl_c = 0
@@ -278,7 +339,6 @@ def run_claude_task(
     from app.config import get_mission_timeout
 
     mission_timeout = get_mission_timeout()
-    timed_out = False
 
     exit_code = 1  # default if subprocess never completes
     try:
@@ -292,20 +352,18 @@ def run_claude_task(
             )
             _sig.claude_proc = proc
 
-            # Watchdog timer: kills the process group if mission exceeds timeout.
-            # Same pattern as skill dispatch (line ~1828). Without this,
-            # proc.wait() blocks indefinitely on runaway sessions.
-            timer = None
-            if mission_timeout > 0:
-                def _mission_watchdog():
-                    nonlocal timed_out
-                    timed_out = True
-                    log("error", f"Mission timed out ({mission_timeout}s) — killing process")
-                    _kill_process_group(proc)
+            from app.subprocess_runner import ProcessWatchdog
 
-                timer = threading.Timer(mission_timeout, _mission_watchdog)
-                timer.daemon = True
-                timer.start()
+            watchdog = None
+            if mission_timeout > 0:
+                watchdog = ProcessWatchdog(
+                    proc, mission_timeout,
+                    on_timeout=lambda: log("error", f"Mission timed out ({mission_timeout}s) — killing process"),
+                ).start()
+
+            stagnation_monitor = _start_stagnation_monitor(
+                stdout_file, proc, project_name,
+            )
 
             try:
                 # Wait for child, handling SIGINT interruptions gracefully.
@@ -317,7 +375,20 @@ def run_claude_task(
                         proc.wait(timeout=30)
                         break
                     except subprocess.TimeoutExpired:
-                        if timed_out:
+                        # Check for abort signal (user sent /abort)
+                        koan_root_path = os.environ.get("KOAN_ROOT", "")
+                        abort_path = Path(koan_root_path, ABORT_FILE) if koan_root_path else None
+                        if abort_path and abort_path.exists():
+                            log("koan", "Abort signal detected — aborting current mission")
+                            abort_path.unlink(missing_ok=True)
+                            _last_mission_aborted = True
+                            _kill_process_group(proc)
+                            try:
+                                proc.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                log("error", f"Process {proc.pid} unkillable after abort — abandoning")
+                            break
+                        if watchdog and watchdog.fired:
                             # Watchdog already fired but process survived —
                             # make one last kill attempt from the main thread.
                             _kill_process_group(proc)
@@ -338,14 +409,24 @@ def run_claude_task(
                         # Single CTRL-C — keep waiting
                         continue
             finally:
-                if timer is not None:
-                    timer.cancel()
+                if watchdog is not None:
+                    watchdog.cancel()
+                if stagnation_monitor is not None:
+                    stagnation_monitor.stop()
+                    if stagnation_monitor.stagnated:
+                        _last_mission_stagnated.set()
+                        _stagnation_pattern_type = stagnation_monitor.pattern_type
+                        _stagnation_pattern_excerpt = stagnation_monitor.pattern_excerpt
                 cleanup()
 
         exit_code = proc.returncode
-        if timed_out:
+        if _last_mission_aborted:
+            exit_code = 1
+        elif watchdog and watchdog.fired:
             exit_code = 1
             _last_mission_timed_out = True
+        elif _last_mission_stagnated.is_set():
+            exit_code = 1
     finally:
         # Always stop journal streaming, even on exception
         if journal_stream:
@@ -374,7 +455,9 @@ def parse_projects() -> list:
     1. projects.yaml (if exists)
     2. KOAN_PROJECTS env var (fallback)
 
-    Returns list of (name, path) tuples. Exits on error.
+    Returns list of (name, path) tuples. Exits on error (only if no
+    valid projects remain). Missing project directories are warned about
+    and filtered out instead of crashing.
     """
     from app.utils import get_known_projects
     projects = get_known_projects()
@@ -387,12 +470,19 @@ def parse_projects() -> list:
         log("error", f"Max 50 projects allowed. You have {len(projects)}.")
         sys.exit(1)
 
+    valid = []
     for name, path in projects:
         if not Path(path).is_dir():
-            log("error", f"Project '{name}' path does not exist: {path}")
-            sys.exit(1)
+            log("warn", f"Project '{name}' path does not exist: {path} — skipping. "
+                f"Remove it from projects.yaml to silence this warning.")
+        else:
+            valid.append((name, path))
 
-    return projects
+    if not valid:
+        log("error", "No valid project directories found. Check your projects.yaml paths.")
+        sys.exit(1)
+
+    return valid
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +512,108 @@ def _notify(instance: str, message: str):
         log("error", f"Notification failed: {e}")
 
 
+def _notify_raw(instance: str, message: str):
+    """Send a notification straight to Telegram, skipping the Claude-CLI
+    personality reformatter (notify.format_and_send → format_outbox.
+    format_message). Use this for terse status updates (startup progress,
+    auto-update restarts) where the verbatim text and emoji matter and the
+    extra Claude CLI call would defeat the point. send_telegram still
+    handles priority filtering, flood protection, and retries.
+    """
+    try:
+        from app.notify import send_telegram
+        send_telegram(message)
+    except Exception as e:
+        log("error", f"Raw notification failed: {e}")
+
+
+def _is_ci_check_mission(mission_title: str) -> bool:
+    """Return True if *mission_title* is a CI-related mission.
+
+    Matches both /ci_check skill missions and ci_dispatch-generated
+    "Fix CI failure:" missions so all CI failure notifications use
+    🚦 instead of the alarming ❌.
+    """
+    from app.skill_dispatch import parse_skill_mission
+    _, cmd, args = parse_skill_mission(mission_title)
+    if cmd == "ci_check":
+        return True
+    if not cmd and args.startswith("Fix CI failure:"):
+        return True
+    return False
+
+
+_SKILL_COMPLETION = {
+    "review": ("🔍", "Reviewed"),
+    "fix": ("🐞", "Fixed"),
+    "rebase": ("🔄", "Rebased"),
+    "plan": ("🧠", "Planned"),
+    "implement": ("🔨", "Implemented"),
+}
+
+
+def _tracked_skill(mission_title: str):
+    """Return (emoji, past_tense) if the mission is a tracked skill, else None."""
+    t = (mission_title or "").strip()
+    if not t.startswith("/"):
+        return None
+    cmd = t[1:].split(None, 1)[0].lower()
+    return _SKILL_COMPLETION.get(cmd)
+
+
+def _completion_pr_url(instance, project_name):
+    try:
+        from app.mission_runner import get_last_pr_url
+        return get_last_pr_url(instance, project_name)
+    except (ImportError, OSError, ValueError):
+        return ""
+
+
+def _notify_mission_normal(
+    instance: str,
+    project_name: str,
+    run_num: int,
+    max_runs: int,
+    exit_code: int,
+    mission_title: str,
+    pr_url: str,
+):
+    """Normal-mode (quiet) end-of-mission emit. See _notify_mission_end."""
+    skill = _tracked_skill(mission_title)
+
+    # Failures always surface (short form).
+    if exit_code != 0:
+        emoji = (skill[0] + " ") if skill else ""
+        prefix = "🚦" if _is_ci_check_mission(mission_title) else "❌"
+        label = mission_title or "Run"
+        _notify(instance, f"{prefix} [{project_name}] {emoji}Failed: {label}")
+        return
+
+    # Tracked skill success → concise "✅ [project] 🔍 Reviewed <pr-url>". Prefer
+    # the URL captured during post-mission processing (before pending.md was
+    # deleted); fall back to a best-effort re-read.
+    if skill is not None:
+        emoji, verb = skill
+        url = pr_url or _completion_pr_url(instance, project_name)
+        _notify(instance, f"✅ [{project_name}] {emoji} {verb} {url}".rstrip())
+        return
+
+    # Genuinely autonomous background runs carry no mission title — suppress
+    # those (log only). An operator-initiated mission (a user/Telegram-queued
+    # task with a real title) still gets a minimal completion signal so
+    # explicitly-requested work isn't silently dropped.
+    title = (mission_title or "").strip()
+    if not title:
+        from app.run_log import log_safe
+        log_safe(
+            "mission",
+            f"[{project_name}] Run {run_num}/{max_runs} done "
+            "(normal mode, autonomous run suppressed)",
+        )
+        return
+    _notify(instance, f"✅ [{project_name}] Done: {title}")
+
+
 def _notify_mission_end(
     instance: str,
     project_name: str,
@@ -429,13 +621,26 @@ def _notify_mission_end(
     max_runs: int,
     exit_code: int,
     mission_title: str = "",
+    pr_url: str = "",
 ):
     """Send a notification when a mission or autonomous run completes.
 
-    Always sends — both on success and failure — so the human always
-    gets a status update. Uses unicode prefix: ✅ for success, ❌ for failure.
-    On success, appends a brief journal summary when available.
+    Honors messaging.level:
+    - normal (default): one short line for tracked skill missions
+      (✅ [project] 🔍 Reviewed <pr-url>); operator-initiated missions get a
+      minimal one-line success (✅ [project] Done: <title>); genuinely
+      autonomous background runs (no mission title) are logged only (no bridge
+      push); failures always surface (short form).
+    - debug: full lifecycle line + journal summary (legacy behavior).
     """
+    if not is_debug():
+        _notify_mission_normal(
+            instance, project_name, run_num, max_runs,
+            exit_code, mission_title, pr_url,
+        )
+        return
+
+    # ---- debug mode: legacy verbose behavior ----
     if exit_code == 0:
         prefix = "✅"
         label = mission_title if mission_title else "Autonomous run"
@@ -449,7 +654,7 @@ def _notify_mission_end(
         except Exception as e:
             log("error", f"Mission summary extraction failed: {e}")
     else:
-        prefix = "❌"
+        prefix = "🚦" if _is_ci_check_mission(mission_title) else "❌"
         label = mission_title if mission_title else "Run"
         msg = f"{prefix} [{project_name}] Run {run_num}/{max_runs} — Failed: {label}"
         # Try to attach error context from the journal
@@ -462,6 +667,62 @@ def _notify_mission_end(
             log("error", f"Failure context extraction failed: {e}")
 
     _notify(instance, msg)
+
+
+# ---------------------------------------------------------------------------
+# Startup delay (#1039)
+# ---------------------------------------------------------------------------
+
+DEFAULT_STARTUP_DELAY = 30  # seconds
+
+
+def _startup_delay(koan_root: str) -> None:
+    """Wait before the first iteration so /pause can be processed.
+
+    When ``make start`` launches koan, the first mission can be picked up
+    before the Telegram bridge has time to process a /pause command.  This
+    interruptible delay (default 30 s, configurable via ``startup_delay``
+    in config.yaml) closes the race window.
+
+    The delay is skipped when:
+    - The agent is already paused (.koan-pause exists).
+    - ``startup_delay`` is set to ``0``.
+
+    The delay is interrupted early if any lifecycle signal appears
+    (.koan-pause, .koan-stop, .koan-shutdown, .koan-restart-run).
+    """
+    from app.utils import load_config
+
+    delay = load_config().get("startup_delay", DEFAULT_STARTUP_DELAY)
+    if delay <= 0:
+        return
+
+    # Already paused — skip directly into the main loop's pause handler
+    if Path(koan_root, PAUSE_FILE).exists():
+        log("koan", "Already paused at startup — skipping startup delay.")
+        return
+
+    log(
+        "koan",
+        f"Startup delay: waiting {delay}s before first mission "
+        f"(send /pause now if needed).",
+    )
+
+    tick = 2  # check signals every 2 s
+    elapsed = 0
+    while elapsed < delay:
+        time.sleep(min(tick, delay - elapsed))
+        elapsed += tick
+
+        # Any lifecycle signal → break out. Use the runner's own restart marker
+        # (RESTART_RUN_FILE) — the legacy combined .koan-restart is deprecated
+        # and no longer written.
+        for sig in (PAUSE_FILE, STOP_FILE, SHUTDOWN_FILE, RESTART_RUN_FILE):
+            if Path(koan_root, sig).exists():
+                log("koan", f"Signal detected during startup delay ({sig}), proceeding.")
+                return
+
+    log("koan", "Startup delay complete — entering main loop.")
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +757,117 @@ def _commit_instance(instance: str, message: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# Update handler (graceful update + restart)
+# ---------------------------------------------------------------------------
+
+def _handle_update(koan_root: str, instance: str, count: int) -> bool:
+    """Handle /update: pull upstream updates, then trigger restart.
+
+    Called after the current mission completes. Pulls the latest code
+    and requests a restart. If the pull fails, notifies and still restarts
+    (the user explicitly asked for an update).
+
+    Returns True if the update was performed (caller should restart),
+    False if the update was refused due to safety checks.
+    """
+    from app.update_manager import check_update_safety, pull_upstream
+    from app.restart_manager import request_restart
+    from app.pause_manager import remove_pause
+
+    safety_msg = check_update_safety(Path(koan_root))
+    if safety_msg:
+        log("koan", "Update refused: diverged from upstream")
+        _notify(instance, safety_msg)
+        return False
+
+    result = pull_upstream(Path(koan_root))
+    if not result.success:
+        log("koan", f"Update failed: {result.error}")
+        _notify(instance, f"🔄 Update failed ({result.error}), restarting anyway.")
+    elif result.changed:
+        log("koan", f"Update: {result.summary()}")
+        _notify(instance, f"🔄 Update complete after {count} runs. {result.summary()} Restarting...")
+    else:
+        log("koan", "Update: already up to date, restarting.")
+        _notify(instance, f"🔄 Update complete after {count} runs. Already up to date. Restarting...")
+
+    remove_pause(koan_root)
+    request_restart(koan_root)
+    return True
+
+
+def _handle_update_release(koan_root: str, instance: str, count: int) -> bool:
+    """Handle /update_last_release: checkout latest release tag, then restart.
+
+    Returns True if the update was performed (caller should restart),
+    False if no tags found or safety check failed.
+    """
+    from app.update_manager import checkout_latest_tag
+    from app.restart_manager import request_restart
+    from app.pause_manager import remove_pause
+
+    result = checkout_latest_tag(Path(koan_root))
+    if not result.success:
+        log("koan", f"Release update failed: {result.error}")
+        _notify(instance, f"🔄 Release update failed ({result.error}), restarting anyway.")
+    elif result.changed:
+        log("koan", f"Release update: {result.summary()}")
+        _notify(instance, f"🔄 Release update complete after {count} runs. {result.summary()} Restarting...")
+    else:
+        log("koan", "Release update: already on latest release tag.")
+        _notify(instance, "🔄 Already on latest release tag. Restarting...")
+
+    remove_pause(koan_root)
+    request_restart(koan_root)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Pause mode handler
 # ---------------------------------------------------------------------------
+
+_last_inbox_check: float = float("-inf")
+
+
+def _check_inbox_during_pause(koan_root: str, instance: str) -> None:
+    """Process /inbox signal while paused (throttled to once per hour).
+
+    Checks each provider independently so one failure doesn't block the other.
+    Signal is consumed only after fetching completes (success or per-provider error).
+    """
+    global _last_inbox_check
+
+    from app.constants import PAUSE_INBOX_CHECK_INTERVAL
+    from app.loop_manager import (
+        _consume_check_notifications_signal,
+        process_github_notifications,
+        process_jira_notifications,
+    )
+
+    signal_path = Path(koan_root, ".koan-check-notifications")
+    if not signal_path.exists():
+        return
+
+    now = time.monotonic()
+    if now - _last_inbox_check < PAUSE_INBOX_CHECK_INTERVAL:
+        return
+
+    log("pause", "Inbox check requested — fetching notifications while paused")
+    total = 0
+    try:
+        total += process_github_notifications(koan_root, instance, force=True)
+    except Exception as e:
+        log("error", f"GitHub inbox check during pause failed: {e}")
+    try:
+        total += process_jira_notifications(koan_root, instance, force=True)
+    except Exception as e:
+        log("error", f"Jira inbox check during pause failed: {e}")
+
+    _last_inbox_check = now
+    _consume_check_notifications_signal(koan_root)
+    if total > 0:
+        log("pause", f"Inbox: {total} mission(s) queued (will run after resume)")
+
 
 def handle_pause(
     koan_root: str, instance: str, max_runs: int,
@@ -531,7 +901,7 @@ def handle_pause(
         _reset_usage_session(instance)
         return "resume"
 
-    # Sleep 5 min in 5s increments — check for resume/stop/restart/shutdown
+    # Sleep 5 min in 5s increments — check for resume/stop/restart/shutdown/update
     with protected_phase("Paused — waiting for resume"):
         for _ in range(60):
             if not Path(koan_root, PAUSE_FILE).exists():
@@ -542,8 +912,15 @@ def handle_pause(
             if Path(koan_root, SHUTDOWN_FILE).exists():
                 log("pause", "Shutdown signal detected while paused")
                 break
-            if check_restart(koan_root):
+            if Path(koan_root, CYCLE_FILE).exists():
+                log("pause", "Update signal detected while paused")
                 break
+            if Path(koan_root, CYCLE_RELEASE_FILE).exists():
+                log("pause", "Release update signal detected while paused")
+                break
+            if check_restart(koan_root, target="run"):
+                break
+            _check_inbox_during_pause(koan_root, instance)
             time.sleep(5)
 
     return None
@@ -591,10 +968,20 @@ def main_loop():
     # file persists and would cause an immediate exit on next startup.
     Path(koan_root, STOP_FILE).unlink(missing_ok=True)
     Path(koan_root, SHUTDOWN_FILE).unlink(missing_ok=True)
-    clear_restart(koan_root)
+    Path(koan_root, CYCLE_FILE).unlink(missing_ok=True)
+    Path(koan_root, CYCLE_RELEASE_FILE).unlink(missing_ok=True)
+    Path(koan_root, ABORT_FILE).unlink(missing_ok=True)
+    Path(koan_root, RESET_COUNTER_FILE).unlink(missing_ok=True)
+    clear_restart(koan_root, target="run")
 
     # Install SIGINT handler
     signal.signal(signal.SIGINT, _on_sigint)
+
+    # Install SIGUSR1 handler — instant /abort from the bridge.
+    # Avoids the up-to-30s wait for the ABORT_FILE poll cycle inside
+    # run_claude_task(). The file is still written for durability so a
+    # missed signal (runner restarting, etc.) is recovered on next poll.
+    signal.signal(signal.SIGUSR1, _on_sigusr1)
 
     # Initialize project state
     if projects:
@@ -605,12 +992,34 @@ def main_loop():
     count = 0
     consecutive_errors = 0
     consecutive_idle = 0
+    consecutive_nonproductive = 0
+    idle_notified = False
     MAX_CONSECUTIVE_IDLE = 30  # ~30 min at 60s interval → auto-pause
+    # Throttle kicks in only after several back-to-back non-productive
+    # iterations so that one-off dedup skips / transient errors don't eat
+    # an extra second each.
+    NONPRODUCTIVE_THROTTLE_THRESHOLD = 3
     try:
         # Startup sequence
         max_runs, interval, branch_prefix = run_startup(koan_root, instance, projects)
 
+        # Probe for optional rtk binary (https://github.com/rtk-ai/rtk).
+        # When present, the prompt builder injects an awareness section so
+        # Claude prefers ``rtk <cmd>`` over the raw command for 60-90 % less
+        # tool output.  Detection is cheap, cached, and never mutates state.
+        try:
+            from app.rtk_detector import detect_rtk
+            log("init", detect_rtk().summary_line())
+        except Exception as e:
+            log("error", f"rtk detection failed: {e}")
+
         git_sync_interval = int(os.environ.get("KOAN_GIT_SYNC_INTERVAL", "5"))
+
+        # --- Startup delay (#1039) ---
+        # Give the user a window to send /pause before the first mission runs.
+        # Without this, a mission can be picked up immediately after startup,
+        # racing with the Telegram bridge processing of /pause.
+        _startup_delay(koan_root)
 
         while True:
             # --- Stop check ---
@@ -622,6 +1031,22 @@ def main_loop():
                 _notify(instance, f"Kōan stopped on request after {count} runs. Last project: {current}.")
                 break
 
+            # --- Update check (finish mission → update → restart) ---
+            cycle_file = Path(koan_root, CYCLE_FILE)
+            if cycle_file.exists():
+                log("koan", "Update requested. Updating and restarting...")
+                cycle_file.unlink(missing_ok=True)
+                if _handle_update(koan_root, instance, count):
+                    sys.exit(RESTART_EXIT_CODE)
+
+            # --- Release update check (checkout latest tag → restart) ---
+            cycle_release_file = Path(koan_root, CYCLE_RELEASE_FILE)
+            if cycle_release_file.exists():
+                log("koan", "Release update requested. Checking out latest tag...")
+                cycle_release_file.unlink(missing_ok=True)
+                if _handle_update_release(koan_root, instance, count):
+                    sys.exit(RESTART_EXIT_CODE)
+
             # --- Shutdown check (stops both agent loop and bridge) ---
             if is_shutdown_requested(koan_root, start_time):
                 log("koan", "Shutdown requested. Exiting.")
@@ -631,9 +1056,9 @@ def main_loop():
                 break
 
             # --- Restart check ---
-            if check_restart(koan_root, since=start_time):
+            if check_restart(koan_root, since=start_time, target="run"):
                 log("koan", "Restart requested. Exiting for re-launch...")
-                clear_restart(koan_root)
+                clear_restart(koan_root, target="run")
                 sys.exit(RESTART_EXIT_CODE)
 
             # --- Pause mode ---
@@ -643,7 +1068,28 @@ def main_loop():
                     count = 0
                     consecutive_errors = 0
                     consecutive_idle = 0
+                    consecutive_nonproductive = 0
+                    idle_notified = False
+                    from app.feature_tips import mark_active
+                    mark_active()
+                    _mark_startup_resume()
                 continue
+
+            # --- Reset counter check ---
+            reset_file = Path(koan_root, RESET_COUNTER_FILE)
+            if reset_file.exists():
+                reset_file.unlink(missing_ok=True)
+                old_count = count
+                count = 0
+                consecutive_errors = 0
+                consecutive_idle = 0
+                consecutive_nonproductive = 0
+                idle_notified = False
+                from app.feature_tips import mark_active
+                mark_active()
+                _mark_startup_resume()
+                log("koan", f"Run counter reset (was {old_count}/{max_runs}, now 0/{max_runs}).")
+                _notify(instance, f"🔄 Run counter reset: {old_count} → 0 (max {max_runs}).")
 
             # --- Iteration body (exception-protected) ---
             try:
@@ -660,9 +1106,15 @@ def main_loop():
                 if productive is True:
                     count += 1
                     consecutive_idle = 0
+                    consecutive_nonproductive = 0
+                    idle_notified = False
+                    from app.feature_tips import mark_active
+                    mark_active()
                 elif productive == "idle":
                     consecutive_idle += 1
-                    if consecutive_idle == 1:
+                    consecutive_nonproductive = 0
+                    if not idle_notified:
+                        idle_notified = True
                         try:
                             from app.schedule_manager import is_scheduled_active
                             schedule_active = is_scheduled_active()
@@ -684,14 +1136,12 @@ def main_loop():
                         # Check if a schedule window is active — if so, the
                         # human configured deep_hours or work_hours and the
                         # agent should stay active, not auto-pause.
-                        try:
+                        with suppress_logged(log, "warning", "Schedule active check failed", Exception):
                             from app.schedule_manager import is_scheduled_active
                             if is_scheduled_active():
                                 if consecutive_idle == MAX_CONSECUTIVE_IDLE:
                                     log("koan", "Idle timeout reached but schedule is active — staying awake")
                                 continue
-                        except (ImportError, Exception):
-                            pass  # schedule check failed — fall through to pause
 
                         from app.config import get_auto_pause
                         if get_auto_pause():
@@ -708,8 +1158,13 @@ def main_loop():
                             consecutive_idle = 0  # Reset so we don't log every iteration
                 else:
                     # Non-productive but not idle (error recovery, dedup, etc.)
-                    # Don't count toward idle timeout
-                    pass
+                    # Don't count toward idle timeout. Throttle only after
+                    # several back-to-back occurrences so one-off skips aren't
+                    # penalized, but a persistent failure (e.g. dedup skipping
+                    # a stuck mission) can't tight-loop and flood Telegram.
+                    consecutive_nonproductive += 1
+                    if consecutive_nonproductive >= NONPRODUCTIVE_THROTTLE_THRESHOLD:
+                        time.sleep(1)
             except KeyboardInterrupt:
                 raise
             except SystemExit:
@@ -730,6 +1185,23 @@ def main_loop():
             fire_hook("session_end", instance_dir=instance, total_runs=count)
         except Exception as e:
             print(f"[hooks] session_end hook error: {e}", file=sys.stderr)
+        # Kill any active parallel sessions before exiting
+        if _live_sessions:
+            log("koan", f"Killing {len(_live_sessions)} active parallel session(s) on shutdown")
+            try:
+                from app.session_manager import kill_session
+                registry = _get_session_registry(instance)
+                for _s in list(_live_sessions.values()):
+                    try:
+                        kill_session(_s, registry)
+                        registry.remove(_s.id)
+                    except Exception as _ke:
+                        log("error", f"kill_session error: {_ke}")
+                _live_sessions.clear()
+            except Exception as e:
+                log("error", f"parallel session cleanup error: {e}")
+        global _session_registry
+        _session_registry = None
         # Cleanup
         Path(koan_root, STATUS_FILE).unlink(missing_ok=True)
         release_pidfile(pidfile_lock, Path(koan_root), "run")
@@ -774,6 +1246,50 @@ def _sleep_between_runs(
             set_status(koan_root, f"Run {run_num}/{max_runs} — done, new mission detected")
 
 
+def _next_notification_due_in(
+    github_enabled: bool,
+    jira_enabled: bool,
+) -> int:
+    """Return the earliest known notification poll due time."""
+    due_times = []
+    if github_enabled:
+        try:
+            from app.loop_manager import get_github_notification_check_due_in
+            due = get_github_notification_check_due_in()
+            if due > 0:
+                due_times.append(due)
+        except Exception as e:
+            log("warning", f"GitHub notification due-time check failed: {e}")
+    if jira_enabled:
+        try:
+            from app.loop_manager import get_jira_notification_check_due_in
+            due = get_jira_notification_check_due_in()
+            if due > 0:
+                due_times.append(due)
+        except Exception as e:
+            log("warning", f"Jira notification due-time check failed: {e}")
+    return min(due_times) if due_times else 0
+
+
+def _resolve_idle_wait_interval(
+    configured_interval: int,
+    github_enabled: bool,
+    jira_enabled: bool,
+) -> int:
+    """Pick a nonzero idle wait without changing normal configured sleeps."""
+    try:
+        interval = max(0, int(configured_interval))
+    except (TypeError, ValueError):
+        interval = 0
+    if interval > 0:
+        return interval
+
+    notification_due = _next_notification_due_in(github_enabled, jira_enabled)
+    if notification_due > 0:
+        return max(IDLE_LOOP_BREATH_SECONDS, notification_due)
+    return IDLE_LOOP_BREATH_SECONDS
+
+
 def _handle_contemplative(
     plan: dict,
     run_num: int,
@@ -790,6 +1306,7 @@ def _handle_contemplative(
     _notify(instance, f"🪷 Run {run_num}/{max_runs} — Contemplative mode on {project_name}")
 
     log("pause", "Running contemplative session...")
+    contemp_start = int(time.time())
     try:
         from app.contemplative_runner import build_contemplative_command
         cmd = build_contemplative_command(
@@ -797,17 +1314,55 @@ def _handle_contemplative(
             project_name=project_name,
             session_info=f"Run {run_num}/{max_runs} on {project_name}. Mode: {plan['autonomous_mode']}.",
         )
-        fd_out, stdout_file = tempfile.mkstemp(prefix="koan-contemp-out-")
+        fd_out, stdout_file = tempfile.mkstemp(prefix="koan-contemp-out-", dir=koan_tmp_dir())
         os.close(fd_out)
-        fd_err, stderr_file = tempfile.mkstemp(prefix="koan-contemp-err-")
+        fd_err, stderr_file = tempfile.mkstemp(prefix="koan-contemp-err-", dir=koan_tmp_dir())
         os.close(fd_err)
+        cli_error = None
         try:
             run_claude_task(
                 cmd, stdout_file, stderr_file, cwd=koan_root,
                 instance_dir=instance, project_name=project_name, run_num=run_num,
             )
-        finally:
-            _cleanup_temp(stdout_file, stderr_file)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            cli_error = traceback.format_exc()
+            log("warn", f"Contemplative CLI failed: {e}")
+        duration_seconds = int(time.time()) - contemp_start
+        # Log contemplative usage before temp files are cleaned up
+        try:
+            from app.mission_runner import _log_activity_usage
+            _log_activity_usage(
+                instance, project_name, stdout_file,
+                "contemplative", "",
+                duration_seconds=duration_seconds,
+            )
+        except Exception as e:
+            log("warn", f"Failed to log contemplative usage: {e}")
+        # Record session outcome so contemplative sessions feed into
+        # staleness detection, Thompson Sampling, and success-rate metrics.
+        try:
+            from app.mission_runner import (
+                _read_pending_content,
+                _read_stdout_summary,
+                _record_session_outcome,
+            )
+            pending_content = _read_pending_content(instance)
+            if not pending_content.strip():
+                pending_content = _read_stdout_summary(stdout_file)
+            _record_session_outcome(
+                instance, project_name,
+                plan.get("autonomous_mode", "unknown"),
+                max(1, duration_seconds // 60),
+                pending_content,
+                mission_type="contemplative",
+            )
+        except Exception as e:
+            log("warn", f"Failed to record contemplative outcome: {e}")
+        _cleanup_temp(stdout_file, stderr_file)
+        if cli_error:
+            log("error", f"Contemplative error:\n{cli_error}")
     except KeyboardInterrupt:
         raise
     except Exception as e:
@@ -837,6 +1392,11 @@ def _handle_wait_pause(
     instance: str,
 ):
     """Enter pause mode when budget is exhausted (WAIT action)."""
+    from app.usage_tracker import _get_budget_mode
+    if _get_budget_mode() == "disabled":
+        log("quota", "WAIT pause suppressed — budget gating is disabled")
+        return
+
     project_name = plan["project_name"]
     log("quota", "Decision: WAIT mode (budget exhausted)")
     print(f"  Reason: {plan['decision_reason']}")
@@ -902,751 +1462,303 @@ def _run_preflight_check(
     return False
 
 
-def _handle_skill_dispatch(
-    mission_title: str,
-    project_name: str,
-    project_path: str,
-    koan_root: str,
+# ---------------------------------------------------------------------------
+# Mission execution state (shared with mission_executor.py)
+# ---------------------------------------------------------------------------
+
+# Set by run_claude_task when the watchdog timer kills a runaway session.
+_last_mission_timed_out = False
+_last_mission_aborted = False
+# Uses threading.Event for explicit cross-thread signaling between the
+# stagnation daemon (writer) and the main loop's _finalize_mission (reader).
+_last_mission_stagnated = threading.Event()
+_stagnation_pattern_type = ""
+_stagnation_pattern_excerpt = ""
+
+# Startup phase for first-iteration Telegram visibility. Replaces the old
+# _startup_notified / _boot_notified boolean pair: their only valid combinations
+# were (first+boot), (first only), and (neither), which map 1:1 to these states.
+#   "boot"    — the very first iteration since process start: emit boot banners
+#               (empty-state "Notifications clear", update hint) plus cold-start ping.
+#   "resume"  — first iteration after /resume or a counter reset (but not boot):
+#               cold-start ping only; boot-only banners stay silent.
+#   "running" — steady state: quiet (no first-iteration pings).
+_startup_phase = "boot"
+
+
+def _mark_startup_resume() -> None:
+    """Downgrade to the 'resume' phase after /resume or a counter reset.
+
+    Leaves the phase at 'boot' when the first boot iteration has not run yet
+    (start-paused, then resumed before any iteration) so boot-only banners
+    still fire exactly once. Only a completed boot iteration ('running')
+    downgrades to 'resume'.
+    """
+    global _startup_phase
+    if _startup_phase == "running":
+        _startup_phase = "resume"
+
+
+_warned_missing_projects: set = set()
+
+# ---------------------------------------------------------------------------
+# Parallel session state (populated/consumed by _parallel_reap_sessions
+# and _parallel_dispatch_session; only used when max_parallel_sessions > 1)
+# ---------------------------------------------------------------------------
+# session_id -> Session object (with _proc attached — NOT persisted to JSON)
+_live_sessions: dict = {}
+# Lazy SessionRegistry singleton — initialised on first parallel-mode access
+_session_registry = None
+
+
+def _get_session_registry(instance: str):
+    """Return the lazy-initialised SessionRegistry singleton."""
+    global _session_registry
+    if _session_registry is None:
+        from app.session_manager import SessionRegistry
+        _session_registry = SessionRegistry(instance)
+    return _session_registry
+
+
+def _parallel_reap_sessions(
     instance: str,
+    koan_root: str,
+    run_num: int,
+    max_runs: int,
+) -> bool:
+    """Poll active parallel sessions; process any that have completed.
+
+    Returns True if at least one session was reaped.
+    """
+    if not _live_sessions:
+        return False
+
+    from app.session_manager import poll_sessions
+    from app.missions import complete_mission_by_session, fail_mission_by_session
+    from app.mission_runner import run_post_mission
+
+    registry = _get_session_registry(instance)
+    active = list(_live_sessions.values())
+    completed = poll_sessions(active, registry)
+    if not completed:
+        return False
+
+    quota_hit = False
+    for result in completed:
+        session = result.session
+        _live_sessions.pop(session.id, None)
+
+        log("koan", f"[parallel] Session {session.id} done (exit={result.exit_code}, "
+            f"project={session.project_name})")
+
+        # Post-mission pipeline
+        try:
+            post = run_post_mission(
+                instance_dir=instance,
+                project_name=session.project_name,
+                project_path=session.worktree_path,
+                run_num=run_num,
+                exit_code=result.exit_code,
+                stdout_file=session.stdout_file,
+                stderr_file=session.stderr_file,
+                mission_title=session.mission_text,
+                autonomous_mode=getattr(session, "autonomous_mode", "implement"),
+                start_time=int(session.started_at),
+                status_callback=lambda step: set_status(koan_root, f"[parallel] {step}"),
+            )
+        except Exception as e:
+            log("error", f"[parallel] post-mission failed for {session.id}: {e}")
+            post = {"success": False, "quota_exhausted": False}
+
+        # Persist missions.md state transition via locked read-modify-write
+        try:
+            from app.utils import modify_missions_file
+            missions_path = Path(instance) / "missions.md"
+            if result.exit_code == 0:
+                modify_missions_file(missions_path, lambda c: complete_mission_by_session(c, session.id))
+            else:
+                modify_missions_file(missions_path, lambda c: fail_mission_by_session(c, session.id))
+        except Exception as e:
+            log("error", f"[parallel] missions.md update failed for {session.id}: {e}")
+            try:
+                dead_letter = Path(instance) / ".failed-transitions.json"
+                import json
+                entries = []
+                if dead_letter.exists():
+                    entries = json.loads(dead_letter.read_text())
+                entries.append({
+                    "session_id": session.id,
+                    "mission_text": session.mission_text,
+                    "exit_code": result.exit_code,
+                    "project": session.project_name,
+                })
+                atomic_write(dead_letter, json.dumps(entries, indent=2))
+            except Exception as dle:
+                log("error", f"[parallel] dead-letter write also failed: {dle}")
+
+        # End-of-mission notification
+        try:
+            _notify_mission_end(
+                instance, session.project_name, run_num, max_runs,
+                result.exit_code, session.mission_text,
+                pr_url=post.get("pr_url", ""),
+            )
+        except Exception as e:
+            log("error", f"[parallel] notification failed for {session.id}: {e}")
+
+        if post.get("quota_exhausted"):
+            quota_hit = True
+
+    registry.clear_completed()
+    _commit_instance(instance)
+
+    if quota_hit:
+        log("quota", "[parallel] Quota exhausted — no new sessions will be dispatched")
+        _notify(instance, "⚠️ API quota exhausted in a parallel session. "
+                "Existing sessions will finish; no new sessions until quota resets.")
+
+    return True
+
+
+def _parallel_dispatch_sessions(
+    primary_mission: str,
+    primary_project: str,
+    primary_project_path: str,
+    instance: str,
+    koan_root: str,
     run_num: int,
     max_runs: int,
     autonomous_mode: str,
-    interval: int,
-) -> tuple:
-    """Try to dispatch a mission as a skill command.
-
-    Returns:
-        (handled: bool, mission_title: str) — if handled is True the caller
-        should return immediately; if False the caller should proceed to Claude
-        using the returned mission_title (which may have been translated by a
-        cli_skill mapping).
-    """
-    from app.debug import debug_log as _debug_log
-    preview = f"{mission_title[:100]}..." if len(mission_title) > 100 else mission_title
-    _debug_log(f"[run] checking skill dispatch for: {preview}")
-
-    from app.skill_dispatch import dispatch_skill_mission, is_skill_mission
-    skill_cmd = dispatch_skill_mission(
-        mission_text=mission_title,
-        project_name=project_name,
-        project_path=project_path,
-        koan_root=koan_root,
-        instance_dir=instance,
-    )
-    if skill_cmd:
-        _debug_log(f"[run] skill dispatch matched: {' '.join(skill_cmd[:5])}")
-        log("mission", "Decision: SKILL DISPATCH (direct runner)")
-        print(f"  Mission: {mission_title}")
-        print(f"  Project: {project_name}")
-        print(f"  Runner: {' '.join(skill_cmd[:4])}...")
-        print()
-        set_status(koan_root, f"Run {run_num}/{max_runs} — skill dispatch on {project_name}")
-        _notify(instance, f"🚀 [{project_name}] Run {run_num}/{max_runs} — Skill: {mission_title}")
-
-        # Create pending.md so /live can show progress during skill dispatch
-        from app.loop_manager import create_pending_file
-        try:
-            create_pending_file(
-                instance_dir=instance,
-                project_name=project_name,
-                run_num=run_num,
-                max_runs=max_runs,
-                autonomous_mode=autonomous_mode or "implement",
-                mission_title=mission_title,
-            )
-        except Exception as e:
-            log("error", f"Failed to create pending.md for skill dispatch: {e}")
-
-        exit_code = 1
-        # Snapshot core files before skill execution
-        from app.core_files import snapshot_core_files, check_core_files, log_integrity_warnings
-        skill_core_snapshot = snapshot_core_files(koan_root, project_path)
-
-        try:
-            with protected_phase(f"Skill: {mission_title[:50]}"):
-                exit_code = _run_skill_mission(
-                    skill_cmd=skill_cmd,
-                    koan_root=koan_root,
-                    instance=instance,
-                    project_name=project_name,
-                    project_path=project_path,
-                    run_num=run_num,
-                    mission_title=mission_title,
-                    autonomous_mode=autonomous_mode,
-                )
-            if exit_code == 0:
-                log("mission", f"Run {run_num}/{max_runs} — [{project_name}] skill completed")
-
-            # Verify core files survived skill execution
-            skill_integrity = check_core_files(koan_root, skill_core_snapshot, project_path)
-            if skill_integrity:
-                log_integrity_warnings(skill_integrity)
-                log("error", f"Core file integrity check failed after skill: {len(skill_integrity)} file(s) missing")
-                exit_code = 1
-        except KeyboardInterrupt:
-            log("error", "Skill dispatch interrupted by user")
-            _finalize_mission(instance, mission_title, project_name, 1)
-            raise
-        except Exception as e:
-            log("error", f"Skill dispatch exception: {e}\n{traceback.format_exc()}")
-        finally:
-            # Clean up temp files created by skill command builders
-            from app.skill_dispatch import cleanup_skill_temp_files
-            cleanup_skill_temp_files(skill_cmd)
-
-        _notify_mission_end(
-            instance, project_name, run_num, max_runs,
-            exit_code, mission_title,
-        )
-        _finalize_mission(instance, mission_title, project_name, exit_code)
-        _commit_instance(instance)
-
-        _sleep_between_runs(koan_root, instance, interval)
-        return True, mission_title
-
-    # Check for cli_skill translation before failing unrecognized /commands
-    if is_skill_mission(mission_title):
-        from pathlib import Path as _Path
-        from app.skill_dispatch import translate_cli_skill_mission
-        translated = translate_cli_skill_mission(
-            mission_text=mission_title,
-            koan_root=_Path(koan_root),
-            instance_dir=_Path(instance),
-        )
-        if translated is not None:
-            _debug_log(
-                f"[run] cli_skill translation: '{mission_title[:80]}' -> '{translated[:80]}'"
-            )
-            log("mission", "Decision: CLI SKILL (provider slash command)")
-            # Return untranslated=False so caller falls through to Claude with translated title
-            return False, translated
-
-        _debug_log(f"[run] skill mission unhandled, failing: {mission_title[:200]}")
-
-        # Differentiate "unknown command" from "known command, bad arguments"
-        from app.skill_dispatch import parse_skill_mission, validate_skill_args
-        _, cmd_name, cmd_args = parse_skill_mission(mission_title)
-        arg_error = validate_skill_args(cmd_name, cmd_args) if cmd_name else None
-        if arg_error:
-            log("warning", f"Skill mission invalid args: {arg_error}")
-            _notify(instance, f"⚠️ [{project_name}] {arg_error}")
-        else:
-            log("warning", f"Skill mission has no runner, failing: {mission_title[:80]}")
-            _notify(instance, f"⚠️ [{project_name}] Unknown skill command: {mission_title[:80]}")
-        _finalize_mission(instance, mission_title, project_name, exit_code=1)
-        _commit_instance(instance)
-        return True, mission_title
-
-    return False, mission_title
-
-
-# ---------------------------------------------------------------------------
-# Mission retry helpers
-# ---------------------------------------------------------------------------
-
-# Maximum retry attempts for mission-level CLI failures.
-# Capped at 1 retry (2 total) since missions are expensive.
-_MISSION_MAX_RETRIES = 1
-_MISSION_RETRY_DELAY = 10  # seconds
-
-# Set by run_claude_task when the watchdog timer kills a runaway session.
-# Checked by _maybe_retry_mission to avoid retrying a timeout as if it
-# were a transient network error (the retryable-pattern list matches
-# "timeout" which would otherwise trigger a second full-length run).
-_last_mission_timed_out = False
-
-
-def _get_git_head(project_path: str) -> str:
-    """Get current git HEAD SHA for retry safety check."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=project_path,
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except (subprocess.SubprocessError, OSError):
-        return ""
-
-
-def _maybe_retry_mission(
-    claude_exit: int,
-    stdout_file: str,
-    stderr_file: str,
-    cmd: list,
-    project_path: str,
-    pre_head: str,
-    instance: str,
-    project_name: str,
-    run_num: int,
-    has_mission: bool,
-) -> tuple:
-    """Attempt a single retry if the CLI error is transient.
-
-    Returns ``(exit_code, stdout_file, stderr_file)`` — the files may
-    be replaced if a retry was performed (old files are truncated to
-    avoid double-counting output).
-
-    Only retries if:
-    - The error is classified as RETRYABLE
-    - No commits were produced (HEAD didn't move)
-    - This is a mission (not autonomous), since missions are higher-value
-    """
-    from app.cli_errors import ErrorCategory, classify_cli_error
-
-    # Watchdog timeouts are NOT transient — don't retry a session that ran
-    # for the full timeout duration.  Without this guard, "timeout" in the
-    # agent's output text (test logs, error messages) would match the
-    # RETRYABLE pattern and start another full-length session.
-    if _last_mission_timed_out:
-        log("koan", "Skipping retry — mission was killed by watchdog timeout")
-        return claude_exit, stdout_file, stderr_file
-
-    # Read output for classification
-    try:
-        stdout_text = Path(stdout_file).read_text()
-    except OSError:
-        stdout_text = ""
-    try:
-        stderr_text = Path(stderr_file).read_text()
-    except OSError:
-        stderr_text = ""
-
-    category = classify_cli_error(claude_exit, stdout_text, stderr_text)
-    log("error", f"CLI error classified as {category.value} (exit={claude_exit})")
-
-    if category != ErrorCategory.RETRYABLE:
-        return claude_exit, stdout_file, stderr_file
-
-    if not has_mission:
-        log("koan", "Skipping retry for autonomous run (lower priority)")
-        return claude_exit, stdout_file, stderr_file
-
-    # Safety: don't retry if Claude already produced commits
-    post_head = _get_git_head(project_path)
-    if pre_head and post_head and pre_head != post_head:
-        log("koan", "Skipping retry — commits were produced before the error")
-        return claude_exit, stdout_file, stderr_file
-
-    log("koan", f"Transient CLI error — retrying mission in {_MISSION_RETRY_DELAY}s")
-    with protected_phase("Mission retry backoff"):
-        time.sleep(_MISSION_RETRY_DELAY)
-
-    # Clear output files before retry to avoid double-counting
-    try:
-        open(stdout_file, "w").close()
-        open(stderr_file, "w").close()
-    except OSError:
-        pass
-
-    retry_exit = run_claude_task(
-        cmd, stdout_file, stderr_file, cwd=project_path,
-        instance_dir=instance, project_name=project_name, run_num=run_num,
-    )
-    log("koan", f"Mission retry exit_code={retry_exit}")
-    return retry_exit, stdout_file, stderr_file
-
-
-# ---------------------------------------------------------------------------
-# Iteration body (extracted for exception isolation)
-# ---------------------------------------------------------------------------
-
-def _run_iteration(
-    koan_root: str,
-    instance: str,
     projects: list,
-    count: int,
-    max_runs: int,
-    interval: int,
-    git_sync_interval: int,
-):
-    """Execute a single iteration of the main loop.
+    last_project: str,
+) -> bool:
+    """Spawn the primary session and fill remaining free slots.
 
-    Called from main_loop() within a try/except block that catches
-    unexpected exceptions without killing the process.
-
-    Returns:
-        True if this was a productive iteration (mission, autonomous, or
-        contemplative session that consumed API budget).  ``"idle"`` for
-        idle wait states (PR limit, schedule, focus, exploration).  False
-        for other non-productive iterations (errors, dedup skips,
-        preflight failures).  The caller only increments ``count`` on
-        productive iterations so that ``max_runs`` reflects actual work
-        done, not loop cycles.
-
-    Exceptions:
-        KeyboardInterrupt: Propagates to caller (user abort)
-        SystemExit: Propagates to caller (restart signal)
-        Exception: Caught by caller for recovery
+    Returns True if at least one session was dispatched.
     """
-    run_num = count + 1
-    set_status(koan_root, f"Run {run_num}/{max_runs} — preparing")
+    from app.session_manager import spawn_session, get_max_parallel_sessions
+    from app.missions import start_mission_parallel, pick_missions, extract_project_tag
+    from app.git_sync import run_git
 
-    # Write run-loop heartbeat so external monitors can detect a hung agent
-    from app.health_check import write_run_heartbeat
-    write_run_heartbeat(koan_root)
+    registry = _get_session_registry(instance)
+    max_slots = get_max_parallel_sessions()
+    active_count = len(registry.get_active())
 
-    print()
-    print(bold_cyan(f"=== Run {run_num}/{max_runs} — {time.strftime('%Y-%m-%d %H:%M:%S')} ==="))
+    if active_count >= max_slots:
+        log("koan", f"[parallel] All {max_slots} slots occupied — waiting for completions")
+        return False
 
-    # Refresh project list (picks up workspace changes since startup)
-    from app.utils import get_known_projects
-    refreshed = get_known_projects()
-    if refreshed:
-        projects = refreshed
+    missions_to_dispatch = [(primary_mission, primary_project, primary_project_path)]
 
-    # Check GitHub notifications before planning (converts @mentions to missions
-    # so plan_iteration() sees them immediately instead of waiting for sleep)
-    from app.loop_manager import process_github_notifications
-    try:
-        gh_missions = process_github_notifications(koan_root, instance)
-        if gh_missions > 0:
-            log("github", f"Pre-iteration: {gh_missions} mission(s) created from GitHub notifications")
-    except Exception as e:
-        log("error", f"Pre-iteration GitHub notification check failed: {e}")
-
-    # Plan iteration (delegated to iteration_manager)
-    last_project = _read_current_project(koan_root)
-    plan = plan_iteration(
-        instance_dir=instance,
-        koan_root=koan_root,
-        run_num=run_num,
-        count=count,
-        projects=projects,
-        last_project=last_project,
-    )
-
-    # --- Iteration decision summary (always visible in logs) ---
-    log("koan", f"Iteration plan: action={plan['action']}, "
-        f"project={plan['project_name']}, mode={plan['autonomous_mode']}, "
-        f"budget={plan['available_pct']}%"
-        f"{', mission=' + plan['mission_title'][:60] if plan['mission_title'] else ''}")
-    if plan.get("error"):
-        log("error", f"Iteration plan error: {plan['error']}")
-    if plan.get("tracker_error"):
-        log("error", f"Usage tracker broken: {plan['tracker_error']} — hard-capped to review mode")
-        _notify(instance, f"⚠️ Budget tracker error: {plan['tracker_error']} — running in review-only mode until fixed")
-
-    # Display usage
-    log("quota", "Usage Status:")
-    if plan["display_lines"]:
-        for line in plan["display_lines"]:
-            print(f"  {line}")
-    else:
-        print("  [No usage data available - using fallback mode]")
-    print(f"  Safety margin: 10% → Available: {plan['available_pct']}%")
-    print()
-
-    # Log recurring injections
-    for line in plan.get("recurring_injected", []):
-        log("mission", line)
-
-    # --- Handle special actions ---
-    action = plan["action"]
-    project_name = plan["project_name"]
-    project_path = plan["project_path"]
-
-    if action == "error":
-        error_msg = plan.get("error", "Unknown error")
-        mission_title = plan.get("mission_title", "")
-        log("error", error_msg)
-        # Move the mission to Failed so it doesn't block the queue.
-        # Without this, the same mission gets picked every iteration,
-        # causing a retry loop until MAX_CONSECUTIVE_ERRORS triggers pause.
-        if mission_title:
-            _update_mission_in_file(instance, mission_title, failed=True)
-            _notify(instance, f"❌ Mission failed: {error_msg}")
-            _commit_instance(instance)
-        else:
-            _notify(instance, f"⚠️ Iteration error: {error_msg}")
-        return False  # error handling — not productive
-
-    if action == "contemplative":
-        _handle_contemplative(plan, run_num, max_runs, koan_root, instance, interval)
-        return True  # contemplative sessions consume API budget
-
-    # Idle wait actions — all follow the same sleep-and-check pattern
-    _IDLE_WAIT_CONFIG = {
-        "focus_wait": lambda p: (
-            f"Focus mode active ({p.get('focus_remaining', 'unknown')} remaining) — no missions pending, sleeping",
-            f"Focus mode — waiting for missions ({p.get('focus_remaining', 'unknown')} remaining)",
-        ),
-        "schedule_wait": lambda _: (
-            "Work hours active — waiting for missions (exploration suppressed)",
-            f"Work hours — waiting for missions ({time.strftime('%H:%M')})",
-        ),
-        "exploration_wait": lambda _: (
-            "All projects have exploration disabled — waiting for missions",
-            f"Exploration disabled — waiting for missions ({time.strftime('%H:%M')})",
-        ),
-        "pr_limit_wait": lambda _: (
-            "PR limit reached for all projects — waiting for reviews",
-            f"PR limit reached — waiting for reviews ({time.strftime('%H:%M')})",
-        ),
-    }
-    if action in _IDLE_WAIT_CONFIG:
-        log_msg, status_msg = _IDLE_WAIT_CONFIG[action](plan)
-        log("koan", log_msg)
-        set_status(koan_root, status_msg)
-        with protected_phase(status_msg):
-            wake = interruptible_sleep(interval, koan_root, instance)
-        if wake == "mission":
-            log("koan", f"New mission detected during {action} — waking up")
-        return "idle"  # idle wait — not productive, trackable
-
-    if action == "wait_pause":
-        _handle_wait_pause(plan, count, koan_root, instance)
-        return False  # budget exhausted — not productive
-
-    # --- Pre-flight quota check ---
-    if action in ("mission", "autonomous"):
-        if _run_preflight_check(plan, koan_root, instance, count):
-            return False  # quota exhausted pre-flight — not productive
-
-    # --- Execute mission or autonomous run ---
-    mission_title = plan["mission_title"]
-    autonomous_mode = plan["autonomous_mode"]
-    focus_area = plan["focus_area"]
-    available_pct = plan["available_pct"]
-
-    # --- Dedup guard ---
-    if mission_title:
+    # Fill remaining slots using pick_missions() which reads all N at once,
+    # avoiding the duplicate-pick bug from calling _pick_mission() in a loop
+    # (it's read-only and returns the same first pending each time).
+    extra = max_slots - active_count - 1
+    if extra > 0:
+        # Exclude projects with active sessions + the primary project
+        active_projects = {s.project_name.lower() for s in registry.get_active()}
+        active_projects.add(primary_project.lower())
         try:
-            from app.mission_history import should_skip_mission
-            if should_skip_mission(instance, mission_title, max_executions=3):
-                log("mission", f"Skipping repeated mission (3+ attempts): {mission_title[:60]}")
-                _update_mission_in_file(instance, mission_title, failed=True)
-                _notify(instance, f"⚠️ Mission failed 3+ times, moved to Failed: {mission_title[:60]}")
-                _commit_instance(instance)
-                return False  # dedup skip — not productive
+            missions_path = Path(instance) / "missions.md"
+            content = missions_path.read_text()
+            extras = pick_missions(content, n=extra, exclude_projects=list(active_projects))
         except Exception as e:
-            log("error", f"Dedup guard error: {e}")
-            return False  # dedup error — not productive, don't proceed
+            log("error", f"[parallel] pick_missions failed: {e}")
+            extras = []
 
-    # Set project state
-    atomic_write(Path(koan_root, PROJECT_FILE), project_name)
-    os.environ["KOAN_CURRENT_PROJECT"] = project_name
-    os.environ["KOAN_CURRENT_PROJECT_PATH"] = project_path
+        # Build project path lookup
+        path_by_name = {name.lower(): path for name, path in (projects or [])}
 
-    print(bold_green(f">>> Current project: {project_name}") + f" ({project_path})")
-    print()
+        for mission_text in extras:
+            proj_name = extract_project_tag(mission_text)
+            if not proj_name:
+                log("warn", f"[parallel] Skipping mission without project tag: {mission_text[:60]}")
+                continue
+            proj_path = path_by_name.get(proj_name.lower(), "")
+            if not proj_path:
+                log("warn", f"[parallel] Skipping mission — no path for project '{proj_name}': {mission_text[:60]}")
+                continue
+            if registry.get_by_project(proj_name):
+                continue
+            missions_to_dispatch.append((mission_text, proj_name, proj_path))
 
-    # --- Prepare project git state ---
-    from app.git_prep import prepare_project_branch
-    try:
-        prep = prepare_project_branch(project_path, project_name, koan_root)
-        if prep.stashed:
-            log("git", f"Stashed uncommitted changes in {project_name}")
-        if not prep.success:
-            log("error", f"Git prep failed for {project_name}: {prep.error}")
-            if mission_title:
-                _update_mission_in_file(instance, mission_title, failed=True)
-                _notify(instance, f"❌ [{project_name}] Git prep failed, aborting mission: {mission_title[:60]}")
-            return False  # abort — branch state is unreliable
-        else:
-            log("git", f"Ready on {prep.base_branch} from {prep.remote_used}")
-    except Exception as e:
-        log("error", f"Git prep error for {project_name}: {e}\n{traceback.format_exc()}")
-        if mission_title:
-            _update_mission_in_file(instance, mission_title, failed=True)
-            _notify(instance, f"❌ [{project_name}] Git prep error, aborting mission: {mission_title[:60]}")
-        return False  # abort — branch state is unreliable
+    dispatched = 0
+    for mission_text, project_name, project_path in missions_to_dispatch:
+        if registry.get_by_project(project_name):
+            log("koan", f"[parallel] {project_name} already has an active session — skipping")
+            continue
 
-    # --- Mark mission as In Progress ---
-    # Save the original title before skill dispatch may translate it.
-    # _finalize_mission must use the original title because that's the
-    # needle recorded in missions.md "In Progress" section.
-    original_mission_title = mission_title
-    if mission_title:
-        _start_mission_in_file(instance, mission_title)
-
-    # --- Check for skill-dispatched mission ---
-    if mission_title:
-        handled, mission_title = _handle_skill_dispatch(
-            mission_title, project_name, project_path, koan_root,
-            instance, run_num, max_runs, autonomous_mode, interval,
-        )
-        if handled:
-            return True  # skill dispatch — productive
-
-    # Lifecycle notification
-    if mission_title:
-        log("mission", "Decision: MISSION mode (assigned)")
-        print(f"  Mission: {mission_title}")
-        print(f"  Project: {project_name}")
-        print()
-        _notify(instance, f"🚀 [{project_name}] Run {run_num}/{max_runs} — Starting: {mission_title}")
-    else:
-        mode_upper = autonomous_mode.upper()
-        log("mission", f"Decision: {mode_upper} mode (estimated cost: 5.0% session)")
-        print(f"  Reason: {plan['decision_reason']}")
-        print(f"  Project: {project_name}")
-        print(f"  Focus: {focus_area}")
-        print()
-        _notify(instance, f"🚀 [{project_name}] Run {run_num}/{max_runs} — Autonomous: {autonomous_mode} mode")
-
-    # --- Fire pre-mission hook ---
-    try:
-        from app.hooks import fire_hook
-        fire_hook(
-            "pre_mission",
-            instance_dir=instance,
-            project_name=project_name,
-            project_path=project_path,
-            mission_title=mission_title,
-            autonomous_mode=autonomous_mode,
-            run_num=run_num,
-        )
-    except Exception as e:
-        print(f"[hooks] pre_mission hook error: {e}", file=sys.stderr)
-
-    # --- Generate mission spec for complex missions ---
-    spec_content = ""
-    if mission_title and autonomous_mode not in ("review", "wait"):
+        # Determine base branch — skip dispatch if detection fails entirely
+        base_branch = None
         try:
-            from app.mission_complexity import is_complex_mission
-            if is_complex_mission(mission_title):
-                log("spec", f"Complex mission detected — generating spec")
-                from app.spec_generator import generate_spec, save_spec
-                spec_content = generate_spec(project_path, mission_title, instance) or ""
-                if spec_content:
-                    spec_path = save_spec(instance, mission_title, spec_content)
-                    if spec_path:
-                        log("spec", f"Spec saved to {spec_path}")
-                    else:
-                        log("spec", "Spec generated but save failed")
-                else:
-                    log("spec", "Spec generation returned empty — proceeding without spec")
+            branch = run_git(project_path, "rev-parse", "--abbrev-ref", "HEAD")
+            if branch:
+                base_branch = branch.strip()
         except Exception as e:
-            log("error", f"Spec generation error (non-blocking): {e}")
-
-    # Build prompt (split into system/user for prompt caching)
-    from app.prompt_builder import build_agent_prompt_parts
-    system_prompt, prompt = build_agent_prompt_parts(
-        instance=instance,
-        project_name=project_name,
-        project_path=project_path,
-        run_num=run_num,
-        max_runs=max_runs,
-        autonomous_mode=autonomous_mode or "implement",
-        focus_area=focus_area or "General autonomous work",
-        available_pct=available_pct or 50,
-        mission_title=mission_title,
-        spec_content=spec_content,
-    )
-
-    # Create pending.md
-    from app.loop_manager import create_pending_file
-    try:
-        create_pending_file(
-            instance_dir=instance,
-            project_name=project_name,
-            run_num=run_num,
-            max_runs=max_runs,
-            autonomous_mode=autonomous_mode or "implement",
-            mission_title=mission_title,
-        )
-    except Exception as e:
-        log("error", f"Failed to create pending.md: {e}")
-
-    # Execute Claude
-    if mission_title:
-        set_status(koan_root, f"Run {run_num}/{max_runs} — executing mission on {project_name}")
-    else:
-        set_status(koan_root, f"Run {run_num}/{max_runs} — {autonomous_mode.upper()} on {project_name}")
-
-    mission_start = int(time.time())
-    fd_out, stdout_file = tempfile.mkstemp(prefix="koan-out-")
-    os.close(fd_out)
-    fd_err, stderr_file = tempfile.mkstemp(prefix="koan-err-")
-    os.close(fd_err)
-    claude_exit = 1  # default to failure; overwritten on successful execution
-    try:
-        # Build CLI command (provider-agnostic with per-project overrides)
-        from app.mission_runner import build_mission_command
-        from app.debug import debug_log as _debug_log
-        cmd = build_mission_command(
-            prompt=prompt,
-            autonomous_mode=autonomous_mode,
-            extra_flags="",
-            project_name=project_name,
-            system_prompt=system_prompt,
-        )
-
-        cmd_display = [c[:100] + '...' if len(c) > 100 else c for c in cmd[:6]]
-        _debug_log(f"[run] cli: cmd={' '.join(cmd_display)}... cwd={project_path}")
-
-        # Capture git HEAD before execution for retry safety check
-        pre_head = _get_git_head(project_path)
-
-        # Snapshot core files before execution for integrity check
-        from app.core_files import snapshot_core_files, check_core_files, log_integrity_warnings
-        core_snapshot = snapshot_core_files(koan_root, project_path)
-
-        claude_exit = run_claude_task(
-            cmd, stdout_file, stderr_file, cwd=project_path,
-            instance_dir=instance, project_name=project_name, run_num=run_num,
-        )
-        _debug_log(f"[run] cli: exit_code={claude_exit}")
-
-        # --- Mission retry on transient CLI errors ---
-        # One retry for missions, zero for autonomous (they're lower-priority).
-        # Only retry if HEAD didn't move (no commits produced).
-        if claude_exit != 0:
-            claude_exit, stdout_file, stderr_file = _maybe_retry_mission(
-                claude_exit=claude_exit,
-                stdout_file=stdout_file,
-                stderr_file=stderr_file,
-                cmd=cmd,
-                project_path=project_path,
-                pre_head=pre_head,
-                instance=instance,
-                project_name=project_name,
-                run_num=run_num,
-                has_mission=bool(mission_title),
-            )
-
-        # Verify core files survived the mission (after retry, so result is final)
-        integrity_warnings = check_core_files(koan_root, core_snapshot, project_path)
-        if integrity_warnings:
-            log_integrity_warnings(integrity_warnings)
-            log("error", f"Core file integrity check failed: {len(integrity_warnings)} file(s) missing")
-            claude_exit = 1
-
-        # Parse and display output
-        try:
-            from app.mission_runner import parse_claude_output
-            with open(stdout_file) as f:
-                raw = f.read()
-            text = parse_claude_output(raw)
-            print(text)
-        except Exception as e:
+            log("warn", f"[parallel] rev-parse HEAD failed for {project_name}: {e}")
+        if not base_branch:
             try:
-                with open(stdout_file) as f:
-                    print(f.read())
-            except Exception as e2:
-                log("error", f"Failed to read CLI output: {e}, {e2}")
-        _reset_terminal()
+                ref = run_git(project_path, "symbolic-ref", "refs/remotes/origin/HEAD")
+                if ref:
+                    base_branch = ref.strip().removeprefix("refs/remotes/origin/")
+            except Exception as e:
+                log("warn", f"[parallel] symbolic-ref failed for {project_name}: {e}")
+        if not base_branch:
+            log("warn", f"[parallel] Could not detect base branch for {project_name} — skipping")
+            continue
 
-        # Complete/fail mission in missions.md (safety net — idempotent if Claude already did it)
-        # Done BEFORE post-mission pipeline so quota exhaustion can't skip it.
-        # Use original_mission_title because that's the needle in "In Progress".
-        # cli_skill translation may have changed mission_title to a different string.
-        if original_mission_title:
-            _finalize_mission(instance, original_mission_title, project_name, claude_exit)
-
-        # Post-mission pipeline
-        _status_prefix = f"Run {run_num}/{max_runs}"
-        set_status(koan_root, f"{_status_prefix} — finalizing")
         try:
-            from app.mission_runner import run_post_mission
-            post_result = run_post_mission(
-                instance_dir=instance,
+            session = spawn_session(
+                mission_text=mission_text,
                 project_name=project_name,
                 project_path=project_path,
-                run_num=run_num,
-                exit_code=claude_exit,
-                stdout_file=stdout_file,
-                stderr_file=stderr_file,
-                mission_title=mission_title,
-                autonomous_mode=autonomous_mode or "implement",
-                start_time=mission_start,
-                status_callback=lambda step: set_status(
-                    koan_root, f"{_status_prefix} — {step}"
-                ),
+                instance_dir=instance,
+                registry=registry,
+                autonomous_mode=autonomous_mode,
+                base_branch=base_branch,
             )
-
-            if post_result.get("pending_archived"):
-                log("health", "pending.md archived to journal (Claude didn't clean up)")
-            if post_result.get("auto_merge_branch"):
-                log("git", f"Auto-merge checked for {post_result['auto_merge_branch']}")
-
-            if post_result.get("quota_exhausted"):
-                # quota_info is a (reset_display, resume_message) tuple
-                quota_info = post_result.get("quota_info")
-                if quota_info and isinstance(quota_info, (list, tuple)) and len(quota_info) >= 2:
-                    reset_display, resume_msg = quota_info[0], quota_info[1]
-                else:
-                    reset_display, resume_msg = "", "Auto-resume in ~5h"
-                log("quota", f"Quota reached. {reset_display}")
-
-                # Create pause state so the main loop actually stops
-                reset_ts, _disp = _compute_quota_reset_ts(instance)
-                from app.pause_manager import create_pause
-                create_pause(koan_root, "quota", reset_ts, reset_display or _disp)
-
-                _commit_instance(instance, f"koan: quota exhausted {time.strftime('%Y-%m-%d-%H:%M')}")
-                _notify(instance, (
-                    f"⚠️ Claude quota exhausted. {reset_display}\n\n"
-                    f"Kōan paused after {count} runs. {resume_msg} or use /resume to restart manually."
-                ))
-                return True  # ran Claude before quota hit — productive
         except Exception as e:
-            log("error", f"Post-mission processing error: {e}\n{traceback.format_exc()}")
-    finally:
-        _cleanup_temp(stdout_file, stderr_file)
+            log("error", f"[parallel] spawn failed for [{project_name}]: {e}")
+            continue
 
-    # Report result — always notify on completion (success or failure)
-    if claude_exit == 0:
-        log("mission", f"Run {run_num}/{max_runs} — [{project_name}] completed successfully")
-    _notify_mission_end(
-        instance, project_name, run_num, max_runs,
-        claude_exit, mission_title,
-    )
+        # Keep in-memory reference (preserves _proc for poll_sessions)
+        _live_sessions[session.id] = session
 
-    # Commit instance
-    _commit_instance(instance)
+        # Transition mission Pending → In Progress in missions.md
+        try:
+            from app.utils import modify_missions_file
+            missions_path = Path(instance) / "missions.md"
+            modify_missions_file(missions_path, lambda c: start_mission_parallel(c, mission_text, session.id))
+        except Exception as e:
+            log("error", f"[parallel] missions.md start failed for {session.id} — killing session: {e}")
+            try:
+                from app.session_manager import kill_session
+                kill_session(session, registry)
+                _live_sessions.pop(session.id, None)
+            except Exception as ke:
+                log("error", f"[parallel] kill_session cleanup failed: {ke}")
+            continue
 
-    # Periodic git sync
-    if (count + 1) % git_sync_interval == 0:
-        with protected_phase("Git sync"):
-            log("git", f"Periodic git sync (run {count + 1})...")
-            from app.git_sync import GitSync
-            for name, path in projects:
-                try:
-                    gs = GitSync(instance, name, path)
-                    gs.sync_and_report()
-                except Exception as e:
-                    log("error", f"Periodic git sync failed for {name}: {e}")
+        log("koan", f"[parallel] Spawned {session.id} [{project_name}]: {mission_text[:60]}")
+        _notify(instance, f"🚀 [{project_name}] Parallel session started: {mission_text[:60]}")
+        dispatched += 1
 
-    # Periodic auto-update check
-    try:
-        from app.auto_update import is_auto_update_enabled, get_check_interval
-        if is_auto_update_enabled() and (count + 1) % get_check_interval() == 0:
-            from app.auto_update import perform_auto_update
-            updated = perform_auto_update(koan_root, instance)
-            if updated:
-                log("update", "Auto-update triggered restart.")
-                sys.exit(RESTART_EXIT_CODE)
-    except Exception as e:
-        log("error", f"Periodic auto-update check failed: {e}")
+    return dispatched > 0
 
-    # Max runs check
-    if count + 1 >= max_runs:
-        from app.config import get_auto_pause
-        if get_auto_pause():
-            log("koan", f"Max runs ({max_runs}) reached. Running evening ritual before pause.")
-            with protected_phase("Evening ritual"):
-                try:
-                    from app.rituals import run_ritual
-                    run_ritual("evening", Path(instance))
-                except Exception as e:
-                    log("error", f"Evening ritual failed: {e}")
-            log("pause", "Entering pause mode (auto-resume in 5h).")
-            from app.pause_manager import create_pause
-            create_pause(koan_root, "max_runs")
-            _notify(instance, (
-                f"⏸️ Kōan paused: {max_runs} runs completed. "
-                "Auto-resume in 5h or use /resume to restart."
-            ))
-            return True  # completed final productive run
-        else:
-            log("koan", f"Max runs ({max_runs}) reached but auto_pause disabled — continuing.")
 
-    # Sleep between runs (skip if pending missions)
-    _sleep_between_runs(koan_root, instance, interval, run_num, max_runs)
+# ---------------------------------------------------------------------------
+# Mission execution lifecycle (extracted to mission_executor.py)
+# ---------------------------------------------------------------------------
 
-    return True  # productive iteration completed
+from app.mission_executor import (  # noqa: F401 — re-exported for backward compat
+    _get_git_head,
+    _handle_skill_dispatch,
+    _maybe_retry_mission,
+    _MISSION_MAX_RETRIES,
+    _MISSION_RETRY_DELAY,
+    _run_iteration,
+)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1662,21 +1774,23 @@ def _handle_iteration_error(
     """Handle an exception from _run_iteration.
 
     Logs the error, backs off with increasing sleep, and enters
-    pause mode after MAX_CONSECUTIVE_ERRORS to avoid thrashing.
+    pause mode after ``max_consecutive_errors`` to avoid thrashing.
     """
+    cfg = get_recovery_config()
+    max_errors = cfg["max_consecutive_errors"]
     tb = traceback.format_exc()
-    log("error", f"Iteration failed ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {error}")
+    log("error", f"Iteration failed ({consecutive_errors}/{max_errors}): {error}")
     log("error", f"Traceback:\n{tb}")
-    set_status(koan_root, f"Error recovery ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS})")
+    set_status(koan_root, f"Error recovery ({consecutive_errors}/{max_errors})")
 
     # Notify on first error and periodically
     if _should_notify_error(consecutive_errors):
         _notify(instance, (
-            f"⚠️ Run loop error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): "
+            f"⚠️ Run loop error ({consecutive_errors}/{max_errors}): "
             f"{type(error).__name__}: {error}"
         ))
 
-    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+    if consecutive_errors >= max_errors:
         log("error", f"Too many consecutive errors ({consecutive_errors}). Entering pause mode.")
         _notify(instance, (
             f"🛑 Kōan entering pause mode after {consecutive_errors} consecutive errors.\n"
@@ -1688,7 +1802,7 @@ def _handle_iteration_error(
         return
 
     # Backoff with increasing delay
-    backoff = _calculate_backoff(consecutive_errors, MAX_BACKOFF_ITERATION)
+    backoff = _calculate_backoff(consecutive_errors, cfg["max_backoff_iteration"])
     log("koan", f"Recovering in {backoff}s...")
     time.sleep(backoff)
 
@@ -1701,17 +1815,25 @@ def _handle_iteration_error(
 def _compute_quota_reset_ts(instance: str):
     """Compute quota reset timestamp and display string.
 
-    Returns (reset_ts: int, reset_display: str). Falls back to
-    QUOTA_RETRY_SECONDS from now if estimation fails.
+    Returns (reset_ts: int, reset_display: str). Delegates the buffer
+    math (QUOTA_RESET_BUFFER_SECONDS) to
+    :func:`app.quota_handler.compute_resume_info` so the buffer policy
+    lives in exactly one place. Falls back to QUOTA_RETRY_SECONDS from
+    now if estimation fails.
     """
     reset_ts = None
     reset_display = ""
     try:
         from app.usage_estimator import cmd_reset_time, _estimate_reset_time, _load_state
+        from app.quota_handler import compute_resume_info
         usage_state_path = Path(instance, "usage_state.json")
-        reset_ts = cmd_reset_time(usage_state_path)
+        raw_reset_ts = cmd_reset_time(usage_state_path)
         state = _load_state(usage_state_path)
         reset_display = f"session reset in ~{_estimate_reset_time(state.get('session_start', ''), 5)}"
+        if raw_reset_ts is not None:
+            # compute_resume_info applies the canonical buffer; we keep the
+            # estimator-derived display string instead of its resume message.
+            reset_ts, _ = compute_resume_info(raw_reset_ts, reset_display)
     except Exception as e:
         log("error", f"Reset time estimation failed: {e}")
     if reset_ts is None:
@@ -1723,8 +1845,9 @@ def _compute_quota_reset_ts(instance: str):
 def _compute_preflight_reset_ts(error_output: str):
     """Compute quota reset timestamp from preflight probe error output.
 
-    Returns (reset_ts: int, reset_display: str). Falls back to
-    QUOTA_RETRY_SECONDS from now if extraction fails.
+    Returns (reset_ts: int, reset_display: str). Adds the quota reset buffer
+    to known reset times and falls back to QUOTA_RETRY_SECONDS from now if
+    extraction fails.
     """
     reset_ts = None
     reset_display = ""
@@ -1739,6 +1862,312 @@ def _compute_preflight_reset_ts(error_output: str):
         from app.pause_manager import QUOTA_RETRY_SECONDS
         reset_ts = int(time.time()) + QUOTA_RETRY_SECONDS
     return reset_ts, reset_display
+
+
+# ---------------------------------------------------------------------------
+# Shared quota / auth error handling
+# ---------------------------------------------------------------------------
+# run.py had 3 nearly-identical code paths for auth/quota errors:
+#   1. skill dispatch CLI error   (_handle_skill_dispatch)
+#   2. regular mission CLI error  (_run_iteration)
+#   3. exit-0 quota probe         (both paths)
+# Factoring the shared logic here eliminates the synchronization burden.
+
+
+def _handle_auth_error(
+    *,
+    provider_label: str,
+    koan_root: str,
+    instance: str,
+    mission_title: str,
+) -> None:
+    """Requeue mission, enter auth pause, and notify on auth failure."""
+    log("error", f"{provider_label} is logged out — requeueing mission to Pending")
+    _requeue_mission_in_file(instance, mission_title)
+    from app.pause_manager import create_pause
+    create_pause(koan_root, "auth")
+    _notify(instance, (
+        f"🔐 {provider_label} is logged out. Please re-authenticate the provider CLI.\n\n"
+        "The current mission has been moved back to Pending. "
+        "Use /resume after logging in."
+    ))
+
+
+def _handle_quota_error(
+    *,
+    provider_name: str,
+    provider_label: str,
+    koan_root: str,
+    instance: str,
+    project_name: str,
+    mission_title: str,
+    run_num: int,
+    hqe_kwargs: dict,
+) -> None:
+    """Requeue mission, detect reset time, pause, and notify on quota exhaustion.
+
+    *hqe_kwargs* are forwarded to :func:`handle_quota_exhaustion` — callers
+    pass either ``stdout_text``/``stderr_text`` (skill path) or
+    ``stdout_file``/``stderr_file`` (regular mission path).
+    """
+    log("quota", "API quota exhausted — requeueing mission to Pending")
+    _requeue_mission_in_file(instance, mission_title)
+    from app.quota_handler import handle_quota_exhaustion, QUOTA_CHECK_UNRELIABLE
+    quota_result = handle_quota_exhaustion(
+        koan_root=koan_root,
+        instance_dir=instance,
+        project_name=project_name,
+        run_count=run_num,
+        provider_name=provider_name,
+        **hqe_kwargs,
+    )
+    reset_display = ""
+    if quota_result and quota_result is not QUOTA_CHECK_UNRELIABLE:
+        reset_display = quota_result[0]
+    else:
+        reset_ts, reset_display = _compute_quota_reset_ts(instance)
+        from app.pause_manager import create_pause
+        create_pause(koan_root, "quota", reset_ts, reset_display)
+    _notify(instance, (
+        f"⏸️ API quota exhausted.{(' ' + reset_display) if reset_display else ''}\n"
+        f"Mission '{mission_title[:60]}' moved back to Pending.\n"
+        f"Use /resume after quota resets."
+    ))
+
+
+def _classify_and_handle_cli_error(
+    exit_code: int,
+    stdout_text: str,
+    stderr_text: str,
+    *,
+    provider_name: str,
+    provider_label: str,
+    koan_root: str,
+    instance: str,
+    project_name: str,
+    mission_title: str,
+    run_num: int,
+    hqe_kwargs: dict,
+    trust_stdout: bool = True,
+) -> bool:
+    """Classify a non-zero CLI exit and handle AUTH / QUOTA errors.
+
+    Shared by both the skill dispatch and regular mission paths.
+
+    Args:
+        exit_code: CLI process exit code.
+        stdout_text / stderr_text: CLI output for error classification.
+        hqe_kwargs: Forwarded to :func:`handle_quota_exhaustion` (text or file).
+        trust_stdout: When False, stdout is treated as DATA and excluded from
+            classification — only stderr (the trusted CLI channel) is scanned.
+            Skill dispatches set this: their stdout is a summarized agent
+            transcript that legitimately quotes CI logs and source identifiers
+            (e.g. ``/ci_check`` always prints ``"quota_exhausted": false``),
+            which otherwise tripped a false QUOTA classification and paused the
+            daemon. Genuine skill quota propagates via the structured
+            ``quota_exhausted`` result field, not via transcript scanning.
+
+    Returns:
+        True if an auth/quota error was handled (caller should return True).
+    """
+    if exit_code == 0:
+        return False
+
+    from app.cli_errors import ErrorCategory, classify_cli_error
+    category = classify_cli_error(
+        exit_code,
+        stdout_text if trust_stdout else "",
+        stderr_text,
+        provider_name=provider_name,
+    )
+    # When stdout is DATA (a skill's summarized agent transcript) the broad
+    # human-prose quota patterns are excluded above — they match content the
+    # transcript merely quotes (CI logs, Kōan's own ``quota_exhausted`` field).
+    # The CLI *runtime's* own signals, however, are safe to honor even in a
+    # transcript: the "hit your session limit" abort line and a rejected
+    # ``rate_limit_event`` are emitted by the runtime, not quotable prose.
+    if category != ErrorCategory.QUOTA and not trust_stdout:
+        from app.quota_handler import cli_runtime_quota_signal
+
+        if cli_runtime_quota_signal(stdout_text):
+            category = ErrorCategory.QUOTA
+    if category != ErrorCategory.AUTH and not trust_stdout:
+        if _cli_runtime_auth_signal(
+            stdout_text=stdout_text,
+            provider_name=provider_name,
+            exit_code=exit_code,
+        ):
+            category = ErrorCategory.AUTH
+    if category == ErrorCategory.AUTH:
+        _handle_auth_error(
+            provider_label=provider_label,
+            koan_root=koan_root,
+            instance=instance,
+            mission_title=mission_title,
+        )
+        return True
+    if category == ErrorCategory.QUOTA:
+        _handle_quota_error(
+            provider_name=provider_name,
+            provider_label=provider_label,
+            koan_root=koan_root,
+            instance=instance,
+            project_name=project_name,
+            mission_title=mission_title,
+            run_num=run_num,
+            hqe_kwargs=hqe_kwargs,
+        )
+        return True
+    return False
+
+
+def _cli_runtime_auth_signal(
+    *,
+    stdout_text: str,
+    provider_name: str,
+    exit_code: int,
+) -> bool:
+    """Detect provider auth failures from stdout-safe runtime lines.
+
+    Skill stdout is normally DATA, so broad stdout auth scans can false-positive
+    on quoted CI logs or source text. Codex, however, reports real stream auth
+    failures on stdout. Keep the trusted surface narrow: raw provider JSON
+    events, Koan's ``[cli]`` stream summaries, and CLI failure summaries.
+    """
+    if exit_code == 0 or not stdout_text or not provider_name:
+        return False
+
+    from app.provider.base import PROVIDER_ERROR_EVENT_TYPES
+
+    runtime_lines: list[str] = []
+    for line in stdout_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[cli]") or "CLI invocation failed:" in stripped:
+            runtime_lines.append(stripped)
+            continue
+        if not stripped.startswith("{"):
+            continue
+        with contextlib.suppress(json.JSONDecodeError):
+            event = json.loads(stripped)
+            if (
+                isinstance(event, dict)
+                and str(event.get("type") or "") in PROVIDER_ERROR_EVENT_TYPES
+            ):
+                runtime_lines.append(stripped)
+
+    if not runtime_lines:
+        return False
+
+    joined = "\n".join(runtime_lines)
+
+    # Check shared auth patterns against filtered runtime lines.
+    # These lines are [cli]-prefixed summaries and JSON error events —
+    # Koan-generated, not agent prose — so _AUTH_RE is safe here.
+    from app.cli_errors import _AUTH_RE
+    if _AUTH_RE.search(joined):
+        return True
+
+    try:
+        from app.provider import get_provider_by_name
+
+        provider = get_provider_by_name(provider_name)
+        return provider.detect_auth_failure(
+            stdout_text=joined,
+            stderr_text="",
+            exit_code=exit_code,
+        )
+    except KeyError as e:
+        print(f"[run] unknown provider {provider_name!r}: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(
+            f"[run] runtime auth detector failed for {provider_name!r}: {e}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _probe_exit0_quota(
+    *,
+    provider_name: str,
+    provider_label: str,
+    koan_root: str,
+    instance: str,
+    mission_title: str,
+    run_num: int,
+    hqe_kwargs: dict,
+    project_name: str = "",
+) -> bool:
+    """Probe for quota exhaustion when CLI exited successfully (exit 0).
+
+    Some provider wrappers emit quota payloads with exit 0.  Without this
+    check the mission would be finalized to Done before any pause fires.
+
+    Returns True if quota was detected and handled.
+    """
+    from app.quota_handler import handle_quota_exhaustion, QUOTA_CHECK_UNRELIABLE
+    probe = handle_quota_exhaustion(
+        koan_root=koan_root,
+        instance_dir=instance,
+        project_name=project_name,
+        run_count=run_num,
+        provider_name=provider_name,
+        **hqe_kwargs,
+    )
+    if probe is None or probe is QUOTA_CHECK_UNRELIABLE:
+        return False
+    reset_display, resume_msg = probe
+    log("quota", f"Exit-0 quota probe matched. {reset_display}")
+    _requeue_mission_in_file(instance, mission_title)
+    _commit_instance(instance, f"koan: quota exhausted {time.strftime('%Y-%m-%d-%H:%M')}")
+    _notify(instance, (
+        f"⏸️ {provider_label} quota exhausted.{(' ' + reset_display) if reset_display else ''}\n"
+        f"Mission '{mission_title[:60]}' moved back to Pending.\n"
+        f"{resume_msg} or use /resume to restart manually."
+    ))
+    return True
+
+
+def _handle_pipeline_quota_flag(
+    *,
+    provider_label: str,
+    koan_root: str,
+    instance: str,
+    mission_title: str,
+    count: int,
+    quota_info,
+) -> bool:
+    """Handle the ``quota_exhausted`` flag from :func:`run_post_mission`.
+
+    ``handle_quota_exhaustion()`` inside ``run_post_mission`` already wrote
+    the journal entry and created the pause state with accurate timing.
+    This function handles the notification + requeue + fallback pause when
+    ``quota_info`` is missing or incomplete.
+
+    Returns True if quota was handled.
+    """
+    if quota_info and isinstance(quota_info, (list, tuple)) and len(quota_info) >= 2:
+        reset_display, resume_msg = quota_info[0], quota_info[1]
+    else:
+        reset_display, resume_msg = "", "Auto-resume in ~5h"
+        reset_ts, _disp = _compute_quota_reset_ts(instance)
+        from app.pause_manager import create_pause
+        create_pause(koan_root, "quota", reset_ts, reset_display or _disp)
+    log("quota", f"Quota reached. {reset_display}")
+
+    if mission_title:
+        log("quota", "Requeueing mission to Pending (quota is transient)")
+        _requeue_mission_in_file(instance, mission_title)
+
+    _commit_instance(instance, f"koan: quota exhausted {time.strftime('%Y-%m-%d-%H:%M')}")
+    _notify(instance, (
+        f"⚠️ {provider_label} quota exhausted. {reset_display}\n\n"
+        f"Mission '{mission_title[:60]}' moved back to Pending.\n"
+        f"Kōan paused after {count} runs. {resume_msg} or use /resume to restart manually."
+    ))
+    return True
 
 
 def _reset_usage_session(instance: str):
@@ -1758,50 +2187,419 @@ def _reset_usage_session(instance: str):
         log("error", f"Usage session reset failed: {e}")
 
 
-def _start_mission_in_file(instance: str, mission_title: str):
-    """Move mission from Pending to In Progress via locked write."""
+def _clear_if_cap_hit(instance: str, mission_title: str, project_name: str = "") -> bool:
+    """Clear retry counter when a capped mission is being restarted by the human.
+
+    The retry counter is preserved while a mission is in Failed state so the
+    human can inspect the count. This function clears it when start_mission()
+    signals a deliberate human retry: we detect a "human retry" by checking
+    whether any per-system cap was hit (stagnation count >= max_retry, or
+    crash_count >= max_crash_retries, or total_attempts >= max_total_retries).
+
+    For ongoing stagnation-retry requeus (count < cap) the counter is NOT
+    cleared — the stagnation cap check in _finalize_mission depends on it.
+
+    *project_name* must match the value _finalize_mission uses so the cap
+    detection here reads the same per-project overrides; passing "" (global
+    config) when the mission has project-specific caps would diverge — a
+    human retry could be silently ignored.
+
+    Returns True when nothing needed clearing or the counter was cleared
+    successfully; returns False when a cap was hit but clearing the counter
+    failed (the caller should warn prominently — the mission will re-escalate
+    to Failed on the next finalize).
+
+    Only ImportError is caught (retry tracking simply unavailable). Schema
+    mismatches in get_retry_info/get_stagnation_config are allowed to propagate
+    so genuine bugs surface rather than being silently swallowed; the caller
+    guards the call so such an error cannot abort an already-started mission.
+    """
     try:
-        from app.missions import start_mission
+        from app.stagnation_monitor import clear_retry_count, get_retry_info
+        from app.config import get_stagnation_config
+    except ImportError as e:
+        # Retry tracking unavailable — there is nothing to clear.
+        log("error", f"Retry counter clear skipped (import failed): {e}")
+        return True
+
+    # Hot path: this runs on every mission start, including brand-new
+    # missions that have never been retried. Read the tracker once and bail
+    # before loading config when there is no entry (all counts zero) — those
+    # missions can never have hit a cap, so there is nothing to clear.
+    info = get_retry_info(instance, mission_title)
+    stag_count = info["count"]
+    crash_count = info["crash_count"]
+    total = info["total_attempts"]
+    if not (stag_count or crash_count or total):
+        return True
+
+    cfg = get_stagnation_config(project_name)
+    # get_stagnation_config() always returns every key, so read them directly:
+    # fallback defaults here would silently drift from the centralized config
+    # defaults if those ever change.
+    max_stag = cfg["max_retry_on_stagnation"]
+    max_crash = cfg["max_crash_retries"]
+    max_total = cfg["max_total_retries"]
+
+    stag_capped = max_stag > 0 and stag_count >= max_stag
+    crash_capped = crash_count >= max_crash
+    total_capped = max_total > 0 and total >= max_total
+
+    if stag_capped or crash_capped or total_capped:
+        try:
+            clear_retry_count(instance, mission_title)
+        except Exception as e:
+            log("error", f"Retry counter clear failed for capped mission: {e}")
+            return False
+    return True
+
+
+def _start_mission_in_file(instance: str, mission_title: str, project_name: str = "") -> bool:
+    """Move mission from Pending to In Progress via locked write.
+
+    Returns True if the transition was confirmed (mission visible in In Progress
+    after the write), False if the mission was not found or the transition could
+    not be verified. A False return is logged as a WARNING — the caller should
+    treat the mission as if it never started.
+    """
+    try:
+        from app.missions import parse_sections, start_mission
         from app.utils import modify_missions_file
         missions_path = Path(instance, "missions.md")
         if not missions_path.exists():
-            return
-        modify_missions_file(missions_path, lambda c: start_mission(c, mission_title))
+            return False
+
+        # start_mission() runs a sanity flush: any stale In Progress missions
+        # are moved to Failed (with a [flushed] tag) before the new one starts.
+        # Under normal operation this never fires because recover.py clears
+        # stale entries at startup — so when it DOES fire, surface it.
+        # Capture the pre-flush In Progress inside the lock to stay race-safe.
+        stale_flushed: list = []
+
+        def _transform(content: str) -> str:
+            stale_flushed[:] = parse_sections(content).get("in_progress", [])
+            return start_mission(content, mission_title)
+
+        after = modify_missions_file(missions_path, _transform)
+        in_progress = parse_sections(after).get("in_progress", [])
+        # Confirm the transition using the SAME canonical identity that the
+        # removal step (_remove_item_by_text) uses, not a raw substring. The
+        # complexity classifier rewrites the on-disk Pending line by injecting
+        # ``[complexity:X]`` *between* the mission body and the ⏳ timestamp
+        # (tag_complexity_in_pending) AFTER ``mission_title`` was captured. A
+        # naive ``mission_title in entry`` check then fails because the in-memory
+        # title (``… 📬 ⏳(…)``) is no longer a contiguous substring of the stored
+        # line (``… 📬 [complexity:X] ⏳(…)``), even though the move succeeded —
+        # leaving an orphaned "zombie" In Progress entry. canonical_mission_key()
+        # strips the complexity tag and lifecycle timestamps from both sides, so
+        # the same logical mission matches regardless of when the tag was added.
+        import re
+        from app.missions import canonical_mission_key
+        clean_title = re.sub(r"\s+", " ", canonical_mission_key(mission_title))
+        for entry in in_progress:
+            entry_text = re.sub(r"\s+", " ", canonical_mission_key(entry))
+            if clean_title and clean_title in entry_text:
+                # Clear counter only if a cap was previously hit (human deliberate
+                # retry) — stagnation-retry requeus must keep their count intact
+                # so the stagnation cap check in _finalize_mission still fires.
+                # The transition above already succeeded, so a failure to clear
+                # the counter must NOT abort the start; surface it as a prominent
+                # warning instead, since the mission will otherwise re-escalate to
+                # Failed on the next finalize.
+                try:
+                    if not _clear_if_cap_hit(instance, mission_title, project_name):
+                        log("warning",
+                            f"Retry counter NOT cleared for '{clean_title[:60]}' — "
+                            "clear failed; mission may re-escalate to Failed on next finalize.")
+                except Exception as e:
+                    # _clear_if_cap_hit only catches ImportError internally and lets
+                    # schema mismatches (e.g. a missing get_retry_info key) propagate —
+                    # those are real bugs, so log at error level with a traceback
+                    # rather than burying them in a warning.
+                    import traceback
+                    log("error",
+                        f"Retry counter clear errored for '{clean_title[:60]}' ({e}); "
+                        "mission may re-escalate to Failed on next finalize.\n"
+                        f"{traceback.format_exc()}")
+
+                # Only surface the sanity flush once the transition is
+                # confirmed: start_mission() early-returns (skipping the
+                # flush) when the mission isn't in Pending, so stale_flushed
+                # being non-empty does NOT by itself mean a flush happened.
+                if stale_flushed:
+                    titles = ", ".join(
+                        s.split("\n")[0].strip().removeprefix("- ")[:50]
+                        for s in stale_flushed
+                    )
+                    log("warning", (
+                        f"Sanity flush: {len(stale_flushed)} stale In Progress "
+                        f"mission(s) moved to Failed by start_mission() — "
+                        f"recover.py missed them "
+                        f"(see _flush_in_progress_to_failed): {titles}"
+                    ))
+                return True
+        log("warning", f"Mission transition unconfirmed — '{clean_title[:60]}' "
+            "not found in In Progress after start_mission(). "
+            "Possible text normalisation mismatch or race condition.")
+        return False
     except Exception as e:
         log("error", f"Could not start mission in missions.md: {e}")
+        return False
 
 
-def _update_mission_in_file(instance: str, mission_title: str, *, failed: bool = False):
-    """Move mission from Pending/In Progress to Done/Failed via locked write."""
+def _update_mission_in_file(
+    instance: str,
+    mission_title: str,
+    *,
+    failed: bool = False,
+    cause_tag: str = "",
+) -> bool:
+    """Move mission from Pending/In Progress to Done/Failed via locked write.
+
+    *cause_tag* is only honored when *failed* is True; it is appended to
+    the missions.md entry (e.g. ``[stagnation]``) so the failure reason
+    is visible without digging through journals.
+
+    Returns True if the mission was actually moved, False otherwise (e.g.
+    the mission text could not be matched in Pending/In Progress). A False
+    return means the mission is still in the queue and will be re-picked —
+    callers should surface this rather than let it loop silently.
+
+    History trimming is intentionally NOT done here. Pruning old
+    Done/Failed entries is a separate maintenance concern run as its own
+    locked step (:func:`_prune_missions_history`) after the move commits, so
+    a pruning bug can never corrupt or roll back the finalization itself.
+    """
     try:
-        from app.missions import complete_mission, fail_mission
+        from app.missions import complete_mission_checked, fail_mission_checked
         from app.utils import modify_missions_file
         missions_path = Path(instance, "missions.md")
         if not missions_path.exists():
-            return
-        transform = fail_mission if failed else complete_mission
-        before = [None]
+            return False
 
-        def tracked(content):
-            before[0] = content
-            return transform(content, mission_title)
+        # The move functions report found-status directly, captured via a
+        # closure flag. This is more robust than comparing before/after
+        # content, and history pruning is decoupled to its own step
+        # (_prune_missions_history below) so it cannot interfere here.
+        found = [False]
 
-        after = modify_missions_file(missions_path, tracked)
-        if before[0] is not None and after == before[0]:
+        if failed:
+            def transform(content):
+                new_content, ok = fail_mission_checked(
+                    content, mission_title, cause_tag=cause_tag,
+                )
+                found[0] = ok
+                return new_content
+        else:
+            def transform(content):
+                new_content, ok = complete_mission_checked(content, mission_title)
+                found[0] = ok
+                return new_content
+
+        modify_missions_file(missions_path, transform)
+        if not found[0]:
             log("warning", f"Mission not found (no change): {mission_title[:80]}")
+            return False
+        # Move committed — trim history as a decoupled, best-effort step.
+        _prune_missions_history(instance)
+        return True
     except Exception as e:
         label = "fail" if failed else "complete"
         log("error", f"Could not {label} mission in missions.md: {e}")
+        return False
+
+
+def _prune_missions_history(instance: str) -> None:
+    """Trim old Done/Failed entries from missions.md as a standalone step.
+
+    Decoupled from mission finalization: runs as its own locked
+    read-modify-write so a pruning error cannot corrupt or roll back the
+    Done/Failed move that just committed. Uses the missions lock (unlike the
+    startup-time :func:`app.startup_manager.prune_missions_done`, which is
+    safe to run unlocked only because nothing else writes during startup) so
+    it cannot race the bridge inserting new missions. Best-effort: any error
+    is logged and swallowed.
+    """
+    try:
+        from app.missions import prune_completed_sections
+        from app.utils import modify_missions_file
+        missions_path = Path(instance, "missions.md")
+        if not missions_path.exists():
+            return
+
+        pruned = [0]
+
+        def _transform(content):
+            new_content, count = prune_completed_sections(content)
+            pruned[0] = count
+            return new_content
+
+        modify_missions_file(missions_path, _transform)
+        if pruned[0] > 0:
+            log("health", f"Pruned {pruned[0]} old Done/Failed items from missions.md")
+    except Exception as e:
+        log("error", f"Missions history pruning failed: {e}")
+
+
+def _requeue_mission_in_file(instance: str, mission_title: str):
+    """Move mission from In Progress back to Pending via locked write."""
+    try:
+        from app.missions import requeue_mission
+        from app.utils import modify_missions_file
+        missions_path = Path(instance, "missions.md")
+        if not missions_path.exists():
+            return
+        modify_missions_file(missions_path, lambda c: requeue_mission(c, mission_title))
+    except Exception as e:
+        log("error", f"Could not requeue mission in missions.md: {e}")
 
 
 def _finalize_mission(instance: str, mission_title: str, project_name: str, exit_code: int):
-    """Complete or fail a mission and record execution history."""
-    _update_mission_in_file(instance, mission_title, failed=(exit_code != 0))
+    """Complete or fail a mission and record execution history.
+
+    When the last mission was killed by the stagnation monitor, the
+    module-level flag ``_last_mission_stagnated`` is read and cleared
+    here. Stagnation handling is gated by ``max_retry_on_stagnation``
+    in the stagnation config:
+
+    - if the per-mission retry count is below the cap, the mission is
+      re-queued to Pending (not failed), the counter is incremented,
+      and a "retry" Telegram notification is sent;
+    - once the cap is reached, the mission is marked Failed with a
+      ``[stagnation]`` tag. The counter is preserved so the human can
+      inspect it while the mission sits in Failed. It is cleared when
+      the human deliberately retries via ``_start_mission_in_file``.
+
+    On success, all retry counters are cleared. On failure (stagnation
+    cap or crash) the counters are left intact for diagnostic visibility
+    while the mission remains in Failed state.
+    """
+    failed = exit_code != 0
+    cause_tag = ""
+    stagnated = False
+    if failed and _last_mission_stagnated.is_set():
+        stagnated = True
+        _last_mission_stagnated.clear()
+
+    if stagnated:
+        from app.config import get_stagnation_config
+        from app.stagnation_monitor import (
+            get_retry_count,
+            get_total_attempts,
+            increment_retry_count,
+        )
+
+        pattern = _stagnation_pattern_type or "unknown"
+        excerpt = _stagnation_pattern_excerpt or ""
+
+        cfg = get_stagnation_config(project_name)
+        # Direct key access (no .get() fallback): get_stagnation_config() always
+        # returns every key, so a missing key is a real schema bug that should
+        # surface loudly rather than silently defaulting — and a `0` fallback for
+        # max_retry_on_stagnation would be semantically wrong (0 disables retries;
+        # the actual default is 3). Consistent with _clear_if_cap_hit.
+        max_retry = cfg["max_retry_on_stagnation"]
+        max_total = cfg["max_total_retries"]
+        already = get_retry_count(instance, mission_title)
+        total = get_total_attempts(instance, mission_title)
+        total_cap_hit = max_total > 0 and total >= max_total
+        if max_retry > 0 and already < max_retry and not total_cap_hit:
+            new_count = increment_retry_count(
+                instance, mission_title,
+                pattern_type=pattern, pattern_excerpt=excerpt,
+            )
+            log("koan", (
+                f"Stagnation retry {new_count}/{max_retry} ({pattern}) — "
+                f"requeueing mission: {mission_title[:60]}"
+            ))
+            _requeue_mission_in_file(instance, mission_title)
+            _notify_stagnation_retry(
+                mission_title, project_name, new_count, max_retry,
+                pattern_type=pattern, pattern_excerpt=excerpt,
+            )
+            try:
+                from app.mission_history import record_execution
+                record_execution(instance, mission_title, project_name, exit_code)
+            except (OSError, ValueError) as e:
+                log("error", f"Mission history recording error: {e}")
+            return
+
+        # Retry cap reached (or retries disabled): mark Failed with cause tag.
+        # Counter is preserved — cleared when the human retries the mission.
+        if total_cap_hit:
+            cause_tag = f"stagnation:{pattern}:total_cap({total}/{max_total})"
+        else:
+            cause_tag = f"stagnation:{pattern}"
+        _notify_stagnation(mission_title, project_name, pattern, excerpt)
+    else:
+        # On success, clear all retry counters so the next run starts fresh.
+        # On failure, leave counters intact so the human can see why the
+        # mission ended up in Failed while inspecting .mission-retries.json.
+        if exit_code == 0:
+            try:
+                from app.stagnation_monitor import clear_retry_count
+                clear_retry_count(instance, mission_title)
+            except Exception as e:
+                log("error", f"Stagnation retry counter cleanup error: {e}")
+
+    _update_mission_in_file(
+        instance, mission_title, failed=failed, cause_tag=cause_tag,
+    )
     try:
         from app.mission_history import record_execution
         record_execution(instance, mission_title, project_name, exit_code)
     except (OSError, ValueError) as e:
         log("error", f"Mission history recording error: {e}")
+
+
+def _notify_stagnation(
+    mission_title: str,
+    project_name: str,
+    pattern_type: str = "",
+    pattern_excerpt: str = "",
+) -> None:
+    """Send a Telegram message announcing a stagnation abort."""
+    try:
+        from app.notify import NotificationPriority, send_telegram
+        short_title = mission_title[:120]
+        project_prefix = f"[{project_name}] " if project_name else ""
+        cause = f" ({pattern_type})" if pattern_type else ""
+        message = (
+            f"🛑 {project_prefix}Mission stopped — Claude was stuck in a loop"
+            f"{cause}. Marked as Failed in missions.md.\n\n"
+            f"Mission: {short_title}"
+        )
+        if pattern_excerpt:
+            message += f"\n\nContext: {pattern_excerpt[:200]}"
+        send_telegram(message, priority=NotificationPriority.WARNING)
+    except Exception as e:
+        log("error", f"Stagnation notification failed: {e}")
+
+
+def _notify_stagnation_retry(
+    mission_title: str,
+    project_name: str,
+    attempt: int,
+    max_attempts: int,
+    pattern_type: str = "",
+    pattern_excerpt: str = "",
+) -> None:
+    """Send a Telegram message announcing a stagnation-triggered requeue."""
+    try:
+        from app.notify import NotificationPriority, send_telegram
+        short_title = mission_title[:120]
+        project_prefix = f"[{project_name}] " if project_name else ""
+        cause = f" ({pattern_type})" if pattern_type else ""
+        message = (
+            f"🔁 {project_prefix}Mission stagnated{cause} — "
+            f"requeueing for retry {attempt}/{max_attempts}.\n\n"
+            f"Mission: {short_title}"
+        )
+        if pattern_excerpt:
+            message += f"\n\nContext: {pattern_excerpt[:200]}"
+        send_telegram(message, priority=NotificationPriority.WARNING)
+    except Exception as e:
+        log("error", f"Stagnation retry notification failed: {e}")
 
 
 def _get_koan_branch(koan_root: str) -> str:
@@ -1859,24 +2657,26 @@ def _run_skill_mission(
     run_num: int,
     mission_title: str,
     autonomous_mode: str,
-) -> int:
+    mission_tier: str = "",
+) -> dict:
     """Execute a skill-dispatched mission directly via subprocess.
 
     Streams stdout/stderr line-by-line to pending.md so /live can show
     real-time progress during skill dispatch.
 
-    Returns the process exit code (0 = success).
+    Returns a dict with:
+        exit_code (int): Process exit code (0 = success).
+        stdout (str): Captured stdout text.
+        stderr (str): Captured stderr text.
+        quota_exhausted (bool): Whether quota exhaustion was detected in
+            the post-mission pipeline.
+        quota_info (tuple|None): (reset_display, resume_message) if exhausted.
     """
     from app.debug import debug_log
 
     mission_start = int(time.time())
     koan_pkg_dir = os.path.join(koan_root, "koan")
     pending_path = Path(instance) / "journal" / "pending.md"
-
-    # Explicitly set PYTHONPATH so the subprocess can always resolve
-    # app.* modules even if the working tree changes (e.g. skill does
-    # a git checkout on the koan repo itself).
-    skill_env = {**os.environ, "PYTHONPATH": koan_pkg_dir}
 
     # Record the koan repo's HEAD before execution.  Skills like
     # /rebase and /recreate do git checkouts on project_path which
@@ -1891,16 +2691,32 @@ def _run_skill_mission(
     debug_log(f"[run] skill exec: cwd={koan_pkg_dir} timeout={skill_timeout}s")
     stdout_lines = []
     proc = None
-    timed_out = False
 
     # Create temp files for post-mission processing up front.
     # stderr is redirected to a file instead of a pipe to eliminate
     # deadlock risk: if a background drain thread dies (e.g.
     # UnicodeDecodeError), the pipe fills and both processes stall.
-    fd_out, stdout_file = tempfile.mkstemp(prefix="koan-out-")
+    fd_out, stdout_file = tempfile.mkstemp(prefix="koan-out-", dir=koan_tmp_dir())
     os.close(fd_out)
-    fd_err, stderr_file = tempfile.mkstemp(prefix="koan-err-")
+    fd_err, stderr_file = tempfile.mkstemp(prefix="koan-err-", dir=koan_tmp_dir())
     os.close(fd_err)
+    fd_usage, stream_usage_file = tempfile.mkstemp(prefix="koan-stream-usage-", dir=koan_tmp_dir())
+    os.close(fd_usage)
+    from app.skill_dispatch import mission_command_name, mission_model_key
+    _mission_command = mission_command_name(mission_title)
+    _mission_model_key = mission_model_key(_mission_command, instance)
+    # Explicitly set PYTHONPATH so the subprocess can always resolve
+    # app.* modules even if the working tree changes (e.g. skill does
+    # a git checkout on the koan repo itself).
+    skill_env = {
+        **os.environ,
+        "PYTHONPATH": koan_pkg_dir,
+        "KOAN_STREAM_USAGE_FILE": stream_usage_file,
+        "KOAN_MISSION_STARTED_AT": str(mission_start),
+        "KOAN_MISSION_COMMAND": _mission_command,
+    }
+    if _mission_model_key:
+        skill_env["KOAN_MISSION_MODEL_KEY"] = _mission_model_key
     stderr_fh = None
     try:
         stderr_fh = open(stderr_file, "w")
@@ -1917,23 +2733,30 @@ def _run_skill_mission(
         # Register for double-tap CTRL-C termination.
         _sig.claude_proc = proc
 
-        # Watchdog timer: kills the process group if the skill exceeds
-        # skill_timeout.  Without this, the ``for line in proc.stdout``
-        # loop below blocks indefinitely if the subprocess hangs without
-        # closing its stdout pipe — ``proc.wait(timeout=...)`` is never
-        # reached because the iterator never finishes.
-        def _watchdog():
-            nonlocal timed_out
-            timed_out = True
-            _kill_process_group(proc)
+        from app.subprocess_runner import ProcessWatchdog, LivenessWatchdog
 
-        timer = threading.Timer(skill_timeout, _watchdog)
-        timer.daemon = True
-        timer.start()
+        watchdog = ProcessWatchdog(proc, skill_timeout).start()
+
+        from app.config import get_first_output_timeout, get_rebase_first_output_timeout
+        # Resolve the canonical command so the rebase override applies to all
+        # dispatch paths: /rebase (GitHub), /core.rebase (Telegram), /rb alias.
+        if _mission_command == "rebase":
+            first_output_timeout = get_rebase_first_output_timeout()
+        else:
+            first_output_timeout = get_first_output_timeout()
+        liveness = None
+        if first_output_timeout > 0:
+            liveness = LivenessWatchdog(
+                proc, first_output_timeout,
+                on_timeout=lambda: log(
+                    "error",
+                    f"No output for {first_output_timeout}s "
+                    f"— killing stuck process (elapsed: {int(time.time() - mission_start)}s)",
+                ),
+            ).start()
 
         # Stream stdout line-by-line, appending each to pending.md
-        # so /live shows real-time progress.  Open the file handle once
-        # to avoid repeated open/close race with archive_pending.
+        # so /live shows real-time progress.
         pending_fh = None
         try:
             pending_fh = open(pending_path, "a")
@@ -1941,6 +2764,8 @@ def _run_skill_mission(
             debug_log(f"[run] cannot open pending.md for streaming: {e}")
         try:
             for line in proc.stdout:
+                if liveness is not None:
+                    liveness.heartbeat()
                 stripped = line.rstrip("\n")
                 stdout_lines.append(stripped)
                 print(stripped)
@@ -1953,14 +2778,28 @@ def _run_skill_mission(
         finally:
             if pending_fh is not None:
                 pending_fh.close()
-            timer.cancel()
+            watchdog.cancel()
+            if liveness is not None:
+                liveness.cancel()
 
         proc.wait(timeout=30)
-        if timed_out:
-            # Watchdog killed the process — treat as timeout
+        if watchdog.fired or (liveness and liveness.fired):
             raise subprocess.TimeoutExpired(skill_cmd, skill_timeout)
         exit_code = proc.returncode
         skill_stdout = "\n".join(stdout_lines)
+        # Provider stream mode can persist token usage to a sidecar file.
+        # Append that JSON payload to stdout capture so token_parser can
+        # account for skill-dispatch sessions in run_post_mission.
+        with suppress_logged(log, "warning", "Skill stream usage read failed", OSError, json.JSONDecodeError):
+            raw_usage = Path(stream_usage_file).read_text().strip()
+            if raw_usage:
+                usage_payload = json.loads(raw_usage)
+                if isinstance(usage_payload, dict):
+                    usage_json = json.dumps(usage_payload, separators=(",", ":"))
+                    if skill_stdout:
+                        skill_stdout = f"{skill_stdout}\n{usage_json}"
+                    else:
+                        skill_stdout = usage_json
         # Read stderr from file after process exits.
         stderr_fh.close()
         stderr_fh = None
@@ -1982,9 +2821,26 @@ def _run_skill_mission(
                 debug_log(f"[run] skill stderr: {skill_stderr[:2000]}")
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
-        timed_out = True
-        log("error", f"Skill runner timed out ({skill_timeout}s)")
-        debug_log(f"[run] skill exec: TIMEOUT ({skill_timeout}s)")
+        liveness_fired = liveness and liveness.fired
+        timeout_kind = "liveness" if liveness_fired else "watchdog"
+        timeout_val = first_output_timeout if liveness_fired else skill_timeout
+        log("error", f"Skill runner timed out ({timeout_kind}: {timeout_val}s)")
+        debug_log(f"[run] skill exec: TIMEOUT ({timeout_kind}: {timeout_val}s)")
+        # Log last lines of captured output so the journal shows *where*
+        # the run stalled, not just that it timed out.
+        tail_lines = stdout_lines[-20:] if stdout_lines else []
+        if tail_lines:
+            tail_preview = "\n".join(tail_lines)
+            log("info", f"Last output before timeout:\n{tail_preview}")
+            debug_log(f"[run] timeout tail ({len(tail_lines)} lines):\n{tail_preview}")
+        else:
+            log("info", "No stdout captured before timeout")
+            debug_log("[run] timeout: no stdout lines captured")
+        # Log stderr — may contain API errors that explain the hang
+        with suppress_logged(log, "warning", "Timeout stderr read failed", OSError):
+            _timeout_stderr = Path(stderr_file).read_text().strip()
+            if _timeout_stderr:
+                debug_log(f"[run] timeout stderr:\n{_timeout_stderr[:2000]}")
         exit_code = 1
         skill_stdout = "\n".join(stdout_lines)
         skill_stderr = ""
@@ -1998,10 +2854,8 @@ def _run_skill_mission(
         skill_stderr = ""
     finally:
         if proc is not None and proc.stdout is not None:
-            try:
+            with suppress_logged(log, "debug", "Skill proc stdout close failed", OSError):
                 proc.stdout.close()
-            except OSError:
-                pass
         if stderr_fh is not None:
             stderr_fh.close()
         _sig.claude_proc = None
@@ -2014,6 +2868,13 @@ def _run_skill_mission(
     # Wrap in try/finally so temp files are cleaned up even if the write
     # or post-mission processing raises an unexpected exception (consistent
     # with the contemplative and regular mission paths).
+    skill_result = {
+        "exit_code": exit_code,
+        "stdout": skill_stdout,
+        "stderr": skill_stderr,
+        "quota_exhausted": False,
+        "quota_info": None,
+    }
     try:
         with open(stdout_file, 'wb') as f:
             f.write(skill_stdout.encode('utf-8'))
@@ -2021,7 +2882,8 @@ def _run_skill_mission(
         _skill_prefix = f"Run {run_num}"
         set_status(koan_root, f"{_skill_prefix} — finalizing")
         from app.mission_runner import run_post_mission
-        run_post_mission(
+        _skill_provider_name, _ = _provider_identity()
+        post_result = run_post_mission(
             instance_dir=instance,
             project_name=project_name,
             project_path=project_path,
@@ -2035,23 +2897,27 @@ def _run_skill_mission(
             status_callback=lambda step: set_status(
                 koan_root, f"{_skill_prefix} — {step}"
             ),
+            mission_tier=mission_tier,
+            provider_name=_skill_provider_name,
+            is_skill_dispatch=True,
         )
+        if isinstance(post_result, dict) and post_result.get("quota_exhausted"):
+            skill_result["quota_exhausted"] = True
+            skill_result["quota_info"] = post_result.get("quota_info")
     except Exception as e:
         log("error", f"Post-mission error: {e}")
     finally:
-        _cleanup_temp(stdout_file, stderr_file)
+        _cleanup_temp(stdout_file, stderr_file, stream_usage_file)
     duration = int(time.time()) - mission_start
     debug_log(f"[run] skill exec: done in {duration}s, exit_code={exit_code}")
-    return exit_code
+    return skill_result
 
 
 def _cleanup_temp(*files):
     """Remove temporary files."""
     for f in files:
-        try:
+        with suppress_logged(log, "debug", f"Temp file cleanup failed ({f})", OSError):
             Path(f).unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2076,22 +2942,46 @@ def main():
             break
         except SystemExit as e:
             if e.code == RESTART_EXIT_CODE:
-                # Restart signal
+                # Restart signal — re-exec the interpreter so updated code on
+                # disk is actually loaded. A plain in-process `continue` re-runs
+                # the loop with the STALE modules already imported into this
+                # long-lived process, so `/update` and auto-update would pull
+                # new code to disk yet keep executing the old code in memory
+                # until a full manual restart. main_loop()'s finally has already
+                # released the pidfile by the time we get here, so the re-exec'd
+                # image re-acquires it cleanly; cwd, env and the stdout/stderr
+                # log fds are preserved across execv.
                 crash_count = 0
-                print("[koan] Restarting run loop...")
-                time.sleep(1)
-                continue
+                print("[koan] Restarting (re-exec to load updated code)...")
+                _reset_terminal()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                try:
+                    os.execv(sys.executable, [sys.executable, *sys.argv])
+                except OSError as exc:
+                    # Re-exec failed — fall back to an in-process restart so the
+                    # daemon stays alive (it just won't pick up updated code).
+                    print(
+                        f"[koan] Re-exec failed ({exc}); restarting in-process "
+                        "without reloading code.",
+                        file=sys.stderr,
+                    )
+                    time.sleep(1)
+                    continue
             raise
         except Exception:
             crash_count += 1
             tb = traceback.format_exc()
-            print(f"[koan] Unexpected crash ({crash_count}/{MAX_MAIN_CRASHES}): {tb}", file=sys.stderr)
+            cfg = get_recovery_config()
+            max_crashes = cfg["max_main_crashes"]
+            print(f"[koan] Unexpected crash ({crash_count}/{max_crashes}): {tb}", file=sys.stderr)
 
-            if crash_count >= MAX_MAIN_CRASHES:
-                print(f"[koan] Too many crashes ({MAX_MAIN_CRASHES}). Giving up.", file=sys.stderr)
-                break
+            if crash_count >= max_crashes:
+                print(f"[koan] Too many crashes ({max_crashes}). Giving up.", file=sys.stderr)
+                _reset_terminal()
+                sys.exit(1)
 
-            backoff = _calculate_backoff(crash_count, MAX_BACKOFF_MAIN)
+            backoff = _calculate_backoff(crash_count, cfg["max_backoff_main"])
             print(f"[koan] Restarting in {backoff}s...", file=sys.stderr)
             time.sleep(backoff)
 

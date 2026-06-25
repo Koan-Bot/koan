@@ -13,33 +13,34 @@ Output (stdout):
     (empty)                       — if autonomous mode (no pending missions)
 """
 
-import re
 import sys
 from pathlib import Path
 
+from app.utils import PROJECT_TAG_RE, PROJECT_TAG_STRIP_RE
 
-def fallback_extract(missions_path: Path, projects_str: str) -> tuple:
+
+def fallback_extract(content: str, projects_str: str) -> tuple[str | None, str | None]:
     """Extract the first pending mission in FIFO order."""
     from app.missions import extract_next_pending
 
-    if not missions_path.exists():
-        return (None, None)
-
-    content = missions_path.read_text()
     line = extract_next_pending(content)
     if not line:
         return (None, None)
 
-    # Try to extract project from inline tag
-    tag = re.search(r"\[projec?t:([a-zA-Z0-9_-]+)\]", line)
+    # Try to extract project from inline tag.
+    # The sentinel tag [project:all] passes through verbatim here; it is
+    # resolved to the workspace root downstream (iteration_manager
+    # ._resolve_project_path) so the org-wide mission runs once over all repos.
+    tag = PROJECT_TAG_RE.search(line)
     if tag:
         project = tag.group(1)
-        title = re.sub(r"\[projec?t:[a-zA-Z0-9_-]+\]\s*", "", line).lstrip("- ").strip()
+        title = PROJECT_TAG_STRIP_RE.sub("", line).removeprefix("- ").strip()
     else:
-        # Default to first project
+        # No tag: default to the first project (intentional for single-project
+        # setups). Org-wide missions must carry an explicit [project:all] tag.
         parts = [p for p in projects_str.split(";") if p]
         project = parts[0].split(":")[0] if parts else "default"
-        title = line.lstrip("- ").strip()
+        title = line.removeprefix("- ").strip()
 
     return (project, title)
 
@@ -60,10 +61,10 @@ def pick_mission(
     instance = Path(instance_dir)
     missions_path = instance / "missions.md"
 
-    if not missions_path.exists():
+    try:
+        missions_content = missions_path.read_text()
+    except FileNotFoundError:
         return ""
-
-    missions_content = missions_path.read_text()
 
     # Quick check: any pending missions at all?
     from app.missions import count_pending
@@ -71,7 +72,7 @@ def pick_mission(
     if pending_count == 0:
         return ""
 
-    project, title = fallback_extract(missions_path, projects_str)
+    project, title = fallback_extract(missions_content, projects_str)
     if project and title:
         return f"{project}:{title}"
     return ""

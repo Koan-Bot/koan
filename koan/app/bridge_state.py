@@ -5,6 +5,7 @@ awake.py (main loop, chat, outbox) and command_handlers.py (slash commands).
 Extracted to avoid circular imports between those two modules.
 """
 
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -81,23 +82,94 @@ summary_path = INSTANCE_DIR / "memory" / "summary.md"
 if summary_path.exists():
     SUMMARY = summary_path.read_text()
 
-# Skills registry — loaded once at import time
+
+# mtime-cached refresh of soul.md / summary.md so the long-running bridge picks
+# up edits (e.g. soul.md changed via the dashboard, summary.md appended by run
+# sessions) without a restart — while still avoiding a disk read per chat.
+_context_cache: dict[str, tuple[float, str]] = {}
+
+
+def _read_cached(path: Path) -> Optional[str]:
+    """Read ``path`` with mtime-based caching.  Returns None only when the file
+    is missing or unreadable; an empty file returns ``""``."""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    key = str(path)
+    cached = _context_cache.get(key)
+    if cached is not None and cached[0] >= mtime:
+        return cached[1]
+    try:
+        content = path.read_text()
+    except OSError:
+        return None
+    _context_cache[key] = (mtime, content)
+    return content
+
+
+def get_soul() -> str:
+    """Current soul.md content, refreshed on edit (falls back to startup value)."""
+    content = _read_cached(soul_path)
+    return content if content is not None else SOUL
+
+
+def get_summary() -> str:
+    """Current summary.md content, refreshed on append (falls back to startup value)."""
+    content = _read_cached(summary_path)
+    return content if content is not None else SUMMARY
+
+# Skills registry — cached with mtime-based invalidation.
+# Rebuilds automatically when skill directories change on disk
+# (e.g., after code deployment adds a new core skill).
 _skill_registry: Optional[SkillRegistry] = None
+_skill_registry_mtime: float = 0.0
+
+
+def _skills_dir_mtime() -> float:
+    """Get the max mtime of core and instance skills directories.
+
+    When a new skill directory is added or removed, the parent directory's
+    mtime changes.  This single stat() call detects structural changes
+    without scanning individual SKILL.md files.
+
+    Also includes skills.py itself — if the Skill dataclass gains new
+    fields after an auto-update, cached instances in the registry would
+    lack them unless the registry is rebuilt.
+    """
+    best = 0.0
+    # Core skills directory (inside the koan package)
+    core_dir = Path(__file__).resolve().parent.parent / "skills" / "core"
+    with contextlib.suppress(OSError):
+        best = max(best, core_dir.stat().st_mtime)
+    # Instance skills directory (user-installed skills)
+    instance_skills = INSTANCE_DIR / "skills"
+    if instance_skills.is_dir():
+        with contextlib.suppress(OSError):
+            best = max(best, instance_skills.stat().st_mtime)
+    # skills.py module — rebuild registry when Skill dataclass changes
+    skills_module = Path(__file__).resolve().parent / "skills.py"
+    with contextlib.suppress(OSError):
+        best = max(best, skills_module.stat().st_mtime)
+    return best
 
 
 def _get_registry() -> SkillRegistry:
-    """Get or initialize the skill registry (lazy singleton)."""
-    global _skill_registry
-    if _skill_registry is None:
+    """Get the skill registry, rebuilding if skills directories changed."""
+    global _skill_registry, _skill_registry_mtime
+    current_mtime = _skills_dir_mtime()
+    if _skill_registry is None or current_mtime > _skill_registry_mtime:
         extra_dirs = []
         instance_skills = INSTANCE_DIR / "skills"
         if instance_skills.is_dir():
             extra_dirs.append(instance_skills)
         _skill_registry = build_registry(extra_dirs)
+        _skill_registry_mtime = current_mtime
     return _skill_registry
 
 
 def _reset_registry():
-    """Reset the registry (for testing)."""
-    global _skill_registry
+    """Reset the registry (for testing and after /skill install/update/remove)."""
+    global _skill_registry, _skill_registry_mtime
     _skill_registry = None
+    _skill_registry_mtime = 0.0

@@ -1,13 +1,40 @@
 """Kōan status skill — consolidates /status, /ping, /usage."""
 
 
+def _get_server_ip() -> str:
+    """Return the IP address of the main network interface.
+
+    Uses a UDP socket connection to determine the default route IP
+    without actually sending any data.
+    """
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "unknown"
+
+
 def _needs_ollama() -> bool:
     """Return True if the configured provider requires ollama serve."""
     try:
         from app.provider import get_provider_name
-        return get_provider_name() in ("local", "ollama")
+        return get_provider_name() == "ollama"
     except Exception:
         return False
+
+
+def _get_version() -> str:
+    """Return Kōan version from git tags."""
+    from app.version import get_version
+    return get_version()
+
+
+def _get_branch() -> str:
+    """Return current git branch name."""
+    from app.version import get_branch
+    return get_branch()
 
 
 def _truncate(text: str, max_len: int = 60) -> str:
@@ -15,6 +42,58 @@ def _truncate(text: str, max_len: int = 60) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 1].rstrip() + "…"
+
+
+def _count_pending_missions(missions_file) -> int:
+    """Return the total number of pending missions across all projects."""
+    from pathlib import Path
+    from app.missions import parse_sections
+
+    path = Path(missions_file)
+    if not path.exists():
+        return 0
+    try:
+        sections = parse_sections(path.read_text())
+        return len(sections.get("pending", []))
+    except Exception:
+        return 0
+
+
+def _get_in_progress_missions(missions_file) -> str:
+    """Return a short display of in-progress missions, or empty string."""
+    from pathlib import Path
+    from app.missions import parse_sections
+    from app.utils import parse_project
+
+    path = Path(missions_file)
+    if not path.exists():
+        return ""
+    try:
+        content = path.read_text()
+        sections = parse_sections(content)
+        in_progress = sections.get("in_progress", [])
+        if not in_progress:
+            return ""
+        summaries = []
+        for m in in_progress[:2]:
+            project, text = parse_project(m)
+            text = _truncate(text.strip().lstrip("- "), 40)
+            if project:
+                summaries.append(f"{text} [{project}]")
+            else:
+                summaries.append(text)
+        return ", ".join(summaries)
+    except Exception:
+        return ""
+
+
+def _get_parallel_workers() -> int:
+    """Return max_parallel_sessions from config (default 1)."""
+    try:
+        from app.session_manager import get_max_parallel_sessions
+        return get_max_parallel_sessions()
+    except Exception:
+        return 1
 
 
 def _format_mission_display(mission: str) -> str:
@@ -60,31 +139,49 @@ def handle(ctx):
 
 
 def _handle_status(ctx) -> str:
-    """Build status message grouped by project."""
+    """Build status message with structured unicode layout."""
     from app.missions import group_by_project
 
     koan_root = ctx.koan_root
     instance_dir = ctx.instance_dir
     missions_file = instance_dir / "missions.md"
 
-    parts = ["Kōan Status"]
+    version = _get_version()
+    branch = _get_branch()
+    if version and branch:
+        parts = [f"◉ Kōan Status ({branch} - {version})"]
+    elif version:
+        parts = [f"◉ Kōan Status ({version})"]
+    elif branch:
+        parts = [f"◉ Kōan Status ({branch})"]
+    else:
+        parts = ["◉ Kōan Status"]
 
     pause_file = koan_root / ".koan-pause"
     stop_file = koan_root / ".koan-stop"
 
+    pending_count = _count_pending_missions(missions_file)
+    queue_suffix = f" — {pending_count} in queue" if pending_count else " — queue empty"
+    workers = _get_parallel_workers()
+    if workers > 1:
+        queue_suffix += f" │ {workers} workers"
+
     if stop_file.exists():
-        parts.append("\n⛔ Mode: Stopping")
+        parts.append("  ⛔ Stopping")
+        in_flight = _get_in_progress_missions(missions_file)
+        if in_flight:
+            parts.append(f"  ⏳ Finishing: {in_flight}")
     elif pause_file.exists():
         from app.pause_manager import get_pause_state
         state = get_pause_state(str(koan_root))
         reason = state.reason if state else ""
         if reason == "quota":
-            parts.append("\n⏸️ Mode: Paused (quota exhausted)")
+            parts.append(f"  ⏸️ Paused (quota exhausted){queue_suffix}")
             if state and state.timestamp > 0:
                 try:
                     from app.reset_parser import time_until_reset
                     remaining = time_until_reset(state.timestamp)
-                    parts.append(f"  Resets in ~{remaining}")
+                    parts.append(f"  ⏱ Resets in ~{remaining}")
                 except Exception:
                     pass
         elif reason == "timed":
@@ -92,20 +189,48 @@ def _handle_status(ctx) -> str:
                 try:
                     from app.reset_parser import time_until_reset
                     remaining = time_until_reset(state.timestamp)
-                    parts.append(f"\n⏸️ Mode: Paused (~{remaining} remaining)")
+                    parts.append(f"  ⏸️ Paused (~{remaining} remaining){queue_suffix}")
                 except Exception:
-                    parts.append("\n⏸️ Mode: Paused (timed)")
+                    parts.append(f"  ⏸️ Paused (timed){queue_suffix}")
             else:
-                parts.append("\n⏸️ Mode: Paused (timed)")
+                parts.append(f"  ⏸️ Paused (timed){queue_suffix}")
         elif reason == "max_runs":
-            parts.append("\n⏸️ Mode: Paused (max runs reached)")
+            parts.append(f"  ⏸️ Paused (max runs reached){queue_suffix}")
         else:
-            parts.append("\n⏸️ Mode: Paused")
-        parts.append("  /resume to unpause")
+            parts.append(f"  ⏸️ Paused{queue_suffix}")
+        in_flight = _get_in_progress_missions(missions_file)
+        if in_flight:
+            parts.append(f"  ⏳ Finishing: {in_flight}")
+        parts.append("  → /resume to unpause")
     else:
-        parts.append("\n🟢 Mode: Working")
+        try:
+            from app.passive_manager import check_passive
+            passive_state = check_passive(str(koan_root))
+            if passive_state:
+                remaining = passive_state.remaining_display()
+                if passive_state.duration == 0:
+                    parts.append(f"  👁️ Passive (read-only){queue_suffix}")
+                else:
+                    parts.append(f"  👁️ Passive (read-only, {remaining} remaining){queue_suffix}")
+            else:
+                parts.append(f"  🟢 Active{queue_suffix}")
+        except Exception:
+            parts.append(f"  🟢 Active{queue_suffix}")
 
-    # Show focus mode if active
+    # System info: IP │ Provider on one compact line
+    info_items = []
+    server_ip = _get_server_ip()
+    if server_ip != "unknown":
+        info_items.append(f"🌐 IP: {server_ip}")
+    try:
+        from app.provider import get_provider_name
+        info_items.append(get_provider_name())
+    except Exception:
+        pass
+    if info_items:
+        parts.append(f"  {' │ '.join(info_items)}")
+
+    # Focus mode
     try:
         from app.focus_manager import check_focus
         focus_state = check_focus(str(koan_root))
@@ -114,22 +239,23 @@ def _handle_status(ctx) -> str:
     except Exception:
         pass
 
-    # Show process health when ollama is needed
+    # Ollama process
     if _needs_ollama():
         from app.pid_manager import check_pidfile
         ollama_pid = check_pidfile(koan_root, "ollama")
         if ollama_pid:
             parts.append(f"  🦙 Ollama: running (PID {ollama_pid})")
         else:
-            parts.append(f"  🦙 Ollama: not running")
+            parts.append("  🦙 Ollama: not running")
 
+    # Loop status
     status_file = koan_root / ".koan-status"
     if status_file.exists():
         loop_status = status_file.read_text().strip()
         if loop_status:
             parts.append(f"  Loop: {loop_status}")
 
-    # Show cache stats if cache has been used
+    # Cache stats
     try:
         from app.response_cache import get_format_cache
         cache_stats = get_format_cache().stats()
@@ -141,31 +267,114 @@ def _handle_status(ctx) -> str:
     except Exception:
         pass
 
+    # Missions section
     if missions_file.exists():
         content = missions_file.read_text()
         missions_by_project = group_by_project(content)
 
         if missions_by_project:
-            for project in sorted(missions_by_project.keys()):
-                missions = missions_by_project[project]
-                pending = missions["pending"]
-                in_progress = missions["in_progress"]
+            has_missions = any(
+                m["pending"] or m["in_progress"]
+                for m in missions_by_project.values()
+            )
+            if has_missions:
+                parts.append("")
+                parts.append("◎ Missions")
+                for project in sorted(missions_by_project.keys()):
+                    missions = missions_by_project[project]
+                    pending = missions["pending"]
+                    in_progress = missions["in_progress"]
 
-                if pending or in_progress:
-                    parts.append(f"\n{project}")
-                    if in_progress:
-                        parts.append(f"  In progress: {len(in_progress)}")
-                        for m in in_progress[:2]:
-                            parts.append(f"    {_format_mission_display(m)}")
-                    if pending:
-                        parts.append(f"  Pending: {len(pending)}")
-                        for m in pending[:3]:
-                            parts.append(f"    {_format_mission_display(m)}")
+                    if pending or in_progress:
+                        parts.append(f"  {project}")
+                        if in_progress:
+                            parts.append(f"    ▶ In progress: {len(in_progress)}")
+                            parts.extend(
+                                f"      {_format_mission_display(m)}"
+                                for m in in_progress[:2]
+                            )
+                        if pending:
+                            parts.append(f"    ⏳ Pending: {len(pending)}")
+                            parts.extend(
+                                f"      {_format_mission_display(m)}"
+                                for m in pending[:3]
+                            )
 
-    # Health section
+    # Skill metrics
+    skill_metrics_lines = _build_skill_metrics_section(instance_dir)
+    if skill_metrics_lines:
+        parts.extend(skill_metrics_lines)
+
+    # Health
     parts.extend(_build_health_section(koan_root, instance_dir))
 
-    return "\n".join(parts)
+    # Contemplative adaptation rates
+    parts.extend(_build_contemplative_section(instance_dir))
+
+    body = "\n".join(parts)
+    return f"```\n{body}\n```"
+
+
+def _build_skill_metrics_section(instance_dir) -> list:
+    """Build skill metrics summary lines for /status output."""
+    try:
+        from pathlib import Path
+        from app.skill_metrics import format_skill_metrics_summary
+
+        projects_dir = Path(instance_dir) / "memory" / "projects"
+        if not projects_dir.exists():
+            return []
+
+        lines = []
+        for project_dir in sorted(projects_dir.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            summary = format_skill_metrics_summary(
+                instance_dir, project_dir.name, days=30,
+            )
+            if summary:
+                if not lines:
+                    lines.append("")
+                    lines.append("◎ Skill Metrics (30d)")
+                lines.append(f"  {project_dir.name}:")
+                lines.extend(f"  {line}" for line in summary.splitlines())
+        return lines
+    except Exception:
+        return []
+
+
+def _build_contemplative_section(instance_dir) -> list:
+    """Build contemplative adaptation rates for /status output."""
+    try:
+        from app.session_tracker import get_contemplative_productivity
+        from app.utils import get_contemplative_chance, get_known_projects
+
+        base_chance = get_contemplative_chance()
+        projects = get_known_projects()
+        items = []
+
+        for name, _ in projects:
+            ratio = get_contemplative_productivity(str(instance_dir), name)
+            if ratio is None:
+                continue
+            # Compute adapted chance
+            if ratio < 0.2:
+                adapted = int(base_chance * 0.4)
+            elif ratio >= 0.5:
+                adapted = min(int(base_chance * 1.5), 25)
+            else:
+                adapted = base_chance
+            pct_label = f"{ratio:.0%}"
+            if adapted != base_chance:
+                items.append(f"  {name}: {pct_label} productive → {adapted}%")
+            else:
+                items.append(f"  {name}: {pct_label} productive (unchanged)")
+
+        if items:
+            return ["", f"○ Contemplative (base {base_chance}%)"] + items
+    except Exception:
+        pass
+    return []
 
 
 def _build_health_section(koan_root, instance_dir) -> list:
@@ -181,32 +390,90 @@ def _build_health_section(koan_root, instance_dir) -> list:
         age = get_run_heartbeat_age(str(koan_root))
         if age >= 0:
             if age < 120:
-                health_items.append(f"Heartbeat: {age:.0f}s ago")
+                health_items.append(f"💓 {age:.0f}s")
+            elif age < 900:
+                health_items.append(f"💓 {age / 60:.0f}m")
             else:
-                health_items.append(f"⚠️ Heartbeat: {age / 60:.0f}m ago")
+                health_items.append(f"⚠️ heartbeat {age / 60:.0f}m ago")
         else:
-            health_items.append("Heartbeat: n/a")
+            health_items.append("💓 n/a")
+
+        # Usage data freshness
+        health_items.append(_check_usage_staleness(instance_dir))
+
+        # GitHub notification queue depth
+        gh_item = _check_github_notifications()
+        if gh_item:
+            health_items.append(gh_item)
+
+        # Disk space
+        free_gb = get_disk_free_gb(str(koan_root))
+        if free_gb >= 0:
+            if free_gb < 1.0:
+                health_items.append(f"⚠️ disk {free_gb:.1f} GB")
+            else:
+                health_items.append(f"💾 {free_gb:.0f} GB")
 
         # Stale missions (read-only check, no alerting)
         stale = check_stale_missions(str(instance_dir))
         if stale:
             health_items.append(f"⚠️ {len(stale)} stale mission(s)")
 
-        # Disk space
-        free_gb = get_disk_free_gb(str(koan_root))
-        if free_gb >= 0:
-            if free_gb < 1.0:
-                health_items.append(f"⚠️ Disk: {free_gb:.1f} GB free")
-            else:
-                health_items.append(f"Disk: {free_gb:.0f} GB free")
-
         if health_items:
-            lines.append("\nHealth")
-            for item in health_items:
-                lines.append(f"  {item}")
+            lines.append("")
+            lines.append("◎ Health")
+            # Group items in pairs for compact display
+            for i in range(0, len(health_items), 2):
+                if i + 1 < len(health_items):
+                    lines.append(f"  {health_items[i]} │ {health_items[i+1]}")
+                else:
+                    lines.append(f"  {health_items[i]}")
     except Exception:
         pass
     return lines
+
+
+def _check_usage_staleness(instance_dir) -> str:
+    """Check if usage.md is stale (>6h), which triggers the 75% fallback."""
+    import os
+    import time
+
+    usage_path = instance_dir / "usage.md"
+    if not usage_path.exists():
+        return "⚠️ Usage: no data (defaulting to 75%)"
+
+    try:
+        age_seconds = time.time() - os.path.getmtime(usage_path)
+        age_hours = age_seconds / 3600
+
+        if age_hours > 6:
+            return f"⚠️ Usage: stale ({age_hours:.0f}h old, 75% fallback active)"
+        elif age_hours > 1:
+            return f"📊 Usage: {age_hours:.1f}h old"
+        else:
+            minutes = age_seconds / 60
+            return f"📊 Usage: {minutes:.0f}m old"
+    except OSError:
+        return "⚠️ Usage: unreadable"
+
+
+def _check_github_notifications() -> str:
+    """Check unread GitHub notification queue depth."""
+    try:
+        from app.github import api
+        raw = api("notifications?per_page=100")
+        if not raw or raw.strip() == "[]":
+            return "📬 GitHub: 0 unread"
+
+        import json
+        notifications = json.loads(raw)
+        count = len(notifications)
+        if count >= 100:
+            return f"📬 GitHub: {count}+ unread"
+        else:
+            return f"📬 GitHub: {count} unread"
+    except Exception:
+        return None
 
 
 def _handle_ping(ctx) -> str:

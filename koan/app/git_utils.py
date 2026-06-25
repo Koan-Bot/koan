@@ -13,6 +13,24 @@ import subprocess
 from typing import Dict, List, Optional, Tuple
 
 
+class GitCommandError(RuntimeError):
+    """Raised by :func:`run_git_strict` when git exits non-zero.
+
+    Subclasses ``RuntimeError`` so existing ``except RuntimeError`` callers keep
+    working, while carrying the exit code and captured output. This lets callers
+    distinguish failure modes — notably a pre-commit *hook rejection* (git exits
+    with the hook's own code, typically 1/2) from a git plumbing error (git
+    reserves exit code 128 for its own fatal errors).
+    """
+
+    def __init__(self, cmd: str, returncode: int, stderr: str, stdout: str = ""):
+        super().__init__(f"git failed: {cmd} — {stderr[:200]}")
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = stdout
+
+
 def run_git(
     *args: str,
     cwd: str = None,
@@ -78,7 +96,9 @@ def run_git_strict(
     )
     if result.returncode != 0:
         cmd_str = " ".join(["git"] + list(args))
-        raise RuntimeError(f"git failed: {cmd_str} — {result.stderr[:200]}")
+        raise GitCommandError(
+            cmd_str, result.returncode, result.stderr, result.stdout,
+        )
     return result.stdout.strip()
 
 
@@ -121,15 +141,39 @@ def get_commit_subjects(
     return [s for s in stdout.splitlines() if s.strip()]
 
 
-def ordered_remotes(preferred: Optional[str] = None) -> List[str]:
-    """Return remote names to try, with *preferred* first if given.
+def _list_remotes(cwd: Optional[str] = None) -> Optional[List[str]]:
+    """Return configured git remotes for *cwd* preserving git's output order.
 
-    Always includes both ``origin`` and ``upstream`` (de-duplicated).
+    Returns ``None`` when discovery fails (e.g. not a git repository).
     """
-    remotes: list[str] = []
-    if preferred:
+    rc, stdout, _ = run_git("remote", cwd=cwd, timeout=10)
+    if rc != 0:
+        return None
+    remotes = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return remotes
+
+
+def ordered_remotes(preferred: Optional[str] = None, cwd: Optional[str] = None) -> List[str]:
+    """Return remote names to try, with *preferred* first when available.
+
+    If *cwd* is provided and remotes can be discovered, only configured remotes
+    are returned. If discovery fails, falls back to ``origin``/``upstream``.
+    """
+    discovered = _list_remotes(cwd=cwd) if cwd else None
+
+    if not discovered:
+        remotes: list[str] = []
+        if preferred:
+            remotes.append(preferred)
+        for remote in ("origin", "upstream"):
+            if remote not in remotes:
+                remotes.append(remote)
+        return remotes
+
+    remotes = []
+    if preferred and preferred in discovered:
         remotes.append(preferred)
-    for r in ("origin", "upstream"):
-        if r not in remotes:
-            remotes.append(r)
+    for remote in discovered:
+        if remote not in remotes:
+            remotes.append(remote)
     return remotes

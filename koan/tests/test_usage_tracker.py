@@ -1,9 +1,12 @@
 """Tests for usage_tracker.py — Usage parsing and autonomous mode decisions."""
 
 import logging
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
+from app import burn_rate
 from app.usage_tracker import UsageTracker, _get_budget_mode, MALFORMED_DEFAULT_PCT
 
 
@@ -359,6 +362,37 @@ class TestCanAffordRun:
         # deep = 16.0 → 16.0 > 10
         assert tracker.can_afford_run("deep") is False
 
+    def test_tier_multiplier_increases_cost(self, tmp_path):
+        """tier_multiplier scales cost on top of mode multiplier."""
+        usage = tmp_path / "usage.md"
+        usage.write_text("Session (5hr) : 50% (reset in 2h)\nWeekly (7 day) : 10% (Resets in 5d)")
+        tracker = UsageTracker(usage, runs_completed=10)
+        # base_cost = 50/10 = 5.0, available = min(40, 80) = 40
+        # implement = 5*1.0 = 5.0 ≤ 40 → affordable
+        assert tracker.can_afford_run("implement") is True
+        # implement with tier_mult=2.0 = 5*1.0*2.0 = 10.0 ≤ 40 → still OK
+        assert tracker.can_afford_run("implement", tier_multiplier=2.0) is True
+        # deep = 5*2.0 = 10.0 ≤ 40 → affordable
+        assert tracker.can_afford_run("deep") is True
+        # deep with tier_mult=2.0 = 5*2.0*2.0 = 20.0 ≤ 40 → still fits
+        assert tracker.can_afford_run("deep", tier_multiplier=2.0) is True
+
+    def test_tier_multiplier_causes_rejection(self, tmp_path):
+        """High tier multiplier can push an otherwise affordable mode over budget."""
+        usage = tmp_path / "usage.md"
+        usage.write_text("Session (5hr) : 80% (reset in 1h)\nWeekly (7 day) : 80% (Resets in 2d)")
+        tracker = UsageTracker(usage, runs_completed=10)
+        # base_cost = 80/10 = 8.0, available = min(10, 10) = 10
+        # implement = 8*1.0 = 8.0 ≤ 10 → affordable
+        assert tracker.can_afford_run("implement") is True
+        # implement with tier_mult=1.5 = 8*1.0*1.5 = 12.0 > 10 → rejected
+        assert tracker.can_afford_run("implement", tier_multiplier=1.5) is False
+
+    def test_tier_multiplier_default_is_noop(self, usage_file_standard):
+        """Default tier_multiplier=1.0 doesn't change behavior."""
+        tracker = UsageTracker(usage_file_standard, runs_completed=5)
+        assert tracker.can_afford_run("deep") == tracker.can_afford_run("deep", tier_multiplier=1.0)
+
 
 class TestBudgetMode:
     """Test budget_mode parameter for controlling which limits are active."""
@@ -437,6 +471,75 @@ class TestBudgetMode:
         assert tracker.can_afford_run("deep") is True
 
 
+class TestBurnRateDowngrade:
+    """_downgrade_if_burning_fast drops one tier when projected exhaustion is near."""
+
+    @staticmethod
+    def _seed_burn_rate(tmp_path, pct_per_min):
+        """Seed rolling buffer for a desired observed burn rate.
+
+        Records 5 samples evenly spaced so total_cost / span = pct_per_min.
+        """
+        base = datetime(2026, 5, 15, 12, 0, tzinfo=timezone.utc)
+        # 5 samples × pct_per_min each over 4 minutes spread.
+        # Total = 5 * pct_per_min, span = 4 → rate = 5/4 * pct_per_min.
+        # Use cost = (4/5) * pct_per_min so total/span = pct_per_min.
+        per_sample = pct_per_min * 4.0 / 5.0
+        for i in range(5):
+            burn_rate.record_run(
+                tmp_path,
+                cost_pct=per_sample,
+                timestamp=base + timedelta(minutes=i),
+            )
+
+    def test_downgrades_deep_to_implement_when_exhaustion_imminent(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        self._seed_burn_rate(tmp_path, pct_per_min=5.0)
+        # 50% remaining at 5%/min, deep multiplier 2.0 → ~5 min → downgrade
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=50.0, mode="deep",
+        )
+        assert mode == "implement"
+        assert downgraded_from == "deep"
+
+    def test_no_downgrade_with_slow_burn(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        self._seed_burn_rate(tmp_path, pct_per_min=0.1)
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=10.0, mode="deep",
+        )
+        assert mode == "deep"
+        assert downgraded_from is None
+
+    def test_no_downgrade_when_history_too_short(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        burn_rate.record_run(tmp_path, cost_pct=10.0)
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=50.0, mode="deep",
+        )
+        assert mode == "deep"
+        assert downgraded_from is None
+
+    def test_wait_mode_not_downgraded(self, tmp_path):
+        from app.iteration_manager import _downgrade_if_burning_fast
+        self._seed_burn_rate(tmp_path, pct_per_min=5.0)
+        mode, downgraded_from = _downgrade_if_burning_fast(
+            tmp_path, session_pct=95.0, mode="wait",
+        )
+        assert mode == "wait"
+        assert downgraded_from is None
+
+    def test_get_decision_reason_unchanged(self, tmp_path):
+        """UsageTracker.get_decision_reason no longer carries burn-rate text."""
+        usage = tmp_path / "usage.md"
+        usage.write_text(
+            "Session (5hr) : 50% (reset in 4h)\nWeekly (7 day) : 20% (Resets in 5d)"
+        )
+        tracker = UsageTracker(usage, budget_mode="session_only")
+        reason = tracker.get_decision_reason("implement")
+        assert "burn-rate" not in reason.lower()
+
+
 class TestGetBudgetMode:
     """Test _get_budget_mode() config reading."""
 
@@ -470,3 +573,83 @@ class TestGetBudgetMode:
         """Config load failure falls back to session_only."""
         with patch("app.utils.load_config", side_effect=OSError("nope")):
             assert _get_budget_mode() == "session_only"
+
+    def test_unexpected_error_never_raises(self):
+        """Any error type (not just ImportError/OSError/ValueError) is
+        swallowed — _get_budget_mode is a never-raises helper so unguarded
+        callers like run.py's wait-pause handler stay safe."""
+        with patch("app.utils.load_config", side_effect=TypeError("boom")):
+            assert _get_budget_mode() == "session_only"
+
+    def test_no_quota_provider_returns_disabled(self):
+        """When provider has no API quota, budget_mode is forced to disabled."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"budget_mode": "full"}
+        }):
+            with patch("app.cli_provider.get_provider") as mock_get_provider:
+                mock_provider = MagicMock()
+                mock_provider.has_api_quota.return_value = False
+                mock_get_provider.return_value = mock_provider
+                assert _get_budget_mode() == "disabled"
+
+    def test_quota_provider_respects_config(self):
+        """When provider has API quota, config budget_mode is respected."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"budget_mode": "full"}
+        }):
+            with patch("app.cli_provider.get_provider") as mock_get_provider:
+                mock_provider = MagicMock()
+                mock_provider.has_api_quota.return_value = True
+                mock_get_provider.return_value = mock_provider
+                assert _get_budget_mode() == "full"
+
+    def test_disabled_in_config_skips_provider_check(self):
+        """When config explicitly disables, provider check is skipped."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"budget_mode": "disabled"}
+        }):
+            # get_provider should not be called when mode is already disabled
+            with patch("app.cli_provider.get_provider") as mock_get_provider:
+                assert _get_budget_mode() == "disabled"
+                mock_get_provider.assert_not_called()
+
+    def test_provider_check_failure_uses_config(self):
+        """When provider check fails, falls back to config value."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"budget_mode": "session_only"}
+        }):
+            with patch("app.cli_provider.get_provider", side_effect=ImportError("nope")):
+                assert _get_budget_mode() == "session_only"
+
+    def test_unlimited_quota_overrides_budget_mode(self):
+        """unlimited_quota: true forces disabled regardless of budget_mode."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"budget_mode": "full", "unlimited_quota": True}
+        }):
+            assert _get_budget_mode() == "disabled"
+
+    def test_unlimited_quota_skips_provider_check(self):
+        """unlimited_quota: true returns disabled without checking provider."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"unlimited_quota": True}
+        }):
+            with patch("app.cli_provider.get_provider") as mock_get_provider:
+                assert _get_budget_mode() == "disabled"
+                mock_get_provider.assert_not_called()
+
+    def test_non_dict_usage_returns_session_only(self):
+        """Non-dict usage value (e.g. string) returns session_only safely."""
+        with patch("app.utils.load_config", return_value={"usage": "malformed"}):
+            with patch("app.config.is_unlimited_quota", return_value=False):
+                assert _get_budget_mode() == "session_only"
+
+    def test_unlimited_quota_false_uses_normal_path(self):
+        """unlimited_quota: false behaves like the flag is absent."""
+        with patch("app.utils.load_config", return_value={
+            "usage": {"budget_mode": "full", "unlimited_quota": False}
+        }):
+            with patch("app.cli_provider.get_provider") as mock_get_provider:
+                mock_provider = MagicMock()
+                mock_provider.has_api_quota.return_value = True
+                mock_get_provider.return_value = mock_provider
+                assert _get_budget_mode() == "full"

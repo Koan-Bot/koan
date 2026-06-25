@@ -10,17 +10,119 @@ Two public functions:
 """
 
 import logging
+import os
+import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from app.git_utils import run_git
 from app.projects_config import (
+    _find_project_entry,
     get_project_auto_merge,
     get_project_submit_to_repository,
     load_projects_config,
 )
 
 logger = logging.getLogger(__name__)
+
+_HTTPS_GITHUB_RE = re.compile(
+    r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$"
+)
+
+
+def _get_remote_url(remote: str, project_path: str) -> str:
+    """Return the URL for a named git remote, or empty string."""
+    rc, url, _ = run_git("remote", "get-url", remote, cwd=project_path)
+    return url.strip() if rc == 0 else ""
+
+
+def _authenticated_fetch_url(
+    remote_url: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Build a token-authenticated HTTPS URL from a plain HTTPS GitHub remote.
+
+    Returns (authenticated_url, token) or (None, None) when the remote is
+    not an HTTPS GitHub URL or no token is available.
+    """
+    m = _HTTPS_GITHUB_RE.match(remote_url)
+    if not m:
+        return None, None
+    try:
+        from app.github import run_gh
+        token = run_gh("auth", "token").strip()
+    except Exception as e:
+        logger.debug("gh auth token failed: %s", e)
+        token = ""
+    if not token:
+        return None, None
+    owner, repo = m.group("owner"), m.group("repo")
+    return f"https://x-access-token:{token}@github.com/{owner}/{repo}.git", token
+
+
+def _fetch_with_https_fallback(
+    remote: str,
+    refspec: str,
+    project_path: str,
+    timeout: int = 30,
+) -> Tuple[int, str, str]:
+    """Fetch a refspec, retrying with token auth when HTTPS remote lacks credentials.
+
+    Returns the same (rc, stdout, stderr) tuple as run_git.
+    """
+    rc, stdout, stderr = run_git(
+        "fetch", remote, refspec, cwd=project_path, timeout=timeout
+    )
+    if rc == 0:
+        return rc, stdout, stderr
+
+    remote_url = _get_remote_url(remote, project_path)
+    auth_url, token = _authenticated_fetch_url(remote_url)
+    if not auth_url:
+        return rc, stdout, stderr
+
+    logger.info("HTTPS fetch failed; retrying with gh token for %s", remote)
+    rc2, stdout2, stderr2 = run_git(
+        "fetch", auth_url, refspec, cwd=project_path, timeout=timeout
+    )
+    if token and stderr2:
+        stderr2 = stderr2.replace(token, "***")
+    return rc2, stdout2, stderr2
+
+
+def _fetch_branch_refspec(
+    remote: str, branch: str, project_path: str, timeout: int = 15
+) -> bool:
+    """Fetch a branch using an explicit refspec to guarantee tracking ref update.
+
+    Returns True on success.
+    """
+    refspec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+    rc, _, _ = _fetch_with_https_fallback(
+        remote, refspec, project_path, timeout=timeout
+    )
+    return rc == 0
+
+
+def _sync_secondary_remotes(
+    base_branch: str, primary_remote: str, project_path: str
+) -> None:
+    """Fetch base branch from all remotes besides the primary.
+
+    Ensures remote tracking refs are fresh for fork-aware operations
+    (e.g., --onto rebase needs both origin/ and upstream/ refs current).
+    Non-fatal — failures are logged but never abort the mission.
+    """
+    rc, stdout, _ = run_git("remote", cwd=project_path)
+    if rc != 0 or not stdout:
+        return
+    for remote in stdout.splitlines():
+        remote = remote.strip()
+        if not remote or remote == primary_remote:
+            continue
+        if not _fetch_branch_refspec(remote, base_branch, project_path):
+            logger.debug(
+                "Secondary fetch %s/%s failed (non-fatal)", remote, base_branch
+            )
 
 
 def detect_remote_default_branch(remote: str, project_path: str) -> str:
@@ -41,19 +143,26 @@ def detect_remote_default_branch(remote: str, project_path: str) -> str:
         if branch:
             return branch
 
-    # 2. Query remote (network call)
-    rc, stdout, _ = run_git(
-        "ls-remote", "--symref", remote, "HEAD",
-        cwd=project_path, timeout=15,
-    )
-    if rc == 0 and stdout:
-        for line in stdout.splitlines():
-            if line.startswith("ref:") and "HEAD" in line:
-                # Format: ref: refs/heads/master\tHEAD
-                ref_part = line.split()[1]
-                branch = ref_part.rsplit("/", 1)[-1]
-                if branch:
-                    return branch
+    # 2. Query remote (network call) — try named remote first, then
+    #    fall back to token-authenticated URL for HTTPS remotes.
+    targets = [remote]
+    remote_url = _get_remote_url(remote, project_path)
+    auth_url, _ = _authenticated_fetch_url(remote_url)
+    if auth_url:
+        targets.append(auth_url)
+
+    for target in targets:
+        rc, stdout, _ = run_git(
+            "ls-remote", "--symref", target, "HEAD",
+            cwd=project_path, timeout=15,
+        )
+        if rc == 0 and stdout:
+            for line in stdout.splitlines():
+                if line.startswith("ref:") and "HEAD" in line:
+                    ref_part = line.split()[1]
+                    branch = ref_part.rsplit("/", 1)[-1]
+                    if branch:
+                        return branch
 
     return "main"
 
@@ -68,6 +177,24 @@ class PrepResult:
     previous_branch: str = ""
     success: bool = True
     error: Optional[str] = None
+
+
+def _is_same_dir(path_a: str, path_b: str) -> bool:
+    """Return True when two paths resolve to the same directory.
+
+    Uses realpath so symlinks and trailing slashes compare equal. This is a
+    same-directory check, not a same-git-repository check: a subdirectory of
+    a repo will not compare equal to the repo root.
+    """
+    if not path_a or not path_b:
+        return False
+    try:
+        return os.path.realpath(path_a) == os.path.realpath(path_b)
+    except OSError as e:
+        logger.warning(
+            "realpath failed comparing '%s' and '%s': %s", path_a, path_b, e
+        )
+        return False
 
 
 def get_upstream_remote(
@@ -132,7 +259,7 @@ def prepare_project_branch(
             # auto-detection for repos whose default branch differs (e.g.
             # "master" repos when defaults say "main").
             projects = config.get("projects", {}) or {}
-            proj_cfg = projects.get(project_name, {}) or {}
+            proj_cfg = _find_project_entry(projects, project_name) or {}
             proj_am = proj_cfg.get("git_auto_merge", {}) or {}
             if proj_am.get("base_branch"):
                 config_explicit = True
@@ -141,9 +268,34 @@ def prepare_project_branch(
 
     base_branch = result.base_branch
 
-    # Fetch latest refs
-    rc, _, stderr = run_git(
-        "fetch", remote, base_branch, cwd=project_path, timeout=30
+    # Launching-repo guard: when the project being prepared IS the repo that
+    # launched the service (project_path == koan_root) and it is currently on a
+    # custom branch, leave it where it is. Switching it back to the base branch
+    # would discard the development branch the operator is testing. This guard
+    # applies ONLY to the launching repo — every other managed project still
+    # resets to its base branch before a mission, which is the intended behavior.
+    #
+    # Note: this compares against the config base_branch, not the auto-detected
+    # remote default (which is resolved only after the fetch below). The guard
+    # intentionally trusts the config value — a self-hosted operator on a dev
+    # branch does not want an auto-reset regardless of the real default branch.
+    if (
+        result.previous_branch
+        and result.previous_branch not in (base_branch, "HEAD")
+        and _is_same_dir(project_path, koan_root)
+    ):
+        logger.info(
+            "Project %s is the launching repo on custom branch '%s'; "
+            "staying put instead of switching to '%s'",
+            project_name, result.previous_branch, base_branch,
+        )
+        result.base_branch = result.previous_branch
+        return result
+
+    # Fetch latest refs (with HTTPS token fallback for repos cloned via
+    # gh with an unauthenticated HTTPS remote URL)
+    rc, _, stderr = _fetch_with_https_fallback(
+        remote, base_branch, project_path, timeout=30
     )
     if rc != 0 and not config_explicit:
         # Base branch was not explicitly configured — detect remote default
@@ -155,8 +307,8 @@ def prepare_project_branch(
             )
             base_branch = detected
             result.base_branch = detected
-            rc, _, stderr = run_git(
-                "fetch", remote, base_branch, cwd=project_path, timeout=30
+            rc, _, stderr = _fetch_with_https_fallback(
+                remote, base_branch, project_path, timeout=30
             )
     if rc != 0:
         result.success = False
@@ -214,5 +366,9 @@ def prepare_project_branch(
             result.success = False
             result.error = f"reset failed: {stderr}"
             return result
+
+    # Sync secondary remotes so fork-aware operations (--onto rebase,
+    # _is_ancestor checks) see fresh tracking refs for every remote.
+    _sync_secondary_remotes(base_branch, remote, project_path)
 
     return result

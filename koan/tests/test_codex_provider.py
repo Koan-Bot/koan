@@ -1,5 +1,6 @@
 """Tests for OpenAI Codex CLI provider (app.provider.codex)."""
 
+import json
 import os
 from unittest.mock import patch, MagicMock
 
@@ -105,14 +106,51 @@ class TestCodexProvider:
         result = self.provider.build_model_args(fallback="gpt-5.4-mini")
         assert result == []
 
-    # -- Output args (no-op) --
+    # -- Output args --
 
     def test_output_args_json(self):
-        """Codex output format is a no-op (uses plain text for Kōan compat)."""
-        assert self.provider.build_output_args("json") == []
+        """Codex emits --json for json / stream-json formats (JSONL events)."""
+        assert self.provider.build_output_args("json") == ["--json"]
+        assert self.provider.build_output_args("stream-json") == ["--json"]
 
     def test_output_args_empty(self):
+        """Plain text is the default; no flag emitted when format is unset."""
         assert self.provider.build_output_args() == []
+        assert self.provider.build_output_args("") == []
+
+    def test_last_message_file_args(self):
+        assert self.provider.supports_last_message_file() is True
+        assert self.provider.build_last_message_file_args("/tmp/out.txt") == [
+            "--output-last-message",
+            "/tmp/out.txt",
+        ]
+
+    def test_add_last_message_file_args_before_prompt(self):
+        cmd = ["codex", "exec", "--json", "prompt"]
+        result = self.provider.add_last_message_file_args(cmd, "/tmp/out.txt")
+        assert result == [
+            "codex",
+            "exec",
+            "--json",
+            "--output-last-message",
+            "/tmp/out.txt",
+            "prompt",
+        ]
+
+    def test_rewrite_prompt_for_stdin_uses_dash(self):
+        cmd = ["codex", "exec", "--json", "prompt"]
+        rewritten, prompt = self.provider.rewrite_prompt_for_stdin(cmd, "@stdin")
+        assert rewritten == ["codex", "exec", "--json", "-"]
+        assert prompt == "prompt"
+
+    def test_rewrite_prompt_for_stdin_existing_dash_unchanged(self):
+        cmd = ["codex", "exec", "--json", "-"]
+        rewritten, prompt = self.provider.rewrite_prompt_for_stdin(cmd, "@stdin")
+        assert rewritten == cmd
+        assert prompt is None
+
+    def test_invocation_lock_name(self):
+        assert self.provider.invocation_lock_name() == "codex-cli"
 
     # -- Max turns (no-op) --
 
@@ -143,13 +181,15 @@ class TestCodexProvider:
 
     # -- Permission args --
 
-    def test_permission_args_yolo(self):
-        """skip_permissions=True maps to --yolo."""
-        assert self.provider.build_permission_args(True) == ["--yolo"]
+    def test_permission_args_full_access(self):
+        """skip_permissions=True bypasses Codex approvals and sandbox."""
+        assert self.provider.build_permission_args(True) == [
+            "--dangerously-bypass-approvals-and-sandbox"
+        ]
 
-    def test_permission_args_full_auto(self):
-        """skip_permissions=False maps to --full-auto."""
-        assert self.provider.build_permission_args(False) == ["--full-auto"]
+    def test_permission_args_sandbox(self):
+        """skip_permissions=False maps to --sandbox workspace-write."""
+        assert self.provider.build_permission_args(False) == ["--sandbox", "workspace-write"]
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +204,18 @@ class TestCodexBuildCommand:
 
     def test_minimal(self):
         cmd = self.provider.build_command(prompt="hello")
-        # Default: codex --full-auto exec "hello"
+        # Default: codex exec --sandbox workspace-write "hello"
         assert cmd[0] == "codex"
-        assert "--full-auto" in cmd
+        assert "--sandbox" in cmd
+        assert "workspace-write" in cmd
         assert "exec" in cmd
         assert "hello" in cmd
 
     def test_with_skip_permissions(self):
         cmd = self.provider.build_command(prompt="hello", skip_permissions=True)
         assert cmd[0] == "codex"
-        assert "--yolo" in cmd
-        assert "--full-auto" not in cmd
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert "--sandbox" not in cmd
         assert "exec" in cmd
         assert "hello" in cmd
 
@@ -184,19 +225,19 @@ class TestCodexBuildCommand:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "gpt-5.4"
 
-    def test_model_before_exec(self):
-        """Global flags (--model) must appear before 'exec' subcommand."""
+    def test_model_after_exec(self):
+        """Exec-level flags (--model) must appear after 'exec' subcommand."""
         cmd = self.provider.build_command(prompt="do stuff", model="gpt-5.4")
         model_idx = cmd.index("--model")
         exec_idx = cmd.index("exec")
-        assert model_idx < exec_idx
+        assert model_idx > exec_idx
 
-    def test_yolo_before_exec(self):
-        """Permission flags must appear before 'exec'."""
+    def test_full_access_after_exec(self):
+        """Permission flags must appear after 'exec'."""
         cmd = self.provider.build_command(prompt="hello", skip_permissions=True)
-        yolo_idx = cmd.index("--yolo")
+        full_access_idx = cmd.index("--dangerously-bypass-approvals-and-sandbox")
         exec_idx = cmd.index("exec")
-        assert yolo_idx < exec_idx
+        assert full_access_idx > exec_idx
 
     def test_system_prompt_prepended(self):
         """System prompt is prepended to user prompt (no native flag)."""
@@ -204,9 +245,8 @@ class TestCodexBuildCommand:
             prompt="do the thing",
             system_prompt="You are helpful.",
         )
-        # Find the prompt argument (after 'exec')
-        exec_idx = cmd.index("exec")
-        prompt_text = cmd[exec_idx + 1]
+        # Prompt is the last element (after exec + flags)
+        prompt_text = cmd[-1]
         assert prompt_text.startswith("You are helpful.")
         assert "do the thing" in prompt_text
 
@@ -258,12 +298,11 @@ class TestCodexBuildCommand:
             system_prompt="Be concise.",
         )
         assert cmd[0] == "codex"
-        assert "--yolo" in cmd
+        assert cmd[1] == "exec"
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "--model" in cmd
-        assert "exec" in cmd
-        # Prompt should contain both system prompt and user prompt
-        exec_idx = cmd.index("exec")
-        prompt_text = cmd[exec_idx + 1]
+        # Prompt is the last element and contains both system + user prompt
+        prompt_text = cmd[-1]
         assert "Be concise." in prompt_text
         assert "implement feature X" in prompt_text
 
@@ -355,6 +394,87 @@ class TestCodexQuotaCheck:
         mock_run.side_effect = OSError("codex not found")
         available, detail = self.provider.check_quota_available("/tmp/project")
         assert available is True
+
+    @patch("subprocess.run")
+    def test_auth_failure_blocks_preflight(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout=json.dumps({
+                "type": "error",
+                "message": (
+                    'unexpected status 401 Unauthorized: {"detail":"Unauthorized"}'
+                ),
+            }),
+            stderr="",
+        )
+        available, detail = self.provider.check_quota_available("/tmp/project")
+        assert available is False
+        assert "401 Unauthorized" in detail
+
+    @patch("subprocess.run")
+    def test_refresh_token_reuse_blocks_preflight(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "Error: Your access token could not be refreshed because "
+                "your refresh token was already used."
+            ),
+        )
+        available, detail = self.provider.check_quota_available("/tmp/project")
+        assert available is False
+        assert "refresh token was already used" in detail
+
+
+# ---------------------------------------------------------------------------
+# detect_quota_exhaustion
+# ---------------------------------------------------------------------------
+
+class TestCodexQuotaDetection:
+    """Tests for CodexProvider.detect_quota_exhaustion()."""
+
+    def setup_method(self):
+        self.provider = CodexProvider()
+
+    def test_detects_quota_in_stderr(self):
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="",
+            stderr_text="HTTP 429 insufficient_quota",
+            exit_code=1,
+        ) is True
+
+    def test_detects_structured_error_event(self):
+        stdout = json.dumps({
+            "type": "error",
+            "error": {"message": "rate limit exceeded", "status_code": 429},
+        })
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text=stdout,
+            stderr_text="",
+            exit_code=0,
+        ) is True
+
+    def test_does_not_treat_turn_completed_usage_as_quota(self):
+        stdout = json.dumps({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 26549,
+                "cached_input_tokens": 22272,
+                "output_tokens": 1590,
+            },
+        })
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text=stdout,
+            stderr_text="",
+            exit_code=0,
+        ) is False
+
+    def test_ignores_plain_quota_words_on_success_stdout(self):
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="discussion: keep quota low and handle retries",
+            stderr_text="",
+            exit_code=0,
+        ) is False
 
 
 # ---------------------------------------------------------------------------

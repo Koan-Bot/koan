@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 from app.project_explorer import get_projects
+from app.utils import resolve_project_from_list
 
 
 def handle(ctx):
@@ -21,8 +22,12 @@ def handle(ctx):
     if not projects:
         return "No projects configured."
 
-    # Pick project: from args or random
-    target = ctx.args.strip().lower() if ctx.args else ""
+    # Pick project: from args or random, rest is focus context
+    args = ctx.args.strip() if ctx.args else ""
+    parts = args.split(None, 1)
+    target = parts[0].lower() if parts else ""
+    focus_context = parts[1] if len(parts) > 1 else ""
+
     name, path = _resolve_project(projects, target)
     if name is None:
         known = ", ".join(n for n, _ in projects)
@@ -31,11 +36,13 @@ def handle(ctx):
     # Queue the mission with clean format
     from app.utils import insert_pending_mission
 
-    mission_entry = f"- [project:{name}] /ai {name}"
+    context_suffix = f" {focus_context}" if focus_context else ""
+    mission_entry = f"- [project:{name}] /ai {name}{context_suffix}"
     missions_path = ctx.instance_dir / "missions.md"
     insert_pending_mission(missions_path, mission_entry)
 
-    return f"AI exploration queued for {name}"
+    context_hint = f" (focus: {focus_context})" if focus_context else ""
+    return f"AI exploration queued for {name}{context_hint}"
 
 
 def _resolve_project(
@@ -48,8 +55,4 @@ def _resolve_project(
     if not target:
         return random.choice(projects)
 
-    for name, path in projects:
-        if name.lower() == target:
-            return name, path
-
-    return None, None
+    return resolve_project_from_list(projects, target)

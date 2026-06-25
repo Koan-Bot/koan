@@ -6,13 +6,17 @@ from unittest.mock import patch
 
 from app.projects_config import (
     load_projects_config,
+    invalidate_projects_config_cache,
     get_projects_from_config,
     get_project_config,
     get_project_auto_merge,
+    get_project_autoreview,
     get_project_cli_provider,
     get_project_exploration,
     get_project_max_open_prs,
+    get_project_max_pending_branches,
     get_project_models,
+    get_project_review_verdict,
     get_project_submit_to_repository,
     get_project_tools,
     resolve_base_branch,
@@ -24,6 +28,14 @@ from app.projects_config import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_config_cache():
+    """Reset load_projects_config() mtime cache between tests."""
+    invalidate_projects_config_cache()
+    yield
+    invalidate_projects_config_cache()
 
 
 @pytest.fixture
@@ -513,6 +525,68 @@ class TestGetProjectExploration:
 
 
 # ---------------------------------------------------------------------------
+# get_project_autoreview
+# ---------------------------------------------------------------------------
+
+
+class TestGetProjectAutoreview:
+    """Tests for get_project_autoreview() — per-project autoreview flag."""
+
+    def test_defaults_to_false_when_key_missing(self):
+        config = {"projects": {"app": {"path": "/app"}}}
+        assert get_project_autoreview(config, "app") is False
+
+    def test_explicit_false_returns_false(self):
+        config = {"projects": {"app": {"path": "/app", "autoreview": False}}}
+        assert get_project_autoreview(config, "app") is False
+
+    def test_explicit_true_returns_true(self):
+        config = {"projects": {"app": {"path": "/app", "autoreview": True}}}
+        assert get_project_autoreview(config, "app") is True
+
+    def test_defaults_section_override(self):
+        config = {
+            "defaults": {"autoreview": True},
+            "projects": {"app": {"path": "/app"}},
+        }
+        assert get_project_autoreview(config, "app") is True
+
+    def test_project_overrides_defaults(self):
+        config = {
+            "defaults": {"autoreview": True},
+            "projects": {"app": {"path": "/app", "autoreview": False}},
+        }
+        assert get_project_autoreview(config, "app") is False
+
+    def test_string_false_coerced(self):
+        config = {"projects": {"app": {"path": "/app", "autoreview": "false"}}}
+        assert get_project_autoreview(config, "app") is False
+
+    def test_string_no_coerced(self):
+        config = {"projects": {"app": {"path": "/app", "autoreview": "no"}}}
+        assert get_project_autoreview(config, "app") is False
+
+    def test_string_zero_coerced(self):
+        config = {"projects": {"app": {"path": "/app", "autoreview": "0"}}}
+        assert get_project_autoreview(config, "app") is False
+
+    def test_string_true_coerced(self):
+        config = {"projects": {"app": {"path": "/app", "autoreview": "true"}}}
+        assert get_project_autoreview(config, "app") is True
+
+    def test_unknown_project_returns_default_false(self):
+        config = {"projects": {"app": {"path": "/app"}}}
+        assert get_project_autoreview(config, "unknown") is False
+
+    def test_none_project_config_inherits_defaults(self):
+        config = {
+            "defaults": {"autoreview": True},
+            "projects": {"app": None},
+        }
+        assert get_project_autoreview(config, "app") is True
+
+
+# ---------------------------------------------------------------------------
 # get_project_max_open_prs
 # ---------------------------------------------------------------------------
 
@@ -587,6 +661,79 @@ class TestGetProjectMaxOpenPrs:
             "projects": {"app": None},
         }
         assert get_project_max_open_prs(config, "app") == 8
+
+
+# ---------------------------------------------------------------------------
+# get_project_max_pending_branches
+# ---------------------------------------------------------------------------
+
+
+class TestGetProjectMaxPendingBranches:
+    """Tests for get_project_max_pending_branches() — per-project branch limit."""
+
+    def test_defaults_to_ten_when_key_missing(self):
+        config = {"projects": {"app": {"path": "/app"}}}
+        assert get_project_max_pending_branches(config, "app") == 10
+
+    def test_explicit_zero_returns_zero(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": 0}}}
+        assert get_project_max_pending_branches(config, "app") == 0
+
+    def test_positive_int_returns_value(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": 5}}}
+        assert get_project_max_pending_branches(config, "app") == 5
+
+    def test_string_int_coerced(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": "7"}}}
+        assert get_project_max_pending_branches(config, "app") == 7
+
+    def test_negative_returns_zero(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": -1}}}
+        assert get_project_max_pending_branches(config, "app") == 0
+
+    def test_none_returns_zero(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": None}}}
+        assert get_project_max_pending_branches(config, "app") == 0
+
+    def test_invalid_string_returns_zero(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": "abc"}}}
+        assert get_project_max_pending_branches(config, "app") == 0
+
+    def test_float_coerced_to_int(self):
+        config = {"projects": {"app": {"path": "/app", "max_pending_branches": 3.7}}}
+        assert get_project_max_pending_branches(config, "app") == 3
+
+    def test_defaults_section_applies(self):
+        config = {
+            "defaults": {"max_pending_branches": 15},
+            "projects": {"app": {"path": "/app"}},
+        }
+        assert get_project_max_pending_branches(config, "app") == 15
+
+    def test_project_overrides_defaults(self):
+        config = {
+            "defaults": {"max_pending_branches": 15},
+            "projects": {"app": {"path": "/app", "max_pending_branches": 3}},
+        }
+        assert get_project_max_pending_branches(config, "app") == 3
+
+    def test_unknown_project_returns_default_ten(self):
+        config = {"projects": {"app": {"path": "/app"}}}
+        assert get_project_max_pending_branches(config, "unknown") == 10
+
+    def test_unknown_project_inherits_defaults(self):
+        config = {
+            "defaults": {"max_pending_branches": 20},
+            "projects": {"app": {"path": "/app"}},
+        }
+        assert get_project_max_pending_branches(config, "unknown") == 20
+
+    def test_none_project_config_returns_default(self):
+        config = {
+            "defaults": {"max_pending_branches": 8},
+            "projects": {"app": None},
+        }
+        assert get_project_max_pending_branches(config, "app") == 8
 
 
 # ---------------------------------------------------------------------------
@@ -845,10 +992,10 @@ class TestGetProjectCliProvider:
 
     def test_unknown_project_returns_default(self):
         config = {
-            "defaults": {"cli_provider": "local"},
+            "defaults": {"cli_provider": "ollama-launch"},
             "projects": {"app": {"path": "/app"}},
         }
-        assert get_project_cli_provider(config, "unknown") == "local"
+        assert get_project_cli_provider(config, "unknown") == "ollama-launch"
 
     def test_normalizes_to_lowercase(self):
         config = {
@@ -1105,14 +1252,14 @@ projects:
 
         with patch("app.config._load_config", return_value={}):
             result = get_mission_tools("app")
-        assert result == "Read,Glob,Grep,Edit,Write,Bash"
+        assert result == "Read,Glob,Grep,Edit,Write,Bash,Skill"
 
     def test_empty_project_name_uses_global(self):
         from app.config import get_mission_tools
 
         with patch("app.config._load_config", return_value={}):
             result = get_mission_tools("")
-        assert result == "Read,Glob,Grep,Edit,Write,Bash"
+        assert result == "Read,Glob,Grep,Edit,Write,Bash,Skill"
 
     def test_defaults_section_tools_inherited(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KOAN_ROOT", str(tmp_path))
@@ -1323,6 +1470,90 @@ projects:
 
 
 # ---------------------------------------------------------------------------
+# get_project_review_verdict
+# ---------------------------------------------------------------------------
+
+
+class TestGetProjectReviewVerdict:
+    """Tests for get_project_review_verdict() — per-project verdict overrides."""
+
+    def test_returns_empty_when_not_configured(self):
+        config = {"projects": {"app": {"path": "/app"}}}
+        assert get_project_review_verdict(config, "app") == {}
+
+    def test_returns_approved_false(self):
+        config = {
+            "projects": {
+                "app": {
+                    "path": "/app",
+                    "review_verdict": {"approved": False},
+                }
+            }
+        }
+        result = get_project_review_verdict(config, "app")
+        assert result == {"approved": False}
+
+    def test_returns_all_keys(self):
+        config = {
+            "projects": {
+                "app": {
+                    "path": "/app",
+                    "review_verdict": {
+                        "approved": False,
+                        "body_enabled": False,
+                        "include_blockers": False,
+                    },
+                }
+            }
+        }
+        result = get_project_review_verdict(config, "app")
+        assert result == {"approved": False, "body_enabled": False, "include_blockers": False}
+
+    def test_fails_closed_on_non_bool_values(self):
+        config = {
+            "projects": {
+                "app": {
+                    "path": "/app",
+                    "review_verdict": {"approved": "yes", "body_enabled": True},
+                }
+            }
+        }
+        result = get_project_review_verdict(config, "app")
+        assert result["approved"] is False
+        assert result["body_enabled"] is True
+
+    def test_fails_closed_on_non_dict(self):
+        config = {
+            "projects": {
+                "app": {"path": "/app", "review_verdict": "garbage"},
+            }
+        }
+        result = get_project_review_verdict(config, "app")
+        assert result == {"approved": False}
+
+    def test_inherits_from_defaults(self):
+        config = {
+            "defaults": {"review_verdict": {"approved": False}},
+            "projects": {"app": {"path": "/app"}},
+        }
+        result = get_project_review_verdict(config, "app")
+        assert result == {"approved": False}
+
+    def test_project_overrides_defaults(self):
+        config = {
+            "defaults": {"review_verdict": {"approved": False}},
+            "projects": {
+                "app": {
+                    "path": "/app",
+                    "review_verdict": {"approved": True},
+                }
+            },
+        }
+        result = get_project_review_verdict(config, "app")
+        assert result == {"approved": True}
+
+
+# ---------------------------------------------------------------------------
 # get_project_submit_to_repository (additional tests in test_projects_config)
 # ---------------------------------------------------------------------------
 
@@ -1438,3 +1669,250 @@ class TestGetProjectSubmitToRepository:
         }
         result = get_project_submit_to_repository(config, "app")
         assert result == {"repo": "up/stream"}
+
+
+# ---------------------------------------------------------------------------
+# _validate_config — per-project key type checks
+# ---------------------------------------------------------------------------
+
+
+class TestValidateProjectKeyTypes:
+    """Tests for per-project key type validation added to _validate_config()."""
+
+    def test_git_auto_merge_must_be_dict(self, koan_root):
+        _write_yaml(koan_root, 'projects:\n  app:\n    path: /tmp/app\n    git_auto_merge: "yes"')
+        with pytest.raises(ValueError, match="projects.app.git_auto_merge.*must be dict"):
+            load_projects_config(koan_root)
+
+    def test_models_must_be_dict(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    models: 42")
+        with pytest.raises(ValueError, match="projects.app.models.*must be dict"):
+            load_projects_config(koan_root)
+
+    def test_tools_must_be_dict(self, koan_root):
+        _write_yaml(koan_root, 'projects:\n  app:\n    path: /tmp/app\n    tools: "bash"')
+        with pytest.raises(ValueError, match="projects.app.tools.*must be dict"):
+            load_projects_config(koan_root)
+
+    def test_github_must_be_dict(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    github: true")
+        with pytest.raises(ValueError, match="projects.app.github.*must be dict"):
+            load_projects_config(koan_root)
+
+    def test_cli_provider_must_be_str(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    cli_provider: 42")
+        with pytest.raises(ValueError, match="projects.app.cli_provider.*must be str"):
+            load_projects_config(koan_root)
+
+    def test_stagnation_accepts_dict(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    stagnation:\n      enabled: false")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_stagnation_accepts_bool(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    stagnation: false")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_stagnation_rejects_string(self, koan_root):
+        _write_yaml(koan_root, 'projects:\n  app:\n    path: /tmp/app\n    stagnation: "off"')
+        with pytest.raises(ValueError, match="projects.app.stagnation.*must be dict/bool"):
+            load_projects_config(koan_root)
+
+    def test_exploration_accepts_bool_and_str(self, koan_root):
+        _write_yaml(koan_root, 'projects:\n  app:\n    path: /tmp/app\n    exploration: "false"')
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_exploration_rejects_int(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    exploration: 42")
+        with pytest.raises(ValueError, match="projects.app.exploration.*must be bool/str"):
+            load_projects_config(koan_root)
+
+    def test_mcp_must_be_list(self, koan_root):
+        _write_yaml(koan_root, 'projects:\n  app:\n    path: /tmp/app\n    mcp: "file.json"')
+        with pytest.raises(ValueError, match="projects.app.mcp.*must be list"):
+            load_projects_config(koan_root)
+
+    def test_valid_project_config_passes(self, koan_root):
+        _write_yaml(koan_root, """
+projects:
+  app:
+    path: /tmp/app
+    git_auto_merge:
+      enabled: true
+    models:
+      mission: sonnet
+    tools:
+      mission: [Bash, Read]
+    cli_provider: claude
+    exploration: true
+    focus: false
+    max_open_prs: 5
+    mcp: [file.json]
+""")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_unknown_keys_pass_through(self, koan_root):
+        """Unknown keys are allowed — they're custom overrides."""
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    custom_flag: true")
+        config = load_projects_config(koan_root)
+        assert config["projects"]["app"]["custom_flag"] is True
+
+    def test_none_values_are_skipped(self, koan_root):
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    models:")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_defaults_section_validated(self, koan_root):
+        _write_yaml(koan_root, 'defaults:\n  git_auto_merge: "yes"')
+        with pytest.raises(ValueError, match="defaults.git_auto_merge.*must be dict"):
+            load_projects_config(koan_root)
+
+    def test_defaults_accepts_valid_types(self, koan_root):
+        _write_yaml(koan_root, "defaults:\n  git_auto_merge:\n    enabled: true\n  exploration: false")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_bool_rejected_where_int_expected(self, koan_root):
+        """max_open_prs accepts int/str but not bool (bool is subclass of int)."""
+        _write_yaml(koan_root, "projects:\n  app:\n    path: /tmp/app\n    max_open_prs: true")
+        with pytest.raises(ValueError, match="projects.app.max_open_prs.*got bool"):
+            load_projects_config(koan_root)
+
+
+# ---------------------------------------------------------------------------
+# get_review_ignore_config (now in config.py, reads from config.yaml)
+# ---------------------------------------------------------------------------
+# Tests for review_ignore config accessor live in test_config.py.
+
+
+# ---------------------------------------------------------------------------
+# devcontainer config key
+# ---------------------------------------------------------------------------
+
+class TestDevcontainerConfig:
+    def test_devcontainer_true_is_valid(self, koan_root):
+        _write_yaml(koan_root, """
+projects:
+  myapp:
+    path: /tmp/myapp
+    devcontainer: true
+""")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_devcontainer_false_is_valid(self, koan_root):
+        _write_yaml(koan_root, """
+projects:
+  myapp:
+    path: /tmp/myapp
+    devcontainer: false
+""")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_devcontainer_string_raises(self, koan_root):
+        _write_yaml(koan_root, """
+projects:
+  myapp:
+    path: /tmp/myapp
+    devcontainer: "yes"
+""")
+        with pytest.raises(ValueError, match="devcontainer"):
+            load_projects_config(koan_root)
+
+    def test_devcontainer_in_defaults_is_valid(self, koan_root):
+        _write_yaml(koan_root, """
+defaults:
+  devcontainer: true
+projects:
+  myapp:
+    path: /tmp/myapp
+""")
+        config = load_projects_config(koan_root)
+        assert config is not None
+
+    def test_get_project_devcontainer_enabled_true(self, koan_root):
+        from app.projects_config import get_project_devcontainer_enabled
+        _write_yaml(koan_root, """
+projects:
+  myapp:
+    path: /tmp/myapp
+    devcontainer: true
+""")
+        config = load_projects_config(koan_root)
+        assert get_project_devcontainer_enabled(config, "myapp") is True
+
+    def test_get_project_devcontainer_enabled_default_false(self, koan_root):
+        from app.projects_config import get_project_devcontainer_enabled
+        _write_yaml(koan_root, """
+projects:
+  myapp:
+    path: /tmp/myapp
+""")
+        config = load_projects_config(koan_root)
+        assert get_project_devcontainer_enabled(config, "myapp") is False
+
+    def test_get_project_devcontainer_enabled_inherits_default(self, koan_root):
+        from app.projects_config import get_project_devcontainer_enabled
+        _write_yaml(koan_root, """
+defaults:
+  devcontainer: true
+projects:
+  myapp:
+    path: /tmp/myapp
+""")
+        config = load_projects_config(koan_root)
+        assert get_project_devcontainer_enabled(config, "myapp") is True
+
+
+# ---------------------------------------------------------------------------
+# Projects.yaml path resolution (instance/ priority — issue #2074)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveProjectsConfigPath:
+    """instance/projects.yaml must win over repo-root projects.yaml."""
+
+    YAML_ROOT = "projects:\n  rootapp:\n    path: /tmp/rootapp\n"
+    YAML_INSTANCE = "projects:\n  instanceapp:\n    path: /tmp/instanceapp\n"
+
+    def test_instance_takes_priority(self, tmp_path):
+        from app.projects_config import resolve_projects_config_path
+        (tmp_path / "projects.yaml").write_text(self.YAML_ROOT)
+        (tmp_path / "instance").mkdir()
+        (tmp_path / "instance" / "projects.yaml").write_text(self.YAML_INSTANCE)
+
+        resolved = resolve_projects_config_path(str(tmp_path))
+        assert resolved == tmp_path / "instance" / "projects.yaml"
+
+    def test_root_fallback_when_no_instance(self, tmp_path):
+        from app.projects_config import resolve_projects_config_path
+        (tmp_path / "projects.yaml").write_text(self.YAML_ROOT)
+
+        resolved = resolve_projects_config_path(str(tmp_path))
+        assert resolved == tmp_path / "projects.yaml"
+
+    def test_returns_root_path_when_neither_exists(self, tmp_path):
+        from app.projects_config import resolve_projects_config_path
+        resolved = resolve_projects_config_path(str(tmp_path))
+        assert resolved == tmp_path / "projects.yaml"
+
+    def test_load_prefers_instance_config(self, tmp_path):
+        (tmp_path / "projects.yaml").write_text(self.YAML_ROOT)
+        (tmp_path / "instance").mkdir()
+        (tmp_path / "instance" / "projects.yaml").write_text(self.YAML_INSTANCE)
+
+        config = load_projects_config(str(tmp_path))
+        assert config is not None
+        assert "instanceapp" in config["projects"]
+        assert "rootapp" not in config["projects"]
+
+    def test_load_falls_back_to_root(self, tmp_path):
+        (tmp_path / "projects.yaml").write_text(self.YAML_ROOT)
+
+        config = load_projects_config(str(tmp_path))
+        assert config is not None
+        assert "rootapp" in config["projects"]

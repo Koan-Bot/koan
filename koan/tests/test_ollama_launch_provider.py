@@ -43,6 +43,10 @@ class TestOllamaLaunchBasics:
         assert available is True
         assert detail == ""
 
+    def test_has_api_quota_false(self):
+        """OllamaLaunchProvider has no metered API quota."""
+        assert self.provider.has_api_quota() is False
+
 
 # ---------------------------------------------------------------------------
 # Configuration resolution
@@ -103,7 +107,7 @@ class TestOllamaLaunchFlags:
 
     def test_tool_args_disallowed(self):
         result = self.provider.build_tool_args(disallowed_tools=["Edit", "Write"])
-        assert result == ["--disallowedTools", "Edit", "Write"]
+        assert result == ["--disallowedTools", "Edit,Write"]
 
     def test_tool_args_empty(self):
         assert self.provider.build_tool_args() == []
@@ -156,10 +160,132 @@ class TestOllamaLaunchFlags:
         assert self.provider.build_plugin_args() == []
         assert self.provider.build_plugin_args([]) == []
 
+    def test_supports_system_prompt_file(self):
+        assert self.provider.supports_system_prompt_file() is True
 
-# ---------------------------------------------------------------------------
-# Full command building
-# ---------------------------------------------------------------------------
+    def test_build_system_prompt_args(self):
+        assert self.provider.build_system_prompt_args("sys") == [
+            "--append-system-prompt", "sys",
+        ]
+        assert self.provider.build_system_prompt_args("") == []
+
+    def test_build_system_prompt_file_args(self):
+        assert self.provider.build_system_prompt_file_args("/tmp/sp.txt") == [
+            "--append-system-prompt-file", "/tmp/sp.txt",
+        ]
+        assert self.provider.build_system_prompt_file_args("") == []
+
+    def test_supports_session_resume(self):
+        assert self.provider.supports_session_resume() is True
+
+    def test_build_resume_args(self):
+        assert self.provider.build_resume_args("sess-123") == [
+            "--resume", "sess-123",
+        ]
+        assert self.provider.build_resume_args("") == []
+
+    def test_supports_stream_json(self):
+        assert self.provider.supports_stream_json() is True
+
+    def test_build_permission_args(self):
+        assert self.provider.build_permission_args(True) == [
+            "--dangerously-skip-permissions",
+        ]
+        assert self.provider.build_permission_args(False) == []
+
+    def test_build_effort_args(self):
+        assert self.provider.build_effort_args("high") == ["--effort", "high"]
+        assert self.provider.build_effort_args("") == []
+        assert self.provider.build_effort_args("bogus") == []
+
+    def test_build_thinking_args(self):
+        assert self.provider.build_thinking_args(enabled=True) == [
+            "--effort", "max",
+        ]
+        assert self.provider.build_thinking_args(enabled=False) == []
+
+    def test_output_args_stream_json_includes_verbose(self):
+        """Claude CLI requires --verbose alongside stream-json in print mode."""
+        result = self.provider.build_output_args("stream-json")
+        assert result == ["--output-format", "stream-json", "--verbose"]
+
+    def test_detect_quota_exhaustion_delegates_to_claude(self):
+        """Quota patterns match the underlying Claude CLI output."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="", stderr_text="rate limit exceeded", exit_code=1,
+        ) is True
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="", stderr_text="ok", exit_code=0,
+        ) is False
+
+    def test_detects_ollama_429_rejected(self):
+        """Detect Ollama-specific 429 rejection message."""
+        stderr = (
+            "API Error: Request rejected (429) · you have reached your "
+            "session usage limit, upgrade for higher limits: https://ollama.com/upgrade"
+        )
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="", stderr_text=stderr, exit_code=1,
+        ) is True
+
+    def test_detects_ollama_session_usage_limit(self):
+        """Detect Ollama 'reached your session usage limit' message."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="", stderr_text="reached your session usage limit", exit_code=1,
+        ) is True
+
+    def test_detects_ollama_upgrade_link(self):
+        """Detect Ollama upgrade link as quota signal."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="", stderr_text="visit https://ollama.com/upgrade", exit_code=1,
+        ) is True
+
+    def test_ollama_quota_patterns_are_case_insensitive(self):
+        """Ollama quota patterns are matched case-insensitively."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="", stderr_text="REQUEST REJECTED (429)", exit_code=1,
+        ) is True
+
+    def test_no_false_positive_on_normal_ollama_output(self):
+        """Normal Ollama output should not trigger quota detection."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="ollama launch claude started successfully",
+            stderr_text="",
+            exit_code=0,
+        ) is False
+
+    def test_no_false_positive_stdout_quota_text_exit_zero(self):
+        """Successful run quoting quota text in stdout must not false-pause."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="The error said Request rejected (429) and https://ollama.com/upgrade",
+            stderr_text="",
+            exit_code=0,
+        ) is False
+
+    def test_stdout_quota_text_detected_on_nonzero_exit(self):
+        """Stdout quota text triggers detection when exit_code != 0."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="Request rejected (429)",
+            stderr_text="",
+            exit_code=1,
+        ) is True
+
+    def test_no_false_positive_claude_quota_phrase_stdout_exit_zero(self):
+        """Inherited Claude patterns must not false-pause on exit-0 stdout."""
+        assert self.provider.detect_quota_exhaustion(
+            stdout_text="The assistant mentioned you are out of extra usage credits",
+            stderr_text="",
+            exit_code=0,
+        ) is False
+
+    def test_get_session_data_none_when_no_project(self):
+        """Session data depends on Claude CLI artifacts; missing project returns None."""
+        from unittest.mock import patch
+        with patch(
+            "app.provider.claude_session.collect_jsonl_tokens",
+            return_value=None,
+        ):
+            assert self.provider.get_session_data("/nonexistent") is None
 
 class TestOllamaLaunchBuildCommand:
     """Test complete command construction with -- separator."""
@@ -268,6 +394,57 @@ class TestOllamaLaunchBuildCommand:
                 cmd = self.provider.build_command(prompt="hello")
         assert "--" in cmd
 
+    def test_build_command_with_skip_permissions(self):
+        cmd = self.provider.build_command(
+            prompt="hi", skip_permissions=True,
+        )
+        sep_idx = cmd.index("--")
+        after_sep = cmd[sep_idx + 1:]
+        assert "--dangerously-skip-permissions" in after_sep
+
+    def test_build_command_with_system_prompt(self):
+        cmd = self.provider.build_command(
+            prompt="hi", system_prompt="Be helpful.",
+        )
+        sep_idx = cmd.index("--")
+        after_sep = cmd[sep_idx + 1:]
+        assert "--append-system-prompt" in after_sep
+        assert "Be helpful." in after_sep
+        # User prompt should NOT have the system prompt prepended
+        prompt_idx = after_sep.index("-p") + 1
+        assert after_sep[prompt_idx] == "hi"
+
+    def test_build_command_with_system_prompt_file(self):
+        cmd = self.provider.build_command(
+            prompt="hi",
+            system_prompt="should not appear",
+            system_prompt_file="/tmp/sp.txt",
+        )
+        sep_idx = cmd.index("--")
+        after_sep = cmd[sep_idx + 1:]
+        assert "--append-system-prompt-file" in after_sep
+        assert "/tmp/sp.txt" in after_sep
+        assert "should not appear" not in after_sep
+        assert "--append-system-prompt" not in after_sep
+
+    def test_build_command_with_resume(self):
+        cmd = self.provider.build_command(
+            prompt="hi", resume_session_id="sess-abc",
+        )
+        sep_idx = cmd.index("--")
+        after_sep = cmd[sep_idx + 1:]
+        assert "--resume" in after_sep
+        assert "sess-abc" in after_sep
+
+    def test_build_command_with_effort(self):
+        cmd = self.provider.build_command(
+            prompt="hi", effort="high",
+        )
+        sep_idx = cmd.index("--")
+        after_sep = cmd[sep_idx + 1:]
+        assert "--effort" in after_sep
+        assert "high" in after_sep
+
 
 # ---------------------------------------------------------------------------
 # Provider registry integration
@@ -331,9 +508,9 @@ class TestOllamaLaunchPidManager:
         from app.pid_manager import _needs_ollama
         assert _needs_ollama("ollama-launch") is False
 
-    def test_needs_ollama_true_for_local(self):
+    def test_needs_ollama_false_for_removed_local(self):
         from app.pid_manager import _needs_ollama
-        assert _needs_ollama("local") is True
+        assert _needs_ollama("local") is False
 
     def test_needs_ollama_true_for_ollama(self):
         from app.pid_manager import _needs_ollama

@@ -12,6 +12,7 @@ from app.github_reply import (
     fetch_thread_context,
     generate_reply,
     post_reply,
+    post_threaded_reply,
 )
 
 
@@ -224,7 +225,7 @@ class TestGenerateReply:
         # Verify read-only tools
         call_args = mock_run.call_args
         assert call_args[1]["allowed_tools"] == ["Read", "Glob", "Grep"]
-        assert call_args[1]["max_turns"] == 1
+        assert call_args[1]["max_turns"] == 5
 
     @patch("app.github_reply.load_prompt", return_value="prompt")
     @patch("app.github_reply.run_command", side_effect=RuntimeError("timeout"))
@@ -262,6 +263,92 @@ class TestPostReply:
     @patch("app.github_reply.api", side_effect=RuntimeError("API error"))
     def test_failure_returns_false(self, mock_api):
         assert post_reply("owner", "repo", "42", "reply") is False
+
+
+class TestPostThreadedReply:
+    """Tests for post_threaded_reply — threaded reply posting."""
+
+    @patch("app.github_reply.api")
+    def test_review_comment_uses_in_reply_to(self, mock_api):
+        """PR review comments should use native threading via in_reply_to."""
+        result = post_threaded_reply(
+            "owner", "repo", "42", "my reply",
+            comment_api_url="https://api.github.com/repos/owner/repo/pulls/comments/999",
+            comment_id="999",
+        )
+        assert result is True
+        mock_api.assert_called_once()
+        call_args = mock_api.call_args
+        assert call_args[0][0] == "repos/owner/repo/pulls/42/comments"
+        extra = call_args[1]["extra_args"]
+        assert "-F" in extra
+        assert "in_reply_to=999" in extra
+
+    @patch("app.github_reply.api")
+    def test_issue_comment_with_context_adds_blockquote(self, mock_api):
+        """Issue comments should include a blockquote of the original."""
+        result = post_threaded_reply(
+            "owner", "repo", "42", "my reply",
+            comment_api_url="https://api.github.com/repos/owner/repo/issues/comments/888",
+            comment_id="888",
+            comment_author="alice",
+            comment_body="What about this change?",
+        )
+        assert result is True
+        mock_api.assert_called_once()
+        call_args = mock_api.call_args
+        assert call_args[0][0] == "repos/owner/repo/issues/42/comments"
+        body_arg = [a for a in call_args[1]["extra_args"] if a.startswith("body=")][0]
+        assert "> @alice:" in body_arg
+        assert "What about this change?" in body_arg
+
+    @patch("app.github_reply.api")
+    def test_no_context_posts_plain_reply(self, mock_api):
+        """Without comment context, falls back to plain reply."""
+        result = post_threaded_reply(
+            "owner", "repo", "42", "my reply",
+        )
+        assert result is True
+        mock_api.assert_called_once()
+        call_args = mock_api.call_args
+        assert call_args[0][0] == "repos/owner/repo/issues/42/comments"
+
+    @patch("app.github_reply.api")
+    def test_review_comment_fallback_on_failure(self, mock_api):
+        """If threaded PR reply fails, falls back to issue comment."""
+        mock_api.side_effect = [RuntimeError("thread failed"), None]
+        result = post_threaded_reply(
+            "owner", "repo", "42", "my reply",
+            comment_api_url="https://api.github.com/repos/owner/repo/pulls/comments/999",
+            comment_id="999",
+            comment_author="bob",
+            comment_body="question here",
+        )
+        assert result is True
+        assert mock_api.call_count == 2
+        fallback_call = mock_api.call_args_list[1]
+        assert fallback_call[0][0] == "repos/owner/repo/issues/42/comments"
+
+    @patch("app.github_reply.api", side_effect=RuntimeError("API error"))
+    def test_total_failure_returns_false(self, mock_api):
+        """Returns False when all posting attempts fail."""
+        result = post_threaded_reply(
+            "owner", "repo", "42", "my reply",
+        )
+        assert result is False
+
+    @patch("app.github_reply.api")
+    def test_long_comment_body_truncated_in_blockquote(self, mock_api):
+        """Long comment bodies should be truncated in the blockquote."""
+        long_body = "x" * 200
+        result = post_threaded_reply(
+            "owner", "repo", "42", "my reply",
+            comment_author="alice",
+            comment_body=long_body,
+        )
+        assert result is True
+        body_arg = [a for a in mock_api.call_args[1]["extra_args"] if a.startswith("body=")][0]
+        assert "..." in body_arg
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +487,58 @@ class TestFetchThreadContextEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# fetch_thread_context — bot_username self-reply filtering
+# ---------------------------------------------------------------------------
+
+
+class TestFetchThreadContextBotFiltering:
+    """Tests that bot_username filters out the bot's own comments."""
+
+    @patch("app.github_reply.api")
+    def test_bot_comments_excluded_when_username_provided(self, mock_api):
+        """Comments from the bot are excluded when bot_username is set."""
+        mock_api.side_effect = [
+            json.dumps({"title": "T", "body": "B", "pull_request": None}),
+            json.dumps([
+                {"author": "human", "body": "real question"},
+                {"author": "koan-bot", "body": "my old reply"},
+                {"author": "other-user", "body": "follow-up"},
+            ]),
+        ]
+        ctx = fetch_thread_context("o", "r", "1", bot_username="koan-bot")
+        assert len(ctx["comments"]) == 2
+        authors = {c["author"] for c in ctx["comments"]}
+        assert "koan-bot" not in authors
+
+    @patch("app.github_reply.api")
+    def test_bot_filtering_case_insensitive(self, mock_api):
+        """Bot username filtering is case-insensitive."""
+        mock_api.side_effect = [
+            json.dumps({"title": "T", "body": "B", "pull_request": None}),
+            json.dumps([
+                {"author": "Koan-Bot", "body": "old reply"},
+                {"author": "human", "body": "question"},
+            ]),
+        ]
+        ctx = fetch_thread_context("o", "r", "1", bot_username="koan-bot")
+        assert len(ctx["comments"]) == 1
+        assert ctx["comments"][0]["author"] == "human"
+
+    @patch("app.github_reply.api")
+    def test_no_filtering_without_bot_username(self, mock_api):
+        """Without bot_username, all comments are included."""
+        mock_api.side_effect = [
+            json.dumps({"title": "T", "body": "B", "pull_request": None}),
+            json.dumps([
+                {"author": "koan-bot", "body": "my reply"},
+                {"author": "human", "body": "question"},
+            ]),
+        ]
+        ctx = fetch_thread_context("o", "r", "1")
+        assert len(ctx["comments"]) == 2
+
+
+# ---------------------------------------------------------------------------
 # generate_reply — additional edge cases
 # ---------------------------------------------------------------------------
 
@@ -474,3 +613,55 @@ class TestTruncateText:
         result = truncate_text("x" * 200, 100)
         assert len(result) < 200
         assert "(truncated)" in result
+
+
+class TestReplyCircuitBreaker:
+    """Per-thread reply budget enforced in post_reply / post_threaded_reply."""
+
+    def test_posts_allowed_until_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KOAN_ROOT", str(tmp_path))
+        (tmp_path / "instance").mkdir()
+        from app.github_reply import _enforce_reply_budget
+
+        with patch(
+            "app.github_config.get_github_max_replies_per_thread",
+            return_value=10,
+        ):
+            allowed = [_enforce_reply_budget("o", "r", "42") for _ in range(10)]
+            assert all(allowed)
+            # 11th call exceeds the cap → suppressed.
+            assert _enforce_reply_budget("o", "r", "42") is False
+
+    def test_post_reply_suppressed_when_breaker_tripped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KOAN_ROOT", str(tmp_path))
+        (tmp_path / "instance").mkdir()
+        from app.github_notification_tracker import record_thread_reply
+
+        for _ in range(10):
+            record_thread_reply(str(tmp_path / "instance"), "owner", "repo", "42")
+
+        with patch("app.github_reply.api") as mock_api, \
+                patch("app.notify.send_telegram"), \
+                patch(
+                    "app.github_config.get_github_max_replies_per_thread",
+                    return_value=10,
+                ):
+            assert post_reply("owner", "repo", "42", "body") is False
+            mock_api.assert_not_called()
+
+    def test_breaker_disabled_when_cap_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KOAN_ROOT", str(tmp_path))
+        (tmp_path / "instance").mkdir()
+        from app.github_reply import _enforce_reply_budget
+
+        with patch(
+            "app.github_config.get_github_max_replies_per_thread",
+            return_value=0,
+        ):
+            # Cap 0 disables the breaker — always allowed.
+            assert all(_enforce_reply_budget("o", "r", "42") for _ in range(25))
+
+    def test_fails_open_without_koan_root(self, monkeypatch):
+        monkeypatch.delenv("KOAN_ROOT", raising=False)
+        from app.github_reply import _enforce_reply_budget
+        assert _enforce_reply_budget("o", "r", "42") is True

@@ -14,6 +14,7 @@ into the mission queue.
 import json
 import logging
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -78,7 +79,7 @@ def handle(ctx):
     thread_context = github_reply.fetch_thread_context(owner, repo, issue_number)
 
     # Fetch the question text from the specific comment
-    question_text, comment_author = _fetch_question_and_author(
+    question_text, comment_author, comment_api_url = _fetch_question_and_author(
         comment_id, owner, repo, comment_url
     )
     if not question_text:
@@ -96,8 +97,14 @@ def handle(ctx):
     if not reply_text:
         return "❌ Failed to generate reply. Check logs for details."
 
-    # Post reply to GitHub
-    if not github_reply.post_reply(owner, repo, issue_number, reply_text):
+    # Post reply threaded to the original comment
+    if not github_reply.post_threaded_reply(
+        owner, repo, issue_number, reply_text,
+        comment_api_url=comment_api_url or "",
+        comment_id=comment_id,
+        comment_author=comment_author or "",
+        comment_body=question_text,
+    ):
         return "❌ Failed to post reply to GitHub."
 
     # Build Telegram notification
@@ -146,16 +153,17 @@ def _fetch_question_and_author(
     owner: str,
     repo: str,
     comment_url: str,
-) -> Tuple[Optional[str], Optional[str]]:
-    """Fetch the comment body and author from GitHub.
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Fetch the comment body, author, and API URL from GitHub.
 
     Tries issue comment endpoint first, then PR review comment endpoint.
-    Returns (body, author) or (None, None) on failure.
+    Returns (body, author, api_url) or (None, None, None) on failure.
+    The api_url is the full GitHub API URL of the matched comment.
     """
     from app.github import api
 
     if not comment_id:
-        return None, None
+        return None, None, None
 
     # Determine endpoint based on URL fragment format
     is_review_comment = "#discussion_r" in comment_url
@@ -182,12 +190,13 @@ def _fetch_question_and_author(
             data = json.loads(raw)
             body = data.get("body", "").strip()
             author = data.get("user", {}).get("login", "")
+            api_url = data.get("url", "")
             if body:
-                return body, author
+                return body, author, api_url
         except (RuntimeError, json.JSONDecodeError, KeyError):
             continue
 
-    return None, None
+    return None, None, None
 
 
 def _generate_reply(
@@ -229,14 +238,20 @@ def _generate_reply(
         QUESTION=question,
         AUTHOR=comment_author,
     )
-    raw = run_command(
-        prompt=prompt,
-        project_path=project_path,
-        allowed_tools=["Read", "Glob", "Grep"],
-        model_key="chat",
-        max_turns=1,
-        timeout=120,
-    )
+    try:
+        raw = run_command(
+            prompt=prompt,
+            project_path=project_path,
+            allowed_tools=["Read", "Glob", "Grep"],
+            model_key="chat",
+            max_turns=5,
+            timeout=300,
+            max_turns_source=None,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        log.warning("ask: reply generation failed: %s", e)
+        return None
     if not raw:
+        log.warning("ask: reply generation returned empty output")
         return None
     return github_reply.clean_reply(raw)

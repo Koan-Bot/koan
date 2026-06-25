@@ -3,6 +3,8 @@
 import json
 import os
 import sys
+from contextlib import ExitStack
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +18,7 @@ class TestBuildMissionCommand:
     def test_basic_command(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="Do something")
+        cmd, _ = build_mission_command(prompt="Do something")
         # Provider-agnostic: check for prompt and output format, not specific binary
         assert "-p" in cmd or any("Do something" in arg for arg in cmd)
         assert "--output-format" in cmd or any("json" in arg for arg in cmd)
@@ -25,7 +27,7 @@ class TestBuildMissionCommand:
     def test_includes_allowed_tools(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test")
         # Tools should be present in the command (format depends on provider)
         cmd_str = " ".join(cmd)
         # Either Claude format (--allowedTools Read,Write,...) or converted to provider format
@@ -35,7 +37,7 @@ class TestBuildMissionCommand:
     def test_extra_flags_appended(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test", extra_flags="--model opus")
+        cmd, _ = build_mission_command(prompt="test", extra_flags="--model opus")
         assert "--model" in cmd
         assert "opus" in cmd
 
@@ -43,16 +45,16 @@ class TestBuildMissionCommand:
     def test_empty_extra_flags_ignored(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test", extra_flags="")
-        base = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test", extra_flags="")
+        base, _ = build_mission_command(prompt="test")
         assert len(cmd) == len(base)
 
     @patch("app.cli_provider.get_provider_name", return_value="claude")
     def test_whitespace_extra_flags_ignored(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test", extra_flags="   ")
-        base = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test", extra_flags="   ")
+        base, _ = build_mission_command(prompt="test")
         assert len(cmd) == len(base)
 
     @patch.dict("os.environ", {"KOAN_CLI_PROVIDER": "copilot"})
@@ -63,7 +65,7 @@ class TestBuildMissionCommand:
 
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test")
         # When copilot is configured, should use gh copilot
         assert "gh" in cmd or "copilot" in cmd[0]
 
@@ -74,7 +76,7 @@ class TestBuildMissionCommand:
     def test_plugin_dirs_forwarded(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(
+        cmd, _ = build_mission_command(
             prompt="test",
             plugin_dirs=["/tmp/koan-plugins"],
         )
@@ -86,7 +88,7 @@ class TestBuildMissionCommand:
     def test_plugin_dirs_none_excluded(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="test")
+        cmd, _ = build_mission_command(prompt="test")
         assert "--plugin-dir" not in cmd
 
 
@@ -159,6 +161,74 @@ class TestParseClaudeOutput:
 
         raw = json.dumps({"status": "ok", "data": "test"})
         assert parse_claude_output(raw) == raw.strip()
+
+
+class TestCheckJsonSuccess:
+    """Test check_json_success — detects successful sessions from JSON output."""
+
+    def test_is_error_false_means_success(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"type": "result", "is_error": False, "result": "done"}))
+        assert check_json_success(str(f)) is True
+
+    def test_is_error_true_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"type": "result", "is_error": True}))
+        assert check_json_success(str(f)) is False
+
+    def test_subtype_success_means_success(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"type": "result", "subtype": "success"}))
+        assert check_json_success(str(f)) is True
+
+    def test_empty_file_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text("")
+        assert check_json_success(str(f)) is False
+
+    def test_missing_file_means_failure(self):
+        from app.mission_runner import check_json_success
+
+        assert check_json_success("/nonexistent/path") is False
+
+    def test_invalid_json_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text("not json at all")
+        assert check_json_success(str(f)) is False
+
+    def test_no_relevant_keys_means_failure(self, tmp_path):
+        from app.mission_runner import check_json_success
+
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps({"status": "ok"}))
+        assert check_json_success(str(f)) is False
+
+    def test_real_world_success_output(self, tmp_path):
+        """Reproduce the exact pattern from the run 2 failure."""
+        from app.mission_runner import check_json_success
+
+        output = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "duration_ms": 529131,
+            "result": "Mission complete.",
+            "stop_reason": "end_turn",
+            "total_cost_usd": 1.88,
+        }
+        f = tmp_path / "stdout.json"
+        f.write_text(json.dumps(output))
+        assert check_json_success(str(f)) is True
 
 
 class TestArchivePending:
@@ -355,14 +425,41 @@ class TestTriggerReflection:
 class TestCheckAutoMerge:
     """Test check_auto_merge function."""
 
-    @patch("app.git_auto_merge.auto_merge_branch")
+    @patch("app.git_auto_merge.auto_merge_branch", return_value=0)
     @patch("app.git_sync.run_git", return_value="koan/my-feature")
     @patch("app.config.get_branch_prefix", return_value="koan/")
-    def test_checks_koan_branch(self, mock_prefix, mock_git, mock_merge, tmp_path):
+    def test_returns_branch_when_auto_merge_enabled(self, mock_prefix, mock_git, mock_merge, tmp_path):
         from app.mission_runner import check_auto_merge
 
-        result = check_auto_merge(str(tmp_path), "project", str(tmp_path))
+        config = {"projects": {"project": {"git_auto_merge": {
+            "enabled": True, "rules": [{"pattern": "koan/*", "auto_merge": True}],
+        }}}}
+        result = check_auto_merge(str(tmp_path), "project", str(tmp_path), projects_config=config)
         assert result == "koan/my-feature"
+        mock_merge.assert_called_once()
+
+    @patch("app.git_auto_merge.auto_merge_branch", return_value=0)
+    @patch("app.git_sync.run_git", return_value="koan/my-feature")
+    @patch("app.config.get_branch_prefix", return_value="koan/")
+    def test_returns_none_when_auto_merge_not_configured(self, mock_prefix, mock_git, mock_merge, tmp_path):
+        from app.mission_runner import check_auto_merge
+
+        config = {"projects": {"project": {"path": str(tmp_path)}}}
+        result = check_auto_merge(str(tmp_path), "project", str(tmp_path), projects_config=config)
+        assert result is None
+        mock_merge.assert_called_once()
+
+    @patch("app.git_auto_merge.auto_merge_branch", return_value=0)
+    @patch("app.git_sync.run_git", return_value="koan/my-feature")
+    @patch("app.config.get_branch_prefix", return_value="koan/")
+    def test_returns_none_when_enabled_but_no_matching_rule(self, mock_prefix, mock_git, mock_merge, tmp_path):
+        from app.mission_runner import check_auto_merge
+
+        config = {"projects": {"project": {"git_auto_merge": {
+            "enabled": True, "rules": [{"pattern": "koan/release-*", "auto_merge": True}],
+        }}}}
+        result = check_auto_merge(str(tmp_path), "project", str(tmp_path), projects_config=config)
+        assert result is None
         mock_merge.assert_called_once()
 
     @patch("app.git_sync.run_git", return_value="main")
@@ -438,6 +535,79 @@ class TestRunPostMission:
         mock_archive.assert_not_called()
         mock_reflect.assert_not_called()
         mock_merge.assert_not_called()
+
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    def test_unreliable_quota_check_does_not_crash(
+        self, mock_usage, mock_archive, mock_reflect, mock_merge, tmp_path
+    ):
+        """Regression: QUOTA_CHECK_UNRELIABLE path called undefined log() function.
+
+        When handle_quota_exhaustion returns QUOTA_CHECK_UNRELIABLE (both log
+        files unreadable), the code must log via _log_runner — not bare log()
+        which raises NameError.
+        """
+        from app.mission_runner import run_post_mission
+        from app.quota_handler import QUOTA_CHECK_UNRELIABLE
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        with patch(
+            "app.quota_handler.handle_quota_exhaustion",
+            return_value=QUOTA_CHECK_UNRELIABLE,
+        ):
+            result = run_post_mission(
+                instance_dir=instance_dir,
+                project_name="koan",
+                project_path=str(tmp_path),
+                run_num=5,
+                exit_code=0,
+                stdout_file="/tmp/out.json",
+                stderr_file="/tmp/err.txt",
+            )
+
+        # Pipeline continues — quota is NOT flagged as exhausted
+        assert result["quota_exhausted"] is False
+        assert result["success"] is True
+        assert result.get("quota_check_unreliable") is True
+
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    def test_unreliable_quota_check_sends_telegram_alert(
+        self, mock_usage, mock_archive, mock_reflect, mock_merge, tmp_path
+    ):
+        """QUOTA_CHECK_UNRELIABLE must send a dedicated outbox notification."""
+        from app.mission_runner import run_post_mission
+        from app.quota_handler import QUOTA_CHECK_UNRELIABLE
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        with patch(
+            "app.quota_handler.handle_quota_exhaustion",
+            return_value=QUOTA_CHECK_UNRELIABLE,
+        ):
+            run_post_mission(
+                instance_dir=instance_dir,
+                project_name="testproj",
+                project_path=str(tmp_path),
+                run_num=5,
+                exit_code=0,
+                stdout_file="/tmp/out.json",
+                stderr_file="/tmp/err.txt",
+                mission_title="fix the widget",
+            )
+
+        outbox = Path(instance_dir) / "outbox.md"
+        assert outbox.exists(), "outbox.md should have been created"
+        content = outbox.read_text()
+        assert "Quota protection disabled" in content
+        assert "testproj" in content
 
     @patch("app.mission_runner.check_auto_merge", return_value=None)
     @patch("app.mission_runner.trigger_reflection", return_value=False)
@@ -646,6 +816,36 @@ class TestRunPostMissionKoanRoot:
 
         call_kwargs = mock_quota.call_args[1]
         assert call_kwargs["koan_root"] == str(tmp_path)
+
+    @patch("app.mission_runner.commit_instance")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.quota_handler.handle_quota_exhaustion", return_value=None)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    def test_passes_provider_name_to_quota_handler(
+        self, mock_usage, mock_quota, mock_archive, mock_reflect,
+        mock_merge, mock_commit, tmp_path
+    ):
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        run_post_mission(
+            instance_dir=instance_dir,
+            project_name="koan",
+            project_path=str(tmp_path),
+            run_num=1,
+            exit_code=0,
+            stdout_file="/tmp/out.json",
+            stderr_file="/tmp/err.txt",
+            provider_name="codex",
+        )
+
+        call_kwargs = mock_quota.call_args[1]
+        assert call_kwargs["provider_name"] == "codex"
+        assert call_kwargs["exit_code"] == 0
 
 
 class TestCommitInstance:
@@ -886,6 +1086,80 @@ class TestCLIPostMission:
             ])
         assert exc_info.value.code == 1
 
+    @patch("app.mission_runner.run_post_mission")
+    def test_cli_post_mission_emits_step_failed(self, mock_run, tmp_path, capsys):
+        """STEP_FAILED|<name> emitted to stderr for failed/timed-out steps."""
+        from app.mission_runner import _cli_post_mission
+
+        mock_run.return_value = {
+            "success": False,
+            "usage_updated": True,
+            "pending_archived": False,
+            "reflection_written": False,
+            "auto_merge_branch": None,
+            "quota_exhausted": False,
+            "quota_info": None,
+            "pipeline_steps": {
+                "usage_update": {"status": "success", "detail": "0.1s"},
+                "verification": {"status": "fail", "detail": "failed after 2s: oops"},
+                "reflection": {"status": "timeout", "detail": "pipeline deadline exceeded"},
+                "auto_merge": {"status": "skipped", "detail": "non-zero exit code"},
+            },
+        }
+
+        with pytest.raises(SystemExit) as exc_info:
+            _cli_post_mission([
+                "--instance", str(tmp_path),
+                "--project-name", "koan",
+                "--project-path", str(tmp_path),
+                "--run-num", "4",
+                "--exit-code", "1",
+                "--stdout-file", "/tmp/out",
+                "--stderr-file", "/tmp/err",
+            ])
+        assert exc_info.value.code == 1
+
+        captured = capsys.readouterr()
+        assert "STEP_FAILED|verification" in captured.err
+        assert "STEP_FAILED|reflection" in captured.err
+        # success and skipped steps must NOT appear
+        assert "STEP_FAILED|usage_update" not in captured.err
+        assert "STEP_FAILED|auto_merge" not in captured.err
+
+    @patch("app.mission_runner.run_post_mission")
+    def test_cli_post_mission_no_step_failed_on_success(self, mock_run, tmp_path, capsys):
+        """No STEP_FAILED lines when all steps succeed."""
+        from app.mission_runner import _cli_post_mission
+
+        mock_run.return_value = {
+            "success": True,
+            "usage_updated": True,
+            "pending_archived": True,
+            "reflection_written": True,
+            "auto_merge_branch": None,
+            "quota_exhausted": False,
+            "quota_info": None,
+            "pipeline_steps": {
+                "usage_update": {"status": "success", "detail": "0.1s"},
+                "verification": {"status": "success", "detail": "1.2s"},
+            },
+        }
+
+        with pytest.raises(SystemExit) as exc_info:
+            _cli_post_mission([
+                "--instance", str(tmp_path),
+                "--project-name", "koan",
+                "--project-path", str(tmp_path),
+                "--run-num", "5",
+                "--exit-code", "0",
+                "--stdout-file", "/tmp/out",
+                "--stderr-file", "/tmp/err",
+            ])
+        assert exc_info.value.code == 0
+
+        captured = capsys.readouterr()
+        assert "STEP_FAILED" not in captured.err
+
 
 class TestReadPendingContent:
     """Test _read_pending_content private helper."""
@@ -927,6 +1201,16 @@ class TestReadPendingContent:
         # Simulate OSError during read
         with patch.object(Path, "read_text", side_effect=OSError("Permission denied")):
             content = _read_pending_content(str(tmp_path))
+        assert content == ""
+
+    def test_no_toctou_race_on_missing_file(self, tmp_path):
+        """File gone before read_text — handled without exists() check."""
+        from app.mission_runner import _read_pending_content
+
+        journal_dir = tmp_path / "journal"
+        journal_dir.mkdir()
+        # No pending.md created — read_text hits FileNotFoundError directly
+        content = _read_pending_content(str(tmp_path))
         assert content == ""
 
 
@@ -992,6 +1276,11 @@ class TestRecordSessionOutcome:
             duration_minutes=15,
             journal_content="journal content",
             mission_title="",
+            mission_type=None,
+            pipeline_timed_out=False,
+            provider="",
+            model="",
+            last_action="",
         )
 
     @patch("app.session_tracker.record_outcome")
@@ -1020,7 +1309,26 @@ class TestRecordSessionOutcome:
         # Should not raise
         _record_session_outcome(str(tmp_path), "koan", "deep", 30, "text")
         captured = capsys.readouterr()
-        assert "Session outcome recording failed" in captured.err
+        assert "Session outcome recording failed" in (captured.err + captured.out)
+
+    @patch("app.session_tracker.record_outcome")
+    def test_forwards_mission_type_override(self, mock_record, tmp_path):
+        from app.mission_runner import _record_session_outcome
+
+        _record_session_outcome(
+            str(tmp_path), "koan", "deep", 10, "content",
+            mission_type="contemplative",
+        )
+        mock_record.assert_called_once()
+        assert mock_record.call_args.kwargs["mission_type"] == "contemplative"
+
+    @patch("app.session_tracker.record_outcome")
+    def test_mission_type_none_by_default(self, mock_record, tmp_path):
+        from app.mission_runner import _record_session_outcome
+
+        _record_session_outcome(str(tmp_path), "koan", "deep", 10, "content")
+        mock_record.assert_called_once()
+        assert mock_record.call_args.kwargs["mission_type"] is None
 
 
 class TestRunPostMissionDuration:
@@ -1173,14 +1481,18 @@ class TestCheckAutoMergeVerifyBlocked:
         captured = capsys.readouterr()
         assert "blocked by verification failure" in captured.out
 
-    @patch("app.git_auto_merge.auto_merge_branch")
+    @patch("app.git_auto_merge.auto_merge_branch", return_value=0)
     @patch("app.git_sync.run_git", return_value="koan/feature")
     @patch("app.config.get_branch_prefix", return_value="koan/")
     def test_verify_not_blocked_allows_merge(self, mock_prefix, mock_git, mock_merge, tmp_path):
         from app.mission_runner import check_auto_merge
 
+        config = {"projects": {"project": {"git_auto_merge": {
+            "enabled": True, "rules": [{"pattern": "koan/*", "auto_merge": True}],
+        }}}}
         result = check_auto_merge(
-            str(tmp_path), "project", str(tmp_path), verify_blocked=False
+            str(tmp_path), "project", str(tmp_path),
+            verify_blocked=False, projects_config=config,
         )
         assert result == "koan/feature"
         mock_merge.assert_called_once()
@@ -1227,7 +1539,7 @@ class TestCheckAutoMergeErrors:
         result = check_auto_merge(str(tmp_path), "koan", str(tmp_path))
         assert result is None
         captured = capsys.readouterr()
-        assert "Auto-merge check failed" in captured.err
+        assert "Auto-merge check failed" in (captured.err + captured.out)
 
     @patch("app.git_sync.run_git", side_effect=Exception("git error"))
     def test_returns_none_on_git_error(self, mock_git, tmp_path, capsys):
@@ -1236,7 +1548,7 @@ class TestCheckAutoMergeErrors:
         result = check_auto_merge(str(tmp_path), "koan", str(tmp_path))
         assert result is None
         captured = capsys.readouterr()
-        assert "Auto-merge check failed" in captured.err
+        assert "Auto-merge check failed" in (captured.err + captured.out)
 
 
 class TestTriggerReflectionErrors:
@@ -1249,7 +1561,7 @@ class TestTriggerReflectionErrors:
         result = trigger_reflection(str(tmp_path), "audit", 60, project_name="koan")
         assert result is False
         captured = capsys.readouterr()
-        assert "Reflection failed" in captured.err
+        assert "Reflection failed" in (captured.err + captured.out)
 
 
 class TestParseClaudeOutputEdgeCases:
@@ -1336,7 +1648,7 @@ class TestBuildMissionCommandReviewMode:
     def test_review_mode_uses_read_only_tools(self, mock_provider):
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(prompt="review code", autonomous_mode="review")
+        cmd, _ = build_mission_command(prompt="review code", autonomous_mode="review")
         cmd_str = " ".join(cmd)
         # Review mode must include Read, Glob, Grep
         assert "Read" in cmd_str
@@ -1357,7 +1669,7 @@ class TestBuildMissionCommandReviewMode:
             "review_mode": "haiku",
             "fallback": "sonnet",
         }):
-            cmd = build_mission_command(
+            cmd, _ = build_mission_command(
                 prompt="review code", autonomous_mode="review"
             )
             cmd_str = " ".join(cmd)
@@ -1373,7 +1685,7 @@ class TestBuildMissionCommandReviewMode:
             "review_mode": "",
             "fallback": "sonnet",
         }):
-            cmd = build_mission_command(
+            cmd, _ = build_mission_command(
                 prompt="review code", autonomous_mode="review"
             )
             cmd_str = " ".join(cmd)
@@ -1386,7 +1698,7 @@ class TestBuildMissionCommandReviewMode:
         from app.mission_runner import build_mission_command
 
         for mode in ("implement", "deep"):
-            cmd = build_mission_command(prompt="code", autonomous_mode=mode)
+            cmd, _ = build_mission_command(prompt="code", autonomous_mode=mode)
             cmd_str = " ".join(cmd)
             # Non-review modes get the full toolset from config
             assert "Bash" in cmd_str or "Read" in cmd_str
@@ -1421,7 +1733,7 @@ class TestBuildMissionCommandProjectOverrides:
         """Multiple plugin dirs should all appear as --plugin-dir flags."""
         from app.mission_runner import build_mission_command
 
-        cmd = build_mission_command(
+        cmd, _ = build_mission_command(
             prompt="test",
             plugin_dirs=["/tmp/plugin-a", "/tmp/plugin-b"],
         )
@@ -1647,6 +1959,7 @@ class TestCLIPostMissionOutputDetails:
             mission_title="audit security",
             autonomous_mode="deep",
             start_time=1700000000,
+            provider_name="",
         )
 
 
@@ -1858,13 +2171,16 @@ class TestRunPostMissionOrdering:
 class TestCheckAutoMergeBranchPrefix:
     """Test check_auto_merge with various branch prefixes."""
 
-    @patch("app.git_auto_merge.auto_merge_branch")
+    @patch("app.git_auto_merge.auto_merge_branch", return_value=0)
     @patch("app.git_sync.run_git", return_value="koan.atoomic/my-feature")
     @patch("app.config.get_branch_prefix", return_value="koan.atoomic/")
     def test_matches_dotted_prefix(self, mock_prefix, mock_git, mock_merge, tmp_path):
         from app.mission_runner import check_auto_merge
 
-        result = check_auto_merge(str(tmp_path), "koan", str(tmp_path))
+        config = {"projects": {"koan": {"git_auto_merge": {
+            "enabled": True, "rules": [{"pattern": "koan.atoomic/*", "auto_merge": True}],
+        }}}}
+        result = check_auto_merge(str(tmp_path), "koan", str(tmp_path), projects_config=config)
         assert result == "koan.atoomic/my-feature"
         mock_merge.assert_called_once()
 
@@ -1882,8 +2198,11 @@ class TestCheckAutoMergeBranchPrefix:
         """A branch named exactly like the prefix (no suffix) should still match."""
         from app.mission_runner import check_auto_merge
 
-        with patch("app.git_auto_merge.auto_merge_branch"):
-            result = check_auto_merge(str(tmp_path), "koan", str(tmp_path))
+        config = {"projects": {"koan": {"git_auto_merge": {
+            "enabled": True, "rules": [{"pattern": "koan/*", "auto_merge": True}],
+        }}}}
+        with patch("app.git_auto_merge.auto_merge_branch", return_value=0):
+            result = check_auto_merge(str(tmp_path), "koan", str(tmp_path), projects_config=config)
         assert result == "koan/"
 
 
@@ -1954,7 +2273,7 @@ class TestTriggerReflectionEdgeCases:
         result = trigger_reflection(str(tmp_path), "audit", 60, project_name="koan")
         assert result is False
         captured = capsys.readouterr()
-        assert "Reflection failed" in captured.err
+        assert "Reflection failed" in (captured.err + captured.out)
 
     @patch("app.post_mission_reflection.write_to_journal")
     @patch("app.post_mission_reflection.run_reflection", return_value="insight")
@@ -2252,7 +2571,11 @@ class TestPipelineTracker:
         result = tracker.run_step("bad_step", failing)
         assert result is None
         assert tracker.steps["bad_step"]["status"] == "fail"
-        assert "boom" in tracker.steps["bad_step"]["detail"]
+        detail = tracker.steps["bad_step"]["detail"]
+        assert "boom" in detail
+        # Elapsed time is included in failure detail
+        assert detail.startswith("failed after ")
+        assert "s: " in detail
 
     def test_run_step_timeout(self):
         from app.mission_runner import _PipelineTracker
@@ -2265,6 +2588,154 @@ class TestPipelineTracker:
         result = tracker.run_step("timed_out", lambda: 1, pipeline_expired=expired)
         assert result is None
         assert tracker.steps["timed_out"]["status"] == "timeout"
+
+    def test_run_step_interrupts_hung_step(self):
+        """If pipeline_expired becomes set during execution, the step is interrupted."""
+        from app.mission_runner import _PipelineTracker
+        import threading
+
+        tracker = _PipelineTracker()
+        expired = threading.Event()
+        barrier = threading.Barrier(2, timeout=10)
+        # Separate gate so firing the deadline does NOT also release the worker:
+        # the step must stay genuinely hung while run_step observes the timeout.
+        release = threading.Event()
+
+        def slow_fn():
+            barrier.wait()  # signal that we're running
+            release.wait(timeout=5)  # stay hung until the test releases us
+
+        def run_in_bg():
+            tracker.run_step("hung_step", slow_fn, pipeline_expired=expired)
+
+        bg = threading.Thread(target=run_in_bg)
+        bg.start()
+        barrier.wait()  # wait for slow_fn to start (thread is alive in poll loop)
+        expired.set()  # fire the deadline while slow_fn is still blocked
+        bg.join(timeout=3.0)
+        assert not bg.is_alive()
+        assert tracker.steps["hung_step"]["status"] == "timeout"
+        assert "interrupted after" in tracker.steps["hung_step"]["detail"]
+        release.set()  # let the abandoned worker thread finish cleanly
+
+    def test_run_step_completes_through_threaded_path(self):
+        """With an unset deadline the step runs in the worker thread and succeeds."""
+        from app.mission_runner import _PipelineTracker
+        import threading
+
+        tracker = _PipelineTracker()
+        expired = threading.Event()  # supplied but never set
+        seen = {}
+
+        def fn():
+            seen["thread"] = threading.current_thread()
+            return 42
+
+        result = tracker.run_step("threaded_step", fn, pipeline_expired=expired)
+        assert result == 42
+        assert tracker.steps["threaded_step"]["status"] == "success"
+        # Passing pipeline_expired forces the interruptible path: a worker thread.
+        assert seen["thread"] is not threading.current_thread()
+
+    def test_run_step_base_exception_recorded_as_fail(self):
+        """A BaseException escaping the worker is recorded as fail, not success."""
+        from app.mission_runner import _PipelineTracker
+        import threading
+
+        tracker = _PipelineTracker()
+        expired = threading.Event()  # supplied but never set
+
+        def boom():
+            raise SystemExit("worker exit")
+
+        result = tracker.run_step("exit_step", boom, pipeline_expired=expired)
+        assert result is None
+        assert tracker.steps["exit_step"]["status"] == "fail"
+
+    def test_run_step_inline_when_no_deadline(self):
+        """Without pipeline_expired the step runs inline (no worker thread)."""
+        from app.mission_runner import _PipelineTracker
+        import threading
+
+        tracker = _PipelineTracker()
+        seen = {}
+
+        def fn():
+            seen["thread"] = threading.current_thread()
+            return 7
+
+        result = tracker.run_step("inline_step", fn)
+        assert result == 7
+        assert tracker.steps["inline_step"]["status"] == "success"
+        # Fast path runs in the caller's thread, not a spawned worker.
+        assert seen["thread"] is threading.current_thread()
+
+    def test_run_step_logs_exception_from_abandoned_thread(self):
+        """An exception raised after the step is abandoned is logged, not lost."""
+        from app.mission_runner import _PipelineTracker
+        import threading
+        from unittest.mock import patch
+
+        tracker = _PipelineTracker()
+        expired = threading.Event()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_then_raise():
+            started.set()
+            release.wait(timeout=5)
+            raise RuntimeError("late boom")
+
+        logged = []
+        error_logged = threading.Event()
+
+        def _capture(cat, msg):
+            logged.append((cat, msg))
+            if cat == "error" and "abandoned" in msg:
+                error_logged.set()
+
+        with patch("app.mission_runner._log_runner", side_effect=_capture):
+
+            def run_in_bg():
+                tracker.run_step(
+                    "abandoned_step", slow_then_raise, pipeline_expired=expired
+                )
+
+            bg = threading.Thread(target=run_in_bg)
+            bg.start()
+            started.wait(timeout=3)
+            expired.set()  # abandon the step before it raises
+            bg.join(timeout=3.0)
+            assert not bg.is_alive()
+            assert tracker.steps["abandoned_step"]["status"] == "timeout"
+
+            # Now let the orphaned worker raise; its exception must be logged.
+            # Block until the worker actually logs so the patch stays active
+            # (the worker runs after run_step has already returned).
+            release.set()
+            assert error_logged.wait(timeout=5), f"no abandoned-thread log: {logged}"
+
+        assert any(
+            cat == "error" and "abandoned" in msg and "late boom" in msg
+            for cat, msg in logged
+        )
+
+    def test_skipped_status_for_unreliable_quota_check(self):
+        """Regression: quota_check used 'warning' status which is not in VALID_STATUSES.
+
+        The unreliable quota check path in run_post_mission must use 'skipped'
+        (a valid status) instead of 'warning' (which raises ValueError).
+        """
+        from app.mission_runner import _PipelineTracker
+
+        tracker = _PipelineTracker()
+        # This must not raise — 'skipped' is valid
+        tracker.record("quota_check", "skipped", "unreliable — log files unreadable")
+        assert tracker.steps["quota_check"]["status"] == "skipped"
+
+        # Confirm 'warning' is still invalid
+        with pytest.raises(ValueError, match="Invalid status"):
+            tracker.record("other", "warning", "not a valid status")
 
 
 class TestPipelineStepsInResult:
@@ -2476,7 +2947,7 @@ class TestNotifyPipelineFailures:
         outbox.write_text("")
         _notify_pipeline_failures(tracker, "", str(tmp_path))
         msg = outbox.read_text()
-        assert msg.startswith("⚠️ Pipeline issues:")
+        assert "⚠️ Pipeline issues:" in msg
         assert "✗ verification (verify crash)" in msg
 
     def test_notification_failure_does_not_raise(self, tmp_path):
@@ -2537,3 +3008,775 @@ class TestNotifyPipelineFailures:
         msg = outbox.read_text()
         assert "reflection" in msg
         assert "test pipeline notify" in msg
+
+
+class TestExtractCacheLine:
+    """Test _extract_cache_line helper for pipeline summary."""
+
+    def test_returns_cache_line_with_data(self, tmp_path):
+        from app.mission_runner import _extract_cache_line
+
+        json_file = tmp_path / "output.json"
+        json_file.write_text(json.dumps({
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "model": "opus",
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 0,
+            },
+        }))
+        result = _extract_cache_line(str(json_file))
+        assert "hit" in result
+        assert "read" in result
+
+    def test_returns_empty_for_no_cache(self, tmp_path):
+        from app.mission_runner import _extract_cache_line
+
+        json_file = tmp_path / "output.json"
+        json_file.write_text(json.dumps({
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "model": "opus",
+        }))
+        result = _extract_cache_line(str(json_file))
+        assert result == ""
+
+    def test_returns_empty_for_missing_file(self):
+        from app.mission_runner import _extract_cache_line
+
+        result = _extract_cache_line("/nonexistent/file.json")
+        assert result == ""
+
+
+class TestCostTrackingFailedFlag:
+    """Test cost_tracking_failed flag in run_post_mission result."""
+
+    def test_codex_jsonl_updates_usage_state_and_cost_rows(self, tmp_path):
+        """Codex JSONL usage updates both budget state and usage JSONL rows."""
+        from app import cost_tracker
+        from app.mission_runner import run_post_mission
+
+        instance_dir = tmp_path / "instance"
+        instance_dir.mkdir()
+        stdout_file = tmp_path / "codex.jsonl"
+        stderr_file = tmp_path / "codex.err"
+        stdout_file.write_text("\n".join([
+            json.dumps({"type": "thread.started"}),
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "model": "gpt-5.4",
+                        "total_token_usage": {
+                            "input_tokens": 26549,
+                            "cached_input_tokens": 22272,
+                            "output_tokens": 1590,
+                            "reasoning_output_tokens": 1152,
+                            "total_tokens": 28139,
+                        },
+                    },
+                },
+            }),
+        ]))
+        stderr_file.write_text("")
+
+        patches = [
+            patch("app.usage_estimator.load_config", return_value={
+                "usage": {
+                    "session_token_limit": 500000,
+                    "weekly_token_limit": 5000000,
+                }
+            }),
+            patch("app.projects_config.load_projects_config", return_value={}),
+            patch("app.quota_handler.handle_quota_exhaustion", return_value=None),
+            patch("app.mission_runner.archive_pending", return_value=False),
+            patch("app.mission_runner.trigger_reflection", return_value=False),
+            patch("app.mission_runner._run_mission_verification", return_value=None),
+            patch("app.mission_runner._run_quality_pipeline", return_value={}),
+            patch("app.mission_runner._run_lint_gate", return_value=None),
+            patch("app.mission_runner.check_security_review", return_value=True),
+            patch("app.mission_runner.check_auto_merge", return_value=None),
+            patch("app.mission_runner._record_session_outcome"),
+            patch("app.mission_runner._record_skill_metric"),
+            patch("app.mission_runner._publish_jira_outcome", return_value={
+                "published": "false",
+                "reason": "test",
+            }),
+            patch("app.bandit.load_bandit_state", return_value={}),
+            patch("app.bandit.update_bandit"),
+            patch("app.bandit.save_bandit_state"),
+            patch("app.daily_snapshot.update_daily_snapshot"),
+            patch("app.mission_runner._check_pipeline_timeout_rate"),
+            patch("app.mission_runner._fire_post_mission_hook", return_value={}),
+            patch("app.mission_runner._write_pipeline_summary"),
+            patch("app.mission_runner._notify_pipeline_failures"),
+            patch("app.mission_runner._notify_mission_result"),
+        ]
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            result = run_post_mission(
+                instance_dir=str(instance_dir),
+                project_name="koan",
+                project_path=str(tmp_path),
+                run_num=1,
+                exit_code=0,
+                stdout_file=str(stdout_file),
+                stderr_file=str(stderr_file),
+                mission_title="test codex usage accounting",
+                autonomous_mode="implement",
+                provider_name="codex",
+            )
+
+        billable_input = 26549 - 22272
+        expected_total = billable_input + 1590
+        state = json.loads((instance_dir / "usage_state.json").read_text())
+        assert result["usage_updated"] is True
+        assert result["cost_tracking_failed"] is False
+        assert state["session_tokens"] == expected_total
+        assert state["weekly_tokens"] == expected_total
+        assert state["runs"] == 1
+
+        rows = cost_tracker._read_jsonl_for_date(
+            instance_dir / "usage",
+            date.today(),
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["project"] == "koan"
+        assert row["model"] == "gpt-5.4"
+        assert row["input_tokens"] == billable_input
+        assert row["output_tokens"] == 1590
+        assert row["cache_read_input_tokens"] == 22272
+        assert row["mode"] == "implement"
+
+    @patch("app.mission_runner.commit_instance")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.quota_handler.handle_quota_exhaustion", return_value=None)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    @patch("app.token_parser.extract_tokens", return_value=None)
+    def test_set_when_tokens_none_and_exit_zero(
+        self, mock_tokens, mock_usage, mock_quota, mock_archive,
+        mock_reflect, mock_merge, mock_commit, tmp_path, capsys,
+    ):
+        """cost_tracking_failed=True when token extraction returns None on success.
+
+        Successful missions (exit_code=0) routinely lack token data because
+        the CLI output format omits it — no stderr warning is emitted to
+        avoid log noise.
+        """
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        result = run_post_mission(
+            instance_dir=instance_dir,
+            project_name="koan",
+            project_path=str(tmp_path),
+            run_num=1,
+            exit_code=0,
+            stdout_file="/tmp/out.json",
+            stderr_file="/tmp/err.txt",
+        )
+
+        assert result["cost_tracking_failed"] is True
+        captured = capsys.readouterr()
+        assert "cost tracking failed" not in captured.err
+
+    @patch("app.mission_runner.commit_instance")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.quota_handler.handle_quota_exhaustion", return_value=None)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    @patch("app.token_parser.extract_tokens", return_value=None)
+    def test_also_set_when_exit_nonzero(
+        self, mock_tokens, mock_usage, mock_quota, mock_archive,
+        mock_reflect, mock_merge, mock_commit, tmp_path, capsys,
+    ):
+        """cost_tracking_failed=True when token extraction returns None on failure too."""
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        result = run_post_mission(
+            instance_dir=instance_dir,
+            project_name="koan",
+            project_path=str(tmp_path),
+            run_num=1,
+            exit_code=1,
+            stdout_file="/tmp/out.json",
+            stderr_file="/tmp/err.txt",
+        )
+
+        assert result["cost_tracking_failed"] is True
+        captured = capsys.readouterr()
+        assert "cost tracking failed" in captured.err
+        assert "exit_code=1" in captured.err
+
+    @patch("app.mission_runner.commit_instance")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.quota_handler.handle_quota_exhaustion", return_value=None)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    @patch("app.token_parser.extract_tokens", return_value=None)
+    def test_codex_warning_mentions_quota_detection_still_runs(
+        self, mock_tokens, mock_usage, mock_quota, mock_archive,
+        mock_reflect, mock_merge, mock_commit, tmp_path, capsys,
+    ):
+        """Codex warning on failure clarifies accounting failure is separate from quota checks."""
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        result = run_post_mission(
+            instance_dir=instance_dir,
+            project_name="koan",
+            project_path=str(tmp_path),
+            run_num=1,
+            exit_code=1,
+            stdout_file="/tmp/out.json",
+            stderr_file="/tmp/err.txt",
+            provider_name="codex",
+        )
+
+        assert result["cost_tracking_failed"] is True
+        captured = capsys.readouterr()
+        assert "quota detection still ran" in captured.err
+
+    @patch("app.mission_runner.run_post_mission")
+    def test_cli_emits_cost_tracking_failed_signal(self, mock_run, tmp_path, capsys):
+        """COST_TRACKING_FAILED emitted to stderr in CLI mode."""
+        from app.mission_runner import _cli_post_mission
+
+        mock_run.return_value = {
+            "success": True,
+            "usage_updated": True,
+            "pending_archived": False,
+            "reflection_written": False,
+            "auto_merge_branch": None,
+            "quota_exhausted": False,
+            "quota_info": None,
+            "cost_tracking_failed": True,
+            "pipeline_steps": {},
+        }
+
+        with pytest.raises(SystemExit) as exc_info:
+            _cli_post_mission([
+                "--instance", str(tmp_path),
+                "--project-name", "koan",
+                "--project-path", str(tmp_path),
+                "--run-num", "1",
+                "--exit-code", "0",
+                "--stdout-file", "/tmp/out",
+                "--stderr-file", "/tmp/err",
+            ])
+        assert exc_info.value.code == 0
+
+        captured = capsys.readouterr()
+        assert "COST_TRACKING_FAILED" in captured.err
+
+
+class TestSkillDispatchPostMission:
+    """is_skill_dispatch=True skips quota detection and cost_tracking warning."""
+
+    @patch("app.mission_runner.commit_instance")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    @patch("app.token_parser.extract_tokens", return_value=None)
+    def test_no_cost_tracking_warning(
+        self, mock_tokens, mock_usage, mock_archive,
+        mock_reflect, mock_merge, mock_commit, tmp_path, capsys,
+    ):
+        """Skill dispatch suppresses cost_tracking_failed when tokens=None."""
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        result = run_post_mission(
+            instance_dir=instance_dir,
+            project_name="koan",
+            project_path=str(tmp_path),
+            run_num=1,
+            exit_code=0,
+            stdout_file="/tmp/out.json",
+            stderr_file="/tmp/err.txt",
+            is_skill_dispatch=True,
+        )
+
+        assert result.get("cost_tracking_failed", False) is False
+        captured = capsys.readouterr()
+        assert "cost tracking failed" not in captured.err
+
+    @patch("app.mission_runner.commit_instance")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    @patch("app.token_parser.extract_tokens", return_value=None)
+    def test_quota_detection_skipped(
+        self, mock_tokens, mock_usage, mock_archive,
+        mock_reflect, mock_merge, mock_commit, tmp_path,
+    ):
+        """Skill dispatch skips handle_quota_exhaustion inside pipeline."""
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        with patch("app.quota_handler.handle_quota_exhaustion") as mock_hqe:
+            result = run_post_mission(
+                instance_dir=instance_dir,
+                project_name="koan",
+                project_path=str(tmp_path),
+                run_num=1,
+                exit_code=0,
+                stdout_file="/tmp/out.json",
+                stderr_file="/tmp/err.txt",
+                is_skill_dispatch=True,
+            )
+
+        mock_hqe.assert_not_called()
+        assert result["quota_exhausted"] is False
+
+
+class TestMissionRunnerFireAndForgetMetrics:
+    def test_publish_jira_outcome_passes_branch_override(self):
+        from app.mission_runner import _publish_jira_outcome
+
+        with patch(
+            "app.jira_outcome_publish.publish_jira_mission_outcome",
+            return_value={"published": "false", "reason": "test"},
+        ) as mock_publish:
+            _publish_jira_outcome(
+                mission_title="/fix https://org.atlassian.net/browse/PROJ-1 branch:main",
+                pending_content="Draft PR: https://github.com/o/r/pull/1",
+                exit_code=0,
+            )
+
+        kwargs = mock_publish.call_args.kwargs
+        assert kwargs["base_branch"] == "main"
+
+    @patch("app.mission_runner._publish_jira_outcome", return_value={"published": "true", "reason": "created"})
+    @patch("app.mission_runner._record_session_outcome")
+    @patch("app.mission_runner.check_auto_merge", return_value=None)
+    @patch("app.mission_runner.trigger_reflection", return_value=False)
+    @patch("app.mission_runner.archive_pending", return_value=False)
+    @patch("app.quota_handler.handle_quota_exhaustion", return_value=None)
+    @patch("app.mission_runner.update_usage", return_value=True)
+    def test_run_post_mission_invokes_jira_outcome_publish(
+        self,
+        mock_usage,
+        mock_quota,
+        mock_archive,
+        mock_reflect,
+        mock_merge,
+        mock_record,
+        mock_publish,
+        tmp_path,
+    ):
+        from app.mission_runner import run_post_mission
+
+        instance_dir = str(tmp_path / "instance")
+        os.makedirs(instance_dir, exist_ok=True)
+
+        result = run_post_mission(
+            instance_dir=instance_dir,
+            project_name="koan",
+            project_path=str(tmp_path),
+            run_num=1,
+            exit_code=0,
+            stdout_file="/tmp/out.json",
+            stderr_file="/tmp/err.txt",
+            mission_title="/fix https://org.atlassian.net/browse/PROJ-1",
+            autonomous_mode="implement",
+        )
+
+        mock_publish.assert_called_once()
+        assert result["jira_outcome_publish"]["published"] == "true"
+
+    def test_record_skill_metric_records_fix_pr_with_failed_ci(self):
+        from app.mission_runner import _record_skill_metric
+
+        pending = "Created PR: https://github.com/owner/repo/pull/12"
+        quality = {"tests": {"passed": False, "skipped": False}}
+
+        with (
+            patch("app.session_tracker.classify_mission_type", return_value="implement"),
+            patch("app.session_tracker.detect_pr_created", return_value=True),
+            patch("app.skill_metrics.record_pr_metric") as mock_record,
+        ):
+            _record_skill_metric(
+                "/instance", "koan", "/fix broken widget", 0, pending, quality,
+            )
+
+        mock_record.assert_called_once_with(
+            "/instance", "koan", "fix",
+            "https://github.com/owner/repo/pull/12", "fail",
+        )
+
+    def test_record_skill_metric_skips_non_implement_missions(self):
+        from app.mission_runner import _record_skill_metric
+
+        with (
+            patch("app.session_tracker.classify_mission_type", return_value="review"),
+            patch("app.skill_metrics.record_pr_metric") as mock_record,
+        ):
+            _record_skill_metric(
+                "/instance", "koan", "review this", 0, "PR text", None,
+            )
+
+        mock_record.assert_not_called()
+
+    def test_record_cost_event_uses_preparsed_tokens(self):
+        from app.mission_runner import _record_cost_event
+
+        tokens = {
+            "model": "opus",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 3,
+            "cache_read_input_tokens": 7,
+            "cost_usd": 0.12,
+        }
+
+        with patch("app.cost_tracker.record_usage") as mock_record:
+            _record_cost_event(
+                "/instance", "", "/tmp/out.json", "deep", "mission",
+                mission_type="fix", tokens=tokens,
+            )
+
+        kwargs = mock_record.call_args.kwargs
+        assert kwargs["project"] == "_global"
+        assert kwargs["model"] == "opus"
+        assert kwargs["mission_type"] == "fix"
+        assert kwargs["cache_read_input_tokens"] == 7
+
+    def test_record_cost_event_placeholder_for_skill_dispatch(self):
+        from app.mission_runner import _record_cost_event
+
+        with (
+            patch("app.token_parser.extract_tokens", return_value=None),
+            patch("app.cost_tracker.record_usage") as mock_record,
+        ):
+            _record_cost_event(
+                "/instance", "cp", "/tmp/out.json", "implement", "/review foo",
+                mission_type="review", allow_placeholder=True,
+            )
+
+        kwargs = mock_record.call_args.kwargs
+        assert kwargs["project"] == "cp"
+        assert kwargs["model"] == "unknown"
+        assert kwargs["input_tokens"] == 0
+        assert kwargs["output_tokens"] == 0
+        assert kwargs["mission_type"] == "review"
+
+    def test_log_activity_usage_uses_preparsed_tokens(self):
+        from app.mission_runner import _log_activity_usage
+
+        tokens = {
+            "model": "sonnet",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 10,
+            "cache_creation_input_tokens": 5,
+            "cost_usd": 0.05,
+        }
+
+        with patch("app.activity_usage_logger.log_activity_usage") as mock_log:
+            _log_activity_usage(
+                "/instance", "koan", "/tmp/out.json", "implement",
+                "", duration_seconds=9, tokens=tokens,
+            )
+
+        kwargs = mock_log.call_args.kwargs
+        assert kwargs["project"] == "koan"
+        assert kwargs["activity_type"] == "implement"
+        assert kwargs["duration_seconds"] == 9
+        assert kwargs["cache_creation_tokens"] == 5
+
+
+class TestMissionRunnerLintBlocking:
+    def test_lint_blocking_false_when_config_missing(self):
+        from app.mission_runner import _is_lint_blocking
+
+        assert _is_lint_blocking("/instance", "koan", projects_config={}) is False
+
+    def test_lint_blocking_respects_project_lint_config(self):
+        from app.mission_runner import _is_lint_blocking
+
+        with patch(
+            "app.lint_gate.get_project_lint_config",
+            return_value={"enabled": True, "blocking": False},
+        ):
+            assert _is_lint_blocking(
+                "/instance", "koan", projects_config={"projects": {}},
+            ) is False
+
+        with patch(
+            "app.lint_gate.get_project_lint_config",
+            return_value={"enabled": True, "blocking": True},
+        ):
+            assert _is_lint_blocking(
+                "/instance", "koan", projects_config={"projects": {}},
+            ) is True
+
+    def test_lint_blocking_errors_return_false(self):
+        from app.mission_runner import _is_lint_blocking
+
+        with patch(
+            "app.lint_gate.get_project_lint_config",
+            side_effect=RuntimeError("bad lint config"),
+        ):
+            assert _is_lint_blocking(
+                "/instance", "koan", projects_config={"projects": {}},
+            ) is False
+
+
+# ---------------------------------------------------------------------------
+# _read_full_stdout_text
+# ---------------------------------------------------------------------------
+
+
+class TestReadFullStdoutText:
+    """Tests for _read_full_stdout_text — uncapped stdout reader for autoreview."""
+
+    def test_reads_and_parses_json_stdout(self, tmp_path):
+        from app.mission_runner import _read_full_stdout_text
+        stdout_file = tmp_path / "stdout.txt"
+        stdout_file.write_text(
+            '{"type":"result","result":"Created PR: https://github.com/o/r/pull/1"}'
+        )
+        result = _read_full_stdout_text(str(stdout_file))
+        assert "https://github.com/o/r/pull/1" in result
+
+    def test_returns_empty_for_missing_file(self):
+        from app.mission_runner import _read_full_stdout_text
+        assert _read_full_stdout_text("/nonexistent/file.txt") == ""
+
+    def test_returns_empty_for_empty_file(self, tmp_path):
+        from app.mission_runner import _read_full_stdout_text
+        stdout_file = tmp_path / "stdout.txt"
+        stdout_file.write_text("")
+        assert _read_full_stdout_text(str(stdout_file)) == ""
+
+    def test_returns_empty_for_empty_string_arg(self):
+        from app.mission_runner import _read_full_stdout_text
+        assert _read_full_stdout_text("") == ""
+
+
+# ---------------------------------------------------------------------------
+# _maybe_queue_autoreview
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeQueueAutoreview:
+    """Tests for _maybe_queue_autoreview — autoreview pipeline step."""
+
+    PR_URL = "https://github.com/owner/repo/pull/42"
+    PENDING_WITH_PR = f"Created PR: {PR_URL} — ready for review"
+
+    def _call(self, instance_dir, mission_title="", pending_content=None,
+              projects_config=None, merge_result=None, security_blocked=False,
+              stdout_file=""):
+        from app.mission_runner import _maybe_queue_autoreview
+        _maybe_queue_autoreview(
+            str(instance_dir),
+            "myapp",
+            mission_title,
+            pending_content or self.PENDING_WITH_PR,
+            projects_config,
+            merge_result,
+            security_blocked=security_blocked,
+            stdout_file=stdout_file,
+        )
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_queues_review_then_rebase_when_enabled(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, projects_config=config)
+        assert mock_insert.call_count == 2
+        calls = [str(c) for c in mock_insert.call_args_list]
+        assert any("/review" in c for c in calls)
+        assert any("/rebase" in c for c in calls)
+        # review must come before rebase
+        first_call_str = str(mock_insert.call_args_list[0])
+        assert "/review" in first_call_str
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=False)
+    def test_skips_when_disabled(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, projects_config=config)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=False)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_when_no_pr_created(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, projects_config=config)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_when_no_pr_url_extractable(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, pending_content="PR #42 was created (no URL)", projects_config=config)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_when_auto_merged(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, projects_config=config, merge_result="koan/fix-something")
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=False)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_duplicate_review_already_pending(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text(
+            f"## Pending\n- [project:myapp] /review {self.PR_URL}\n"
+        )
+        self._call(tmp_path, projects_config=config)
+        # insert_pending_mission returns False (dedup), no error raised
+        assert mock_insert.call_count == 2  # still called, but returns False (no-op)
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_review_missions(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        # A /review mission itself should not trigger autoreview
+        self._call(tmp_path, mission_title=f"/review {self.PR_URL}", projects_config=config)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_rebase_missions(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, mission_title=f"/rebase {self.PR_URL}", projects_config=config)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_when_no_projects_config(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, projects_config=None)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_when_security_blocked(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, projects_config=config, security_blocked=True)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.session_tracker.detect_pr_created", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_skips_review_rebase_combo(
+        self, mock_autoreview, mock_detect, mock_insert, tmp_path
+    ):
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        self._call(tmp_path, mission_title=f"/review_rebase {self.PR_URL}", projects_config=config)
+        mock_insert.assert_not_called()
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_falls_back_to_stdout_when_pending_empty(
+        self, mock_autoreview, mock_insert, tmp_path
+    ):
+        """When pending_content has no PR signal, fall back to full stdout."""
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        # Write stdout file with PR URL buried in JSON-like content
+        stdout_file = tmp_path / "stdout.txt"
+        stdout_file.write_text(
+            f'{{"type":"result","result":"PR created: {self.PR_URL}"}}'
+        )
+        self._call(
+            tmp_path,
+            pending_content="no pr info here",
+            projects_config=config,
+            stdout_file=str(stdout_file),
+        )
+        assert mock_insert.call_count == 2
+        calls = [str(c) for c in mock_insert.call_args_list]
+        assert any("/review" in c for c in calls)
+        assert any("/rebase" in c for c in calls)
+
+    @patch("app.utils.insert_pending_mission", return_value=True)
+    @patch("app.projects_config.get_project_autoreview", return_value=True)
+    def test_prefers_pending_content_over_stdout(
+        self, mock_autoreview, mock_insert, tmp_path
+    ):
+        """pending_content PR URL takes precedence over stdout."""
+        config = {"projects": {"myapp": {"path": str(tmp_path)}}}
+        (tmp_path / "missions.md").write_text("## Pending\n")
+        stdout_file = tmp_path / "stdout.txt"
+        stdout_file.write_text(
+            '{"type":"result","result":"PR created: https://github.com/owner/repo/pull/99"}'
+        )
+        self._call(
+            tmp_path,
+            pending_content=self.PENDING_WITH_PR,
+            projects_config=config,
+            stdout_file=str(stdout_file),
+        )
+        assert mock_insert.call_count == 2
+        # Should use PR URL from pending_content (#42), not stdout (#99)
+        first_call = str(mock_insert.call_args_list[0])
+        assert "/pull/42" in first_call

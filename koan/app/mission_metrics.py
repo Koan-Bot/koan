@@ -91,6 +91,13 @@ def compute_project_metrics(
             "success_rate": counts["productive"] / counts["total"] if counts["total"] else 0.0,
         }
 
+    # Last-action distribution (what tool was the agent using at session end)
+    by_last_action = defaultdict(int)
+    for o in filtered:
+        action = o.get("last_action", "")
+        if action:
+            by_last_action[action] += 1
+
     return {
         "total_sessions": total,
         "productive": productive,
@@ -101,6 +108,7 @@ def compute_project_metrics(
         "branch_rate": branch_count / total,
         "avg_duration_minutes": round(avg_duration, 1),
         "by_mission_type": by_type_out,
+        "by_last_action": dict(by_last_action),
     }
 
 
@@ -155,6 +163,13 @@ def compute_global_metrics(
 
     trend = _compute_trend(filtered)
 
+    # Last-action distribution
+    by_last_action = defaultdict(int)
+    for o in filtered:
+        action = o.get("last_action", "")
+        if action:
+            by_last_action[action] += 1
+
     return {
         "total_sessions": total,
         "productive": productive,
@@ -163,6 +178,7 @@ def compute_global_metrics(
         "success_rate": productive / total,
         "by_project": by_project_out,
         "trend": trend,
+        "by_last_action": dict(by_last_action),
     }
 
 
@@ -170,6 +186,7 @@ def get_project_success_rates(
     instance_dir: str,
     projects: List[str],
     days: int = 30,
+    _all_outcomes: Optional[list] = None,
 ) -> Dict[str, float]:
     """Get success rates for multiple projects (for iteration_manager weighting).
 
@@ -177,12 +194,13 @@ def get_project_success_rates(
         instance_dir: Path to instance directory.
         projects: List of project names.
         days: Number of days to look back.
+        _all_outcomes: Pre-loaded outcomes list to avoid redundant file reads.
 
     Returns:
         Dict mapping project name to success rate (0.0-1.0).
         Projects with no data get 0.5 (neutral).
     """
-    outcomes = _load_outcomes(instance_dir)
+    outcomes = _all_outcomes if _all_outcomes is not None else _load_outcomes(instance_dir)
     filtered = _filter_by_window(outcomes, days)
 
     by_project = defaultdict(lambda: {"total": 0, "productive": 0})
@@ -356,4 +374,5 @@ def _empty_metrics() -> dict:
         "branch_rate": 0.0,
         "avg_duration_minutes": 0.0,
         "by_mission_type": {},
+        "by_last_action": {},
     }

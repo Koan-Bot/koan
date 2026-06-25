@@ -12,6 +12,7 @@ The registry file (instance/sessions.json) follows Koan's existing pattern
 of file-based state with fcntl locks for cross-process safety.
 """
 
+import contextlib
 import fcntl
 import json
 import os
@@ -35,7 +36,7 @@ from app.worktree_manager import (
 
 
 # Default configuration
-DEFAULT_MAX_PARALLEL = 2
+DEFAULT_MAX_PARALLEL = 1
 MAX_PARALLEL_CAP = 5
 SESSIONS_FILE = "sessions.json"
 
@@ -56,6 +57,7 @@ class Session:
     exit_code: int = -1
     stdout_file: str = ""
     stderr_file: str = ""
+    autonomous_mode: str = "implement"
 
 
 @dataclass
@@ -93,21 +95,8 @@ class SessionRegistry:
 
     def _write_unlocked(self, data: Dict[str, dict]):
         """Write sessions.json atomically (caller holds the file lock)."""
-        fd, tmp = tempfile.mkstemp(
-            dir=self.instance_dir, prefix=".koan-sessions-",
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, str(self._path))
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        from app.utils import atomic_write_json
+        atomic_write_json(self._path, data, indent=2)
 
     def _read_locked(self) -> Dict[str, dict]:
         """Read sessions.json under a shared file lock."""
@@ -174,10 +163,11 @@ class SessionRegistry:
         return [s for s in self.get_all() if s.status == "running"]
 
     def get_by_project(self, project_name: str) -> List[Session]:
-        """Get active sessions for a specific project."""
+        """Get active sessions for a specific project (case-insensitive)."""
+        lower = project_name.lower()
         return [
             s for s in self.get_active()
-            if s.project_name == project_name
+            if s.project_name.lower() == lower
         ]
 
     def clear_completed(self):
@@ -198,7 +188,7 @@ def _dict_to_session(d: dict) -> Session:
 
 
 def get_max_parallel_sessions() -> int:
-    """Read max_parallel_sessions from config.yaml (default: 2, max: 5)."""
+    """Read max_parallel_sessions from config.yaml (default: 1, max: 5)."""
     try:
         from app.utils import load_config
         config = load_config()
@@ -247,16 +237,18 @@ def spawn_session(
     inject_worktree_claude_md(wt.path, mission_text)
 
     # Build CLI command
-    cmd = build_mission_command(
+    cmd, cmd_cleanup_paths = build_mission_command(
         prompt=mission_text,
         autonomous_mode=autonomous_mode,
         project_name=project_name,
     )
 
     # Create temp files for stdout/stderr
-    fd_out, stdout_file = tempfile.mkstemp(prefix=f"koan-session-{wt.session_id}-out-")
+    from app.utils import koan_tmp_dir
+
+    fd_out, stdout_file = tempfile.mkstemp(prefix=f"koan-session-{wt.session_id}-out-", dir=koan_tmp_dir())
     os.close(fd_out)
-    fd_err, stderr_file = tempfile.mkstemp(prefix=f"koan-session-{wt.session_id}-err-")
+    fd_err, stderr_file = tempfile.mkstemp(prefix=f"koan-session-{wt.session_id}-err-", dir=koan_tmp_dir())
     os.close(fd_err)
 
     # Create session
@@ -271,6 +263,7 @@ def spawn_session(
         started_at=time.time(),
         stdout_file=stdout_file,
         stderr_file=stderr_file,
+        autonomous_mode=autonomous_mode,
     )
 
     # Start subprocess — file handles must outlive the process
@@ -296,11 +289,21 @@ def spawn_session(
         raise
     session.pid = proc.pid
 
-    # Wrap cleanup to also close file handles after process exits
+    # Wrap cleanup to also close file handles and unlink temp prompt files
+    # after the process exits.
     def _session_cleanup():
         cli_cleanup()
         out_f.close()
         err_f.close()
+        if cmd_cleanup_paths:
+            try:
+                from app.provider import cleanup_managed_paths
+                cleanup_managed_paths(cmd_cleanup_paths)
+            except Exception as e:
+                print(
+                    f"[session_manager] sysprompt cleanup error: {e}",
+                    file=sys.stderr,
+                )
 
     # Store cleanup and proc as transient state (not persisted)
     session._proc = proc  # type: ignore[attr-defined]
@@ -396,18 +399,14 @@ def kill_session(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(pgid, signal.SIGKILL)
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
         except (ProcessLookupError, PermissionError, OSError):
             pass
     elif session.pid > 0:
         # No proc reference — try killing by PID
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.kill(session.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
 
     # Call cleanup
     cleanup = getattr(session, "_cleanup", None)
@@ -440,12 +439,6 @@ def kill_session(
                 Path(path).unlink(missing_ok=True)
         except OSError:
             pass
-
-
-def kill_all_sessions(registry: SessionRegistry):
-    """Kill all active sessions."""
-    for session in registry.get_active():
-        kill_session(session, registry)
 
 
 def recover_stale_sessions(registry: SessionRegistry):

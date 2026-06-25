@@ -18,6 +18,32 @@ pytestmark = pytest.mark.slow
 
 
 @pytest.fixture
+def subject_closed_state():
+    """Per-test override hook for `_is_subject_closed`'s stubbed return value.
+
+    Defaults to `None` (subject treated as open). Tests exercising the
+    closed-subject branch should override this fixture and return
+    ``"merged"`` or ``"closed"``.
+    """
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _stub_is_subject_closed(subject_closed_state):
+    """Stub the network-hitting `_is_subject_closed` helper.
+
+    Return value is sourced from the `subject_closed_state` fixture so
+    tests that need a non-default answer can override it instead of
+    falling back to manual `@patch` wiring.
+    """
+    with patch(
+        "app.github_command_handler._is_subject_closed",
+        return_value=subject_closed_state,
+    ):
+        yield
+
+
+@pytest.fixture
 def mock_skill():
     return Skill(
         name="rebase",
@@ -188,7 +214,7 @@ class TestSubscriptionInProcessNotification:
         new_comments = [{"id": 500, "body": "What about this?", "user_login": "alice"}]
 
         with patch.dict(os.environ, {"KOAN_ROOT": str(tmp_path)}), \
-             patch("app.github_command_handler._fetch_and_filter_comment", return_value=None), \
+             patch("app.github_command_handler._find_all_thread_mentions", return_value=[]), \
              patch("app.github_command_handler.resolve_project_from_notification",
                    return_value=("koan", "sukria", "koan")), \
              patch("app.github_command_handler._fetch_new_comments_since",
@@ -234,7 +260,7 @@ class TestSubscriptionInProcessNotification:
         missions_path.write_text("# Pending\n\n# In Progress\n\n# Done\n")
 
         with patch.dict(os.environ, {"KOAN_ROOT": str(tmp_path)}), \
-             patch("app.github_command_handler._fetch_and_filter_comment", return_value=comment), \
+             patch("app.github_command_handler._find_all_thread_mentions", return_value=[comment]), \
              patch("app.github_command_handler.resolve_project_from_notification",
                    return_value=("koan", "sukria", "koan")), \
              patch("app.github_command_handler.check_already_processed", return_value=False), \

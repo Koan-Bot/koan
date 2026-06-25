@@ -1,25 +1,73 @@
 # Installation
 
+## Release channels
+
+Kōan has two branches you can track:
+
+- **`main`** (default) — bleeding edge. Every merged change lands here.
+- **`stable`** — contains only tagged releases, fast-forwarded at each release. Recommended for a predictable, vetted experience.
+
+Track stable:
+
+```bash
+git clone -b stable https://github.com/Anantys-oss/koan.git
+cd koan
+# update later with:
+git pull origin stable
+```
+
+Switch an existing checkout from `main` to `stable`:
+
+```bash
+git fetch origin
+git checkout stable
+git pull origin stable
+```
+
+See [docs/maint.md](docs/maint.md) for the release procedure and cadence philosophy.
+
 ## Quick Start (Wizard)
 
 The easiest way to set up Kōan is with the interactive wizard:
 
 ```bash
-git clone https://github.com/sukria/koan.git
+git clone https://github.com/Anantys-oss/koan.git
 cd koan
 make setup
 make install
 ```
 
-This launches a web-based wizard that guides you through Telegram setup, project configuration, and validation. If you prefer manual setup, continue below.
+This launches the terminal onboarding wizard. It creates your private
+`instance/`, configures a CLI provider and messaging, clones Kōan into
+`workspace/koan`, and validates the setup. If you prefer manual setup,
+continue below.
 
 ## Docker
 
-To run Koan in a Docker container (for server deployment or local isolation), see the [Docker Setup Guide](docs/docker.md).
+Prefer to run Koan in a container (server deployment or local isolation)? The
+easiest path is the **prebuilt image** on GitHub Container Registry — no local build:
+
+```bash
+git clone https://github.com/Anantys-oss/koan.git && cd koan
+cp -r instance.example instance && cp env.example .env   # fill in messaging + auth creds
+./setup-docker.sh        # detect host paths, generate volume mounts
+make docker-auth         # subscription users: extract a Claude OAuth token from the host
+make docker-gh-auth      # inject your gh token for the container
+make docker-pull-up      # pull ghcr.io/anantys-oss/koan and start (or: make docker-up to build)
+```
+
+The image lives at [`ghcr.io/anantys-oss/koan`](https://github.com/Anantys-oss/koan/pkgs/container/koan)
+with `latest`, `stable`, and per-version tags. Building from source remains a
+first-class fallback. See the [Docker Setup Guide](docs/setup/docker.md) for the
+full walkthrough — authentication, GHCR access, image pinning, and troubleshooting.
 
 ## Prerequisites
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- At least one supported CLI provider installed and authenticated:
+  - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
+  - [OpenAI Codex CLI](https://github.com/openai/codex)
+  - [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli)
+  - Local provider dependencies (see [docs/provider-local.md](docs/provider-local.md))
 - Python 3.8+
 - A Telegram account or a Slack workspace (for messaging)
 
@@ -30,12 +78,13 @@ To run Koan in a Docker container (for server deployment or local isolation), se
 ## LLM Providers
 
 Koan supports multiple LLM providers. Claude Code CLI is the default and
-most capable option. You can also use GitHub Copilot or a local LLM
-server.
+most capable option. You can also use OpenAI Codex, GitHub Copilot, or a
+local LLM server.
 
 | Provider | Setup Guide | Best For |
 |----------|------------|----------|
 | **Claude Code** (default) | [docs/provider-claude.md](docs/provider-claude.md) | Full-featured agent with best reasoning |
+| **OpenAI Codex** | [docs/provider-codex.md](docs/provider-codex.md) | ChatGPT users who want Codex models |
 | **GitHub Copilot** | [docs/provider-copilot.md](docs/provider-copilot.md) | Teams with existing Copilot subscriptions |
 | **Local LLM** | [docs/provider-local.md](docs/provider-local.md) | Offline use, privacy, zero API cost |
 
@@ -47,7 +96,7 @@ per-project configuration via `projects.yaml`.
 ### 1. Clone and create your instance
 
 ```bash
-git clone https://github.com/sukria/koan.git
+git clone https://github.com/Anantys-oss/koan.git
 cd koan
 cp -r instance.example instance
 ```
@@ -56,14 +105,15 @@ The `instance/` directory is your private data — it's gitignored and never pus
 
 ### 2. Set up a messaging platform
 
-Kōan supports **Telegram** (default) and **Slack** for communication. Follow the setup guide for your preferred platform:
+Kōan supports **Telegram** (default), **Slack**, and **Matrix** for communication. Follow the setup guide for your preferred platform:
 
 | Platform | Setup Guide | Best For |
 |----------|-------------|----------|
 | **Telegram** (default) | [docs/messaging-telegram.md](docs/messaging-telegram.md) | Quick setup, works from any network |
 | **Slack** | [docs/messaging-slack.md](docs/messaging-slack.md) | Team collaboration, workspace integration |
+| **Matrix** | [docs/messaging-matrix.md](docs/messaging-matrix.md) | Self-hosted / federated, open protocol |
 
-Both platforms are fully supported with the same feature set. Telegram is recommended for personal use (simpler setup), while Slack is ideal for team environments.
+All three platforms expose the same feature set. Telegram is the simplest for personal use, Slack is best for team environments, and Matrix is ideal if you want a self-hosted or federated option.
 
 ### 3. Set environment variables
 
@@ -85,6 +135,29 @@ KOAN_MESSAGING_PROVIDER=slack
 KOAN_SLACK_BOT_TOKEN=xoxb-your-bot-token
 KOAN_SLACK_APP_TOKEN=xapp-your-app-token
 KOAN_SLACK_CHANNEL_ID=C01234ABCD
+```
+
+**For Matrix:** Matrix can be configured via `.env` *or* via `instance/config.yaml` (recommended — see [docs/messaging-matrix.md](docs/messaging-matrix.md) for the full guide):
+
+```yaml
+# instance/config.yaml (recommended)
+messaging:
+  provider: "matrix"
+  matrix:
+    homeserver: "https://matrix.org"
+    user_id: "@koan:matrix.org"
+    room_id: "!abcdefghijk:matrix.org"
+    access_token: "syt_your_token_here"
+```
+
+Or the legacy `.env` form (env vars override `config.yaml` when set):
+
+```bash
+KOAN_MESSAGING_PROVIDER=matrix
+KOAN_MATRIX_HOMESERVER=https://matrix.org
+KOAN_MATRIX_ACCESS_TOKEN=syt_your_token_here
+KOAN_MATRIX_USER_ID=@koan:matrix.org
+KOAN_MATRIX_ROOM_ID=!abcdefghijk:matrix.org
 ```
 
 The `.env` file is gitignored — your secrets stay local. See the provider-specific setup guides above for detailed instructions on obtaining these credentials.
@@ -498,13 +571,25 @@ Your `missions.md` file references a project name that doesn't match your config
 2. Check that the bot is invited to the channel (`/invite @koan`)
 3. Review the logs for connection errors (`make logs`)
 
-### Claude CLI errors
+### CLI provider errors
 
-Make sure Claude Code CLI is installed and authenticated:
+Make sure your configured provider CLI is installed and authenticated.
+
+**Claude Code:**
 ```bash
 claude --version   # Should show version
 claude             # Should start interactive mode (exit with /exit)
 ```
+
+**OpenAI Codex:**
+```bash
+codex --version    # Should show version
+codex login --device-auth
+```
+
+For Copilot and local setups, see:
+- [docs/provider-copilot.md](docs/provider-copilot.md)
+- [docs/provider-local.md](docs/provider-local.md)
 
 ## Preventing macOS sleep
 

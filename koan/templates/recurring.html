@@ -1,0 +1,726 @@
+{% extends "base.html" %}
+{% block title_suffix %} — Recurring Tasks{% endblock %}
+{% block page_title %}Recurring Tasks{% endblock %}
+{% block content %}
+<style>
+    .recurring-page { max-width: 960px; margin: 0 auto; padding: 1.5rem 1rem; }
+
+    /* Stat cards */
+    .rec-stats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.75rem;
+        margin-bottom: 1.5rem;
+    }
+    .rec-stat {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        padding: 0.75rem 1rem;
+        text-align: center;
+    }
+    .rec-stat__value {
+        font-size: 1.5rem;
+        font-weight: 700;
+        font-family: var(--font-display, 'Space Grotesk', sans-serif);
+        color: var(--text);
+    }
+    .rec-stat__label {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        margin-top: 0.15rem;
+    }
+
+    /* Table */
+    .rec-table { width: 100%; border-collapse: collapse; }
+    .rec-table th {
+        text-align: left;
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        padding: 0.5rem 0.6rem;
+        border-bottom: 1px solid var(--border);
+        font-family: var(--mono);
+    }
+    .rec-table td {
+        padding: 0.6rem;
+        border-bottom: 1px solid var(--border);
+        font-size: 0.85rem;
+        vertical-align: middle;
+    }
+    .rec-table tr:last-child td { border-bottom: none; }
+
+    .rec-row { cursor: pointer; transition: background var(--dur-fast) ease; }
+    .rec-row:hover { background: var(--surface-2); }
+    .rec-row.expanded { background: var(--surface-2); }
+    .rec-row.task-disabled td:not(:first-child) { opacity: 0.45; }
+
+    .task-text {
+        max-width: 360px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    /* Frequency badges */
+    .badge-freq {
+        display: inline-block;
+        padding: 0.12rem 0.45rem;
+        border-radius: var(--radius-full);
+        font-size: 0.72rem;
+        font-family: var(--mono);
+        font-weight: 500;
+        white-space: nowrap;
+    }
+    .badge-freq--hourly  { background: var(--info-bg, rgba(77,163,255,.12)); color: var(--info); }
+    .badge-freq--daily   { background: var(--success-bg, rgba(43,217,142,.12)); color: var(--success); }
+    .badge-freq--weekly  { background: var(--brand-subtle, rgba(91,91,214,.12)); color: var(--brand); }
+    .badge-freq--every   { background: var(--warning-bg, rgba(245,166,35,.12)); color: var(--warning); }
+
+    .badge-project {
+        display: inline-block;
+        padding: 0.1rem 0.35rem;
+        border-radius: var(--radius-sm);
+        font-size: 0.72rem;
+        font-family: var(--mono);
+        background: var(--surface-3);
+        color: var(--text-secondary);
+    }
+
+    .schedule-info {
+        font-family: var(--mono);
+        font-size: 0.75rem;
+        color: var(--text-muted);
+    }
+    .last-run-info {
+        font-size: 0.78rem;
+        color: var(--text-muted);
+    }
+
+    /* Toggle switch */
+    .toggle-switch {
+        position: relative;
+        display: inline-block;
+        width: 36px;
+        height: 20px;
+    }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-track {
+        position: absolute;
+        cursor: pointer;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: var(--border);
+        border-radius: 20px;
+        transition: background 0.2s;
+    }
+    .toggle-track::before {
+        content: '';
+        position: absolute;
+        width: 14px; height: 14px;
+        left: 3px; bottom: 3px;
+        background: white;
+        border-radius: 50%;
+        transition: transform 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-track { background: var(--brand); }
+    .toggle-switch input:checked + .toggle-track::before { transform: translateX(16px); }
+
+    /* Action buttons */
+    .rec-actions { display: flex; gap: 0.35rem; align-items: center; }
+    .action-btn {
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--text-muted);
+        padding: 0.2rem 0.4rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.72rem;
+        line-height: 1;
+        transition: all var(--dur-fast) ease;
+    }
+    .action-btn:hover { border-color: var(--brand); color: var(--brand); }
+    .action-btn--danger:hover { border-color: var(--danger); color: var(--danger); }
+    .action-btn--run:hover { border-color: var(--success); color: var(--success); }
+
+    /* Detail / Edit panel (expanded row) */
+    .rec-detail-row td { padding: 0; border-bottom: 1px solid var(--border); }
+    .rec-detail {
+        background: var(--surface-1);
+        border-top: 1px solid var(--border);
+        padding: 1rem 1.25rem;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.75rem 1.5rem;
+    }
+    .rec-detail .field { display: flex; flex-direction: column; gap: 0.25rem; }
+    .rec-detail .field--full { grid-column: 1 / -1; }
+    .rec-detail label {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-muted);
+    }
+    .rec-detail input,
+    .rec-detail select {
+        padding: 0.4rem 0.5rem;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        background: var(--bg, var(--canvas));
+        color: var(--text);
+        font-size: 0.85rem;
+        font-family: inherit;
+    }
+    .rec-detail input:focus,
+    .rec-detail select:focus {
+        outline: none;
+        border-color: var(--brand);
+        box-shadow: 0 0 0 2px rgba(91,91,214,.2);
+    }
+    .rec-detail .detail-actions {
+        grid-column: 1 / -1;
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+        padding-top: 0.25rem;
+    }
+    .btn-save {
+        padding: 0.35rem 1rem;
+        background: var(--brand);
+        color: var(--on-brand);
+        border: none;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-size: 0.85rem;
+    }
+    .btn-save:hover { opacity: 0.88; }
+    .btn-cancel {
+        padding: 0.35rem 1rem;
+        background: none;
+        color: var(--text-muted);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-size: 0.85rem;
+    }
+    .btn-cancel:hover { color: var(--text); }
+
+    /* Add task form */
+    .add-form-card {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        padding: 1rem 1.25rem;
+        margin-top: 1.5rem;
+    }
+    .add-form-card h3 {
+        margin: 0 0 0.75rem;
+        font-size: 0.95rem;
+        font-weight: 600;
+    }
+    .add-row {
+        display: flex;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+        align-items: flex-end;
+    }
+    .add-group { display: flex; flex-direction: column; gap: 0.25rem; }
+    .add-group label { font-size: 0.72rem; color: var(--text-muted); }
+    .add-group input,
+    .add-group select {
+        padding: 0.38rem 0.5rem;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        background: var(--bg, var(--canvas));
+        color: var(--text);
+        font-size: 0.85rem;
+        min-width: 120px;
+    }
+    .add-group input:focus,
+    .add-group select:focus {
+        outline: none;
+        border-color: var(--brand);
+        box-shadow: 0 0 0 2px rgba(91,91,214,.2);
+    }
+    .add-group--text { flex: 1; min-width: 200px; }
+    .add-group--text input { width: 100%; }
+    #add-interval-group { display: none; }
+
+    /* Toast */
+    .rec-toast {
+        position: fixed;
+        bottom: 1.5rem;
+        right: 1.5rem;
+        padding: 0.6rem 1rem;
+        background: var(--surface-2);
+        border: 1px solid var(--brand);
+        border-radius: var(--radius-md);
+        color: var(--text);
+        font-size: 0.85rem;
+        z-index: 1000;
+        opacity: 0;
+        transform: translateY(8px);
+        transition: all var(--dur-base) ease;
+        pointer-events: none;
+    }
+    .rec-toast.visible {
+        opacity: 1;
+        transform: translateY(0);
+    }
+
+    .empty-state {
+        text-align: center;
+        padding: 3rem 1rem;
+        color: var(--text-muted);
+        font-size: 0.9rem;
+    }
+
+    @media (max-width: 700px) {
+        .rec-stats { grid-template-columns: 1fr; }
+        .rec-detail { grid-template-columns: 1fr; }
+        .add-row { flex-direction: column; }
+        .task-text { max-width: 180px; }
+        .hide-mobile { display: none; }
+    }
+</style>
+
+<div class="recurring-page">
+    <!-- Stat cards -->
+    <div class="rec-stats" id="rec-stats">
+        <div class="rec-stat">
+            <div class="rec-stat__value" id="stat-total">{{ tasks | length }}</div>
+            <div class="rec-stat__label">Total</div>
+        </div>
+        <div class="rec-stat">
+            <div class="rec-stat__value" id="stat-active">{{ tasks | selectattr('enabled') | list | length }}</div>
+            <div class="rec-stat__label">Active</div>
+        </div>
+        <div class="rec-stat">
+            <div class="rec-stat__value" id="stat-paused">{{ tasks | rejectattr('enabled') | list | length }}</div>
+            <div class="rec-stat__label">Paused</div>
+        </div>
+    </div>
+
+    <!-- Tasks table -->
+    <div id="tasks-container">
+        {% if tasks %}
+        <table class="rec-table" id="tasks-table">
+            <thead>
+                <tr>
+                    <th style="width:50px">On</th>
+                    <th style="width:80px">Freq</th>
+                    <th>Task</th>
+                    <th class="hide-mobile">Project</th>
+                    <th class="hide-mobile">Schedule</th>
+                    <th class="hide-mobile">Last Run</th>
+                    <th style="width:100px"></th>
+                </tr>
+            </thead>
+            <tbody id="tasks-tbody">
+                {% for task in tasks %}
+                {% set task_json = task | tojson %}
+                <tr class="rec-row{% if not task.enabled %} task-disabled{% endif %}"
+                    data-task-id="{{ task.id }}"
+                    data-task='{{ task_json }}'>
+                    <td>
+                        <label class="toggle-switch" onclick="event.stopPropagation()">
+                            <input type="checkbox" class="task-toggle"
+                                   data-task-id="{{ task.id }}"
+                                   {% if task.enabled %}checked{% endif %}>
+                            <span class="toggle-track"></span>
+                        </label>
+                    </td>
+                    <td>
+                        {% if task.frequency == 'every' %}
+                        <span class="badge-freq badge-freq--every">{{ task.interval_display or 'custom' }}</span>
+                        {% else %}
+                        <span class="badge-freq badge-freq--{{ task.frequency }}">{{ task.frequency }}</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="task-text" title="{{ task.text }}">{{ task.text }}</span></td>
+                    <td class="hide-mobile">
+                        {% if task.project %}<span class="badge-project">{{ task.project }}</span>{% else %}<span style="color:var(--text-muted)">—</span>{% endif %}
+                    </td>
+                    <td class="hide-mobile">
+                        <span class="schedule-info">
+                            {% if task.at %}at {{ task.at }}{% endif %}
+                            {% if task.days %}{% if task.at %} · {% endif %}{{ task.days }}{% endif %}
+                            {% if not task.at and not task.days %}—{% endif %}
+                        </span>
+                    </td>
+                    <td class="hide-mobile">
+                        <span class="last-run-info">
+                            {% if task.last_run %}{{ task.last_run[:16] | replace('T', ' ') }}{% else %}never{% endif %}
+                        </span>
+                    </td>
+                    <td>
+                        <div class="rec-actions" onclick="event.stopPropagation()">
+                            <button class="action-btn action-btn--run" onclick="forceRun('{{ task.id }}')" title="Run now">▶</button>
+                            <button class="action-btn action-btn--danger" onclick="deleteTask('{{ task.id }}')" title="Delete">✕</button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state" id="empty-tasks">No recurring tasks. Add one below.</div>
+        {% endif %}
+    </div>
+
+    <!-- Add task form -->
+    <div class="add-form-card">
+        <h3>Add Recurring Task</h3>
+        <form id="add-form">
+            <div class="add-row">
+                <div class="add-group">
+                    <label for="add-freq">Frequency</label>
+                    <select id="add-freq" required>
+                        <option value="daily" selected>Daily</option>
+                        <option value="hourly">Hourly</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="every">Custom interval</option>
+                    </select>
+                </div>
+                <div class="add-group" id="add-interval-group">
+                    <label for="add-interval">Interval</label>
+                    <input type="text" id="add-interval" placeholder="e.g. 5m, 2h, 1h30m" style="min-width:130px">
+                </div>
+                <div class="add-group--text add-group">
+                    <label for="add-text">Task description</label>
+                    <input type="text" id="add-text" placeholder="What should the agent do?" required>
+                </div>
+                <div class="add-group">
+                    <label for="add-project">Project</label>
+                    <select id="add-project">
+                        <option value="">All</option>
+                        {% for p in projects %}
+                        <option value="{{ p }}">{{ p }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="add-group">
+                    <label for="add-at">Time (HH:MM)</label>
+                    <input type="text" id="add-at" placeholder="e.g. 09:00" style="min-width:90px">
+                </div>
+                <div class="add-group">
+                    <label for="add-days">Days</label>
+                    <input type="text" id="add-days" placeholder="e.g. weekdays" style="min-width:100px">
+                </div>
+                <button type="submit" class="btn-save">Add</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Toast notification -->
+<div class="rec-toast" id="rec-toast"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var expandedId = null;
+
+    function toast(msg) {
+        var el = document.getElementById('rec-toast');
+        el.textContent = msg;
+        el.classList.add('visible');
+        setTimeout(function () { el.classList.remove('visible'); }, 2500);
+    }
+
+    function updateStats() {
+        var rows = document.querySelectorAll('.rec-row');
+        var total = rows.length;
+        var active = 0;
+        rows.forEach(function (r) { if (!r.classList.contains('task-disabled')) active++; });
+        document.getElementById('stat-total').textContent = total;
+        document.getElementById('stat-active').textContent = active;
+        document.getElementById('stat-paused').textContent = total - active;
+    }
+
+    function escHtml(s) {
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function formatLastRun(lr) {
+        if (!lr) return 'never';
+        return lr.substring(0, 16).replace('T', ' ');
+    }
+
+    /* ---- Toggle enable/disable ---- */
+    function bindToggle(el) {
+        el.addEventListener('change', function () {
+            var id = this.dataset.taskId;
+            var enabled = this.checked;
+            var row = document.querySelector('.rec-row[data-task-id="' + id + '"]');
+            fetch('/api/recurring/' + id, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled }),
+            }).then(function (r) {
+                if (!r.ok) { el.checked = !enabled; return; }
+                if (row) {
+                    if (enabled) row.classList.remove('task-disabled');
+                    else row.classList.add('task-disabled');
+                }
+                updateStats();
+                toast(enabled ? 'Task enabled' : 'Task paused');
+            }).catch(function () { el.checked = !enabled; });
+        });
+    }
+
+    /* ---- Expandable row for inline editing ---- */
+    function collapseDetail() {
+        var existing = document.querySelector('.rec-detail-row');
+        if (existing) existing.remove();
+        var expandedRow = document.querySelector('.rec-row.expanded');
+        if (expandedRow) expandedRow.classList.remove('expanded');
+        expandedId = null;
+    }
+
+    function expandRow(row) {
+        var id = row.dataset.taskId;
+        if (expandedId === id) { collapseDetail(); return; }
+        collapseDetail();
+
+        var task = JSON.parse(row.dataset.task);
+        expandedId = id;
+        row.classList.add('expanded');
+
+        var detailTr = document.createElement('tr');
+        detailTr.className = 'rec-detail-row';
+        var td = document.createElement('td');
+        td.colSpan = 7;
+        td.innerHTML =
+            '<div class="rec-detail">' +
+            '  <div class="field field--full">' +
+            '    <label for="edit-text">Task description</label>' +
+            '    <input type="text" id="edit-text" value="' + escHtml(task.text) + '">' +
+            '  </div>' +
+            '  <div class="field">' +
+            '    <label for="edit-freq">Frequency</label>' +
+            '    <select id="edit-freq">' +
+            '      <option value="hourly"' + (task.frequency === 'hourly' ? ' selected' : '') + '>Hourly</option>' +
+            '      <option value="daily"' + (task.frequency === 'daily' ? ' selected' : '') + '>Daily</option>' +
+            '      <option value="weekly"' + (task.frequency === 'weekly' ? ' selected' : '') + '>Weekly</option>' +
+            '      <option value="every"' + (task.frequency === 'every' ? ' selected' : '') + '>Custom interval</option>' +
+            '    </select>' +
+            '  </div>' +
+            '  <div class="field" id="edit-interval-wrap" style="' + (task.frequency === 'every' ? '' : 'display:none') + '">' +
+            '    <label for="edit-interval">Interval</label>' +
+            '    <input type="text" id="edit-interval" value="' + escHtml(task.interval_display || '') + '" placeholder="e.g. 5m, 2h">' +
+            '  </div>' +
+            '  <div class="field">' +
+            '    <label for="edit-project">Project</label>' +
+            '    <select id="edit-project">' +
+            '      <option value="">All</option>' +
+            projectOptions(task.project) +
+            '    </select>' +
+            '  </div>' +
+            '  <div class="field">' +
+            '    <label for="edit-at">Time (HH:MM)</label>' +
+            '    <input type="text" id="edit-at" value="' + escHtml(task.at || '') + '" placeholder="e.g. 09:00">' +
+            '  </div>' +
+            '  <div class="field">' +
+            '    <label for="edit-days">Days</label>' +
+            '    <input type="text" id="edit-days" value="' + escHtml(task.days || '') + '" placeholder="e.g. weekdays, mon,wed,fri">' +
+            '  </div>' +
+            '  <div class="detail-actions">' +
+            '    <button type="button" class="btn-cancel" id="edit-cancel">Cancel</button>' +
+            '    <button type="button" class="btn-save" id="edit-save">Save</button>' +
+            '  </div>' +
+            '</div>';
+        detailTr.appendChild(td);
+        row.parentNode.insertBefore(detailTr, row.nextSibling);
+
+        document.getElementById('edit-freq').addEventListener('change', function () {
+            document.getElementById('edit-interval-wrap').style.display =
+                this.value === 'every' ? '' : 'none';
+        });
+
+        document.getElementById('edit-cancel').addEventListener('click', collapseDetail);
+
+        document.getElementById('edit-save').addEventListener('click', function () {
+            var payload = {
+                text: document.getElementById('edit-text').value,
+                frequency: document.getElementById('edit-freq').value,
+                project: document.getElementById('edit-project').value || null,
+                at: document.getElementById('edit-at').value || null,
+                days: document.getElementById('edit-days').value || null,
+            };
+            if (payload.frequency === 'every') {
+                payload.interval = document.getElementById('edit-interval').value;
+            }
+            fetch('/api/recurring/' + id, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            }).then(function (r) {
+                if (!r.ok) return r.json().then(function (d) { toast('Error: ' + (d.error || 'Save failed')); });
+                return r.json().then(function (updated) {
+                    row.dataset.task = JSON.stringify(updated);
+                    refreshRowContent(row, updated);
+                    collapseDetail();
+                    toast('Task updated');
+                });
+            }).catch(function () { toast('Network error'); });
+        });
+
+        document.getElementById('edit-text').focus();
+    }
+
+    var PROJECTS = {{ projects | tojson }};
+
+    function projectOptions(selected) {
+        return PROJECTS.map(function (p) {
+            return '<option value="' + escHtml(p) + '"' + (p === selected ? ' selected' : '') + '>' + escHtml(p) + '</option>';
+        }).join('');
+    }
+
+    function refreshRowContent(row, task) {
+        var cells = row.querySelectorAll('td');
+        // cell 1 = freq badge
+        var freqLabel = task.frequency === 'every' ? (task.interval_display || 'custom') : task.frequency;
+        cells[1].innerHTML = '<span class="badge-freq badge-freq--' + task.frequency + '">' + escHtml(freqLabel) + '</span>';
+        // cell 2 = text
+        cells[2].innerHTML = '<span class="task-text" title="' + escHtml(task.text) + '">' + escHtml(task.text) + '</span>';
+        // cell 3 = project
+        cells[3].innerHTML = task.project
+            ? '<span class="badge-project">' + escHtml(task.project) + '</span>'
+            : '<span style="color:var(--text-muted)">—</span>';
+        // cell 4 = schedule
+        var sched = '';
+        if (task.at) sched += 'at ' + task.at;
+        if (task.days) sched += (sched ? ' · ' : '') + task.days;
+        cells[4].innerHTML = '<span class="schedule-info">' + (sched || '—') + '</span>';
+        // cell 5 = last run
+        cells[5].innerHTML = '<span class="last-run-info">' + formatLastRun(task.last_run) + '</span>';
+    }
+
+    function bindRow(row) {
+        row.addEventListener('click', function () { expandRow(row); });
+        var toggle = row.querySelector('.task-toggle');
+        if (toggle) bindToggle(toggle);
+    }
+
+    document.querySelectorAll('.rec-row').forEach(bindRow);
+
+    /* ---- Delete ---- */
+    window.deleteTask = function (id) {
+        if (!confirm('Delete this recurring task?')) return;
+        fetch('/api/recurring/' + id, { method: 'DELETE' })
+        .then(function (r) {
+            if (!r.ok) return;
+            var row = document.querySelector('.rec-row[data-task-id="' + id + '"]');
+            if (expandedId === id) collapseDetail();
+            if (row) row.remove();
+            var tbody = document.getElementById('tasks-tbody');
+            if (tbody && tbody.children.length === 0) {
+                document.getElementById('tasks-container').innerHTML =
+                    '<div class="empty-state" id="empty-tasks">No recurring tasks. Add one below.</div>';
+            }
+            updateStats();
+            toast('Task deleted');
+        });
+    };
+
+    /* ---- Force run ---- */
+    window.forceRun = function (id) {
+        fetch('/api/recurring/' + id + '/run', { method: 'POST' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+            if (d.ok) toast('Task queued for immediate run');
+            else toast('Error: ' + (d.error || 'Unknown'));
+        })
+        .catch(function () { toast('Network error'); });
+    };
+
+    /* ---- Add form ---- */
+    var addFreq = document.getElementById('add-freq');
+    var addIntervalGroup = document.getElementById('add-interval-group');
+    addFreq.addEventListener('change', function () {
+        addIntervalGroup.style.display = this.value === 'every' ? '' : 'none';
+    });
+
+    document.getElementById('add-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        var freq = addFreq.value;
+        var text = document.getElementById('add-text').value.trim();
+        if (!text) return;
+
+        var payload = { frequency: freq, text: text };
+        var project = document.getElementById('add-project').value;
+        if (project) payload.project = project;
+        var at = document.getElementById('add-at').value.trim();
+        if (at) payload.at = at;
+        var days = document.getElementById('add-days').value.trim();
+        if (days) payload.days = days;
+        if (freq === 'every') {
+            payload.interval = document.getElementById('add-interval').value.trim();
+            if (!payload.interval) { toast('Interval is required'); return; }
+        }
+
+        fetch('/api/recurring', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        }).then(function (r) {
+            if (!r.ok) return r.json().then(function (d) { toast('Error: ' + (d.error || 'Create failed')); });
+            return r.json().then(function (task) {
+                addTaskRow(task);
+                document.getElementById('add-form').reset();
+                addIntervalGroup.style.display = 'none';
+                updateStats();
+                toast('Task created');
+            });
+        }).catch(function () { toast('Network error'); });
+    });
+
+    function addTaskRow(task) {
+        var tbody = document.getElementById('tasks-tbody');
+        if (!tbody) {
+            document.getElementById('tasks-container').innerHTML =
+                '<table class="rec-table" id="tasks-table">' +
+                '<thead><tr>' +
+                '<th style="width:50px">On</th><th style="width:80px">Freq</th><th>Task</th>' +
+                '<th class="hide-mobile">Project</th><th class="hide-mobile">Schedule</th>' +
+                '<th class="hide-mobile">Last Run</th><th style="width:100px"></th>' +
+                '</tr></thead><tbody id="tasks-tbody"></tbody></table>';
+            tbody = document.getElementById('tasks-tbody');
+        }
+        var freqLabel = task.frequency === 'every' ? (task.interval_display || 'custom') : task.frequency;
+        var sched = '';
+        if (task.at) sched += 'at ' + task.at;
+        if (task.days) sched += (sched ? ' · ' : '') + task.days;
+        var tr = document.createElement('tr');
+        tr.className = 'rec-row';
+        tr.dataset.taskId = task.id;
+        tr.dataset.task = JSON.stringify(task);
+        tr.innerHTML =
+            '<td><label class="toggle-switch" onclick="event.stopPropagation()">' +
+            '<input type="checkbox" class="task-toggle" data-task-id="' + task.id + '" checked>' +
+            '<span class="toggle-track"></span></label></td>' +
+            '<td><span class="badge-freq badge-freq--' + task.frequency + '">' + escHtml(freqLabel) + '</span></td>' +
+            '<td><span class="task-text" title="' + escHtml(task.text) + '">' + escHtml(task.text) + '</span></td>' +
+            '<td class="hide-mobile">' + (task.project ? '<span class="badge-project">' + escHtml(task.project) + '</span>' : '<span style="color:var(--text-muted)">—</span>') + '</td>' +
+            '<td class="hide-mobile"><span class="schedule-info">' + (sched || '—') + '</span></td>' +
+            '<td class="hide-mobile"><span class="last-run-info">never</span></td>' +
+            '<td><div class="rec-actions" onclick="event.stopPropagation()">' +
+            '<button class="action-btn action-btn--run" onclick="forceRun(\'' + task.id + '\')" title="Run now">▶</button>' +
+            '<button class="action-btn action-btn--danger" onclick="deleteTask(\'' + task.id + '\')" title="Delete">✕</button>' +
+            '</div></td>';
+        tbody.appendChild(tr);
+        bindRow(tr);
+    }
+
+    /* ---- Escape to close detail ---- */
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && expandedId) collapseDetail();
+    });
+})();
+</script>
+{% endblock %}

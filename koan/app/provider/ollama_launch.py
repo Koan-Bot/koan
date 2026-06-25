@@ -15,14 +15,15 @@ Claude Code CLI verbatim.
 """
 
 import os
+import re
 import shutil
 import sys
 from typing import Dict, List, Optional, Tuple
 
-from app.provider.base import CLIProvider
+from app.provider.claude import ClaudeProvider
 
 
-class OllamaLaunchProvider(CLIProvider):
+class OllamaLaunchProvider(ClaudeProvider):
     """Provider that uses ``ollama launch claude`` to run Claude Code.
 
     Advantages over manual OllamaClaudeProvider:
@@ -30,6 +31,11 @@ class OllamaLaunchProvider(CLIProvider):
     - Ollama auto-starts the server if needed
     - Native integration maintained by Ollama upstream
     - Model validated by Ollama before launch
+
+    Because everything after ``--`` is forwarded to the Claude Code CLI,
+    this provider inherits from :class:`ClaudeProvider` and reuses all
+    Claude-specific flag builders (permissions, system prompts, session
+    resume, streaming, effort, thinking, quota detection, etc.).
 
     Configuration (config.yaml)::
 
@@ -77,50 +83,9 @@ class OllamaLaunchProvider(CLIProvider):
         """Check that ollama binary exists and is v0.16.0+."""
         return shutil.which("ollama") is not None
 
-    def build_prompt_args(self, prompt: str) -> List[str]:
-        return ["-p", prompt]
-
-    def build_tool_args(
-        self,
-        allowed_tools: Optional[List[str]] = None,
-        disallowed_tools: Optional[List[str]] = None,
-    ) -> List[str]:
-        flags: List[str] = []
-        if allowed_tools:
-            flags.extend(["--allowedTools", ",".join(allowed_tools)])
-        if disallowed_tools:
-            flags.extend(["--disallowedTools"] + disallowed_tools)
-        return flags
-
     def build_model_args(self, model: str = "", fallback: str = "") -> List[str]:
-        # Model is handled by ollama --model flag, not Claude --model
-        # So we don't add anything here — it's injected in build_command()
+        # Model is handled by ollama --model flag (before --), not Claude --model.
         return []
-
-    def build_output_args(self, fmt: str = "") -> List[str]:
-        if fmt:
-            return ["--output-format", fmt]
-        return []
-
-    def build_max_turns_args(self, max_turns: int = 0) -> List[str]:
-        if max_turns > 0:
-            return ["--max-turns", str(max_turns)]
-        return []
-
-    def build_mcp_args(self, configs: Optional[List[str]] = None) -> List[str]:
-        if not configs:
-            return []
-        flags = ["--mcp-config"]
-        flags.extend(configs)
-        return flags
-
-    def build_plugin_args(self, plugin_dirs: Optional[List[str]] = None) -> List[str]:
-        if not plugin_dirs:
-            return []
-        flags: List[str] = []
-        for d in plugin_dirs:
-            flags.extend(["--plugin-dir", d])
-        return flags
 
     def build_command(
         self,
@@ -133,10 +98,19 @@ class OllamaLaunchProvider(CLIProvider):
         max_turns: int = 0,
         mcp_configs: Optional[List[str]] = None,
         plugin_dirs: Optional[List[str]] = None,
+        skip_permissions: bool = False,
+        system_prompt: str = "",
+        system_prompt_file: str = "",
+        effort: str = "",
+        resume_session_id: str = "",
     ) -> List[str]:
         """Build: ollama launch claude --model X -- <claude-flags>.
 
         The ``--`` separator divides Ollama args from Claude Code args.
+        Everything after ``--`` uses the same flag builders as
+        :class:`ClaudeProvider` so feature parity is maintained
+        (permissions, system prompts, resume, output format, max turns,
+        MCP, plugins, effort).
         """
         # Ollama part: binary + launch subcommand + model
         cmd = ["ollama", "launch", "claude"]
@@ -147,13 +121,29 @@ class OllamaLaunchProvider(CLIProvider):
         # Separator between ollama args and Claude Code args
         cmd.append("--")
 
-        # Claude Code part: all flags passed through verbatim
+        # Claude Code part — same ordering as base CLIProvider.build_command()
+        if resume_session_id and self.supports_session_resume():
+            cmd.extend(self.build_resume_args(resume_session_id))
+        cmd.extend(self.build_permission_args(skip_permissions))
+
+        # System prompt: file mode takes precedence over inline content.
+        if system_prompt_file and self.supports_system_prompt_file():
+            cmd.extend(self.build_system_prompt_file_args(system_prompt_file))
+        elif system_prompt:
+            sys_args = self.build_system_prompt_args(system_prompt)
+            if sys_args:
+                cmd.extend(sys_args)
+            else:
+                prompt = system_prompt + "\n\n" + prompt
+
         cmd.extend(self.build_prompt_args(prompt))
         cmd.extend(self.build_tool_args(allowed_tools, disallowed_tools))
+        cmd.extend(self.build_model_args(model, fallback))
         cmd.extend(self.build_output_args(output_format))
         cmd.extend(self.build_max_turns_args(max_turns))
         cmd.extend(self.build_mcp_args(mcp_configs))
         cmd.extend(self.build_plugin_args(plugin_dirs))
+        cmd.extend(self.build_effort_args(effort))
         return cmd
 
     def get_env(self) -> Dict[str, str]:
@@ -163,3 +153,35 @@ class OllamaLaunchProvider(CLIProvider):
     def check_quota_available(self, project_path: str, timeout: int = 15) -> Tuple[bool, str]:
         """Local models have no API quota — always available."""
         return True, ""
+
+    _OLLAMA_QUOTA_PATTERNS = (
+        r"Request rejected \(429\)",
+        r"reached your session usage limit",
+        r"ollama\.com/upgrade",
+    )
+
+    def detect_quota_exhaustion(
+        self,
+        stdout_text: str = "",
+        stderr_text: str = "",
+        exit_code: int = 0,
+    ) -> bool:
+        """Detect Ollama-specific quota failures, then fall back to Claude patterns.
+
+        Stderr is trusted unconditionally. Stdout is only scanned when
+        exit_code != 0 to avoid false-pausing successful runs whose
+        transcript quotes Ollama quota text.
+        """
+        stderr_text = stderr_text or ""
+        stdout_text = stdout_text or ""
+        for pattern in self._OLLAMA_QUOTA_PATTERNS:
+            if re.search(pattern, stderr_text, re.IGNORECASE):
+                return True
+            if exit_code != 0 and re.search(pattern, stdout_text, re.IGNORECASE):
+                return True
+        fallback_stdout = stdout_text if exit_code != 0 else ""
+        return super().detect_quota_exhaustion(fallback_stdout, stderr_text, exit_code)
+
+    def has_api_quota(self) -> bool:
+        """Ollama launch uses local or cloud Ollama — no metered API quota."""
+        return False

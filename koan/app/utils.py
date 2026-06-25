@@ -17,13 +17,16 @@ extracted to dedicated modules (config.py, journal.py, conversation_history.py).
 Backward-compatible re-exports are provided below.
 """
 
+import contextlib
 import fcntl
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import yaml
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -33,9 +36,27 @@ if "KOAN_ROOT" not in os.environ:
     raise SystemExit("KOAN_ROOT environment variable is not set. Run via 'make run' or 'make awake'.")
 KOAN_ROOT = Path(os.environ["KOAN_ROOT"])
 
-# Pre-compiled regex for project tag extraction (accepts both [project:X] and [projet:X])
-_PROJECT_TAG_RE = re.compile(r'\[projec?t:([a-zA-Z0-9_-]+)\]')
-_PROJECT_TAG_STRIP_RE = re.compile(r'\[projec?t:[a-zA-Z0-9_-]+\]\s*')
+# Single source of truth for the project-name character class.
+# Dots are allowed because project names may be domain-like, e.g. developers.esphome.io.
+# Extend here (not in scattered call sites) when the allowed character set changes.
+PROJECT_NAME_CHARS = r"a-zA-Z0-9_.-"
+
+# Bracketed inline tag, capturing form: [project:X] / [projet:X]
+PROJECT_TAG_RE = re.compile(rf'\[projec?t:([{PROJECT_NAME_CHARS}]+)\]', re.IGNORECASE)
+# Bracketed inline tag, strip form (with trailing whitespace consumed).
+PROJECT_TAG_STRIP_RE = re.compile(rf'\[projec?t:[{PROJECT_NAME_CHARS}]+\]\s*', re.IGNORECASE)
+# Anchored prefix form (used to peel a leading tag off a mission line).
+PROJECT_TAG_PREFIX_RE = re.compile(rf'^\[projec?t:([{PROJECT_NAME_CHARS}]+)\]\s*', re.IGNORECASE)
+# Full alternation form with surrounding whitespace (dashboard / template-side parity).
+PROJECT_TAG_FULL_RE = re.compile(rf'\s*\[(?:project|projet):([{PROJECT_NAME_CHARS}]+)\]\s*', re.IGNORECASE)
+# Markdown sub-header form: "### project:name" / "### projet:name"
+PROJECT_SUBHEADER_RE = re.compile(rf'###\s+projec?t\s*:\s*([{PROJECT_NAME_CHARS}]+)', re.IGNORECASE)
+# Natural-text hint form: "(projet: name)" / "projet:name" (no brackets)
+PROJECT_HINT_RE = re.compile(rf'\(?\s*projec?t\s*:\s*([{PROJECT_NAME_CHARS}]+)\s*\)?', re.IGNORECASE)
+# Unbracketed *trailing* hint: "... project:name" at the very end of the text.
+# Anchored to end (and requires leading whitespace) so a "project:" mid-sentence
+# is never misread as a tag — used as a lenient fallback for command input.
+PROJECT_TRAILING_HINT_RE = re.compile(rf'\s+projec?t:([{PROJECT_NAME_CHARS}]+)\s*$', re.IGNORECASE)
 
 _MISSIONS_DEFAULT = "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n"
 _MISSIONS_LOCK = threading.Lock()
@@ -44,6 +65,33 @@ _MISSIONS_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # Core utilities (stay here)
 # ---------------------------------------------------------------------------
+
+def read_timestamp_file(path) -> Optional[float]:
+    """Read a file containing a single epoch timestamp.
+
+    Returns the timestamp as float, or None if the file is missing
+    or its content cannot be parsed.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return float(path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def get_file_age_seconds(path) -> Optional[float]:
+    """Return how many seconds ago a timestamp stored in *path* was written.
+
+    Combines :func:`read_timestamp_file` with the current wall-clock time.
+    Returns None when the file is missing or unparseable.
+    """
+    ts = read_timestamp_file(path)
+    if ts is None:
+        return None
+    return time.time() - ts
+
 
 def load_dotenv():
     """Load .env file from the project root, stripping quotes from values.
@@ -114,19 +162,70 @@ def parse_project(text: str) -> Tuple[Optional[str], str]:
     Returns (project_name, cleaned_text) where cleaned_text has the tag removed.
     Returns (None, text) if no tag found.
     """
-    match = _PROJECT_TAG_RE.search(text)
+    match = PROJECT_TAG_RE.search(text)
     if match:
         project = match.group(1)
-        cleaned = _PROJECT_TAG_STRIP_RE.sub('', text).strip()
+        cleaned = PROJECT_TAG_STRIP_RE.sub('', text).strip()
         return project, cleaned
     return None, text
 
 
-def detect_project_from_text(text: str) -> Tuple[Optional[str], str]:
-    """Detect project name from the first word of text.
+def parse_project_lenient(text: str) -> Tuple[Optional[str], str]:
+    """Extract a project, accepting both bracketed and trailing-inline forms.
 
-    If the first word matches a known project name (case-insensitive),
-    returns (project_name, remaining_text). Otherwise returns (None, text).
+    Tries the canonical ``[project:name]`` tag first (via :func:`parse_project`);
+    if absent, falls back to an unbracketed **trailing** ``project:name`` hint
+    (e.g. ``run the audit project:yarn``). The fallback is anchored to the end
+    of the string, so a ``project:`` appearing mid-sentence is never mistaken
+    for a tag.
+
+    Returns ``(project_name, cleaned_text)`` with the tag/hint removed, or
+    ``(None, text)`` when neither form is present. Use this for human command
+    input (e.g. ``/daily``) where forgetting the brackets should not silently
+    drop the project.
+    """
+    project, cleaned = parse_project(text)
+    if project is not None:
+        return project, cleaned
+    match = PROJECT_TRAILING_HINT_RE.search(text)
+    if match:
+        project = match.group(1)
+        cleaned = PROJECT_TRAILING_HINT_RE.sub('', text).strip()
+        return project, cleaned
+    return None, text
+
+
+def load_project_aliases() -> dict:
+    """Load project aliases from instance/.project-aliases.json.
+
+    Returns a dict mapping shortcut (lowercase) -> canonical project name.
+    """
+    import json
+    aliases_path = KOAN_ROOT / "instance" / ".project-aliases.json"
+    if not aliases_path.exists():
+        return {}
+    try:
+        return json.loads(aliases_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def resolve_project_alias(name: str) -> Optional[str]:
+    """Resolve a project alias to its canonical project name.
+
+    Returns the canonical project name if *name* is a known alias,
+    or None if it isn't.
+    """
+    aliases = load_project_aliases()
+    return aliases.get(name.lower())
+
+
+def detect_project_from_text(text: str) -> Tuple[Optional[str], str]:
+    """Detect project name or alias from the first word of text.
+
+    If the first word matches a known project name (case-insensitive)
+    or a project alias, returns (project_name, remaining_text).
+    Otherwise returns (None, text).
     """
     parts = text.strip().split(None, 1)
     if not parts:
@@ -139,6 +238,12 @@ def detect_project_from_text(text: str) -> Tuple[Optional[str], str]:
     if first_word in project_names:
         remaining = parts[1].strip() if len(parts) > 1 else ""
         return project_names[first_word], remaining
+
+    # Alias fallback
+    alias_project = resolve_project_alias(first_word)
+    if alias_project:
+        remaining = parts[1].strip() if len(parts) > 1 else ""
+        return alias_project, remaining
 
     return None, text
 
@@ -218,6 +323,88 @@ def get_all_github_remotes(project_path: str) -> List[str]:
     return remotes
 
 
+_koan_tmp_dir_cache: Optional[str] = None
+
+
+def koan_tmp_dir() -> str:
+    """Return a per-uid temp directory for Kōan's scratch files and locks.
+
+    Resolution order:
+      1. ``KOAN_TMP_DIR`` env override (explicit operator/test control).
+      2. ``$XDG_RUNTIME_DIR/koan`` when ``XDG_RUNTIME_DIR`` is set
+         (Linux/systemd; the dir is per-uid and reaped on logout).
+      3. ``<gettempdir>/koan-<uid>`` fallback (covers macOS, which has no
+         ``XDG_RUNTIME_DIR``).
+
+    The directory is created mode ``0700`` so files created by one user cannot
+    be read or name-collided by another user sharing the same host. This is the
+    fix for multi-instance ``/tmp`` collisions (e.g. two users clashing on the
+    provider invocation lock).
+
+    Per-*uid* rather than per-instance on purpose: provider auth/session state
+    lives in the user's home dir, so two Kōan instances run by the same user
+    must still serialize on the same lock.
+
+    Because the fallback path (``/tmp/koan-<uid>``) is predictable and ``/tmp``
+    is world-writable, the directory is created securely: a pre-existing entry
+    is accepted only if it is a real directory (not a symlink) owned by the
+    current uid. Otherwise we fail closed rather than write scratch files and
+    the provider lock into an attacker-controlled location.
+    """
+    global _koan_tmp_dir_cache
+    if _koan_tmp_dir_cache is not None:
+        return _koan_tmp_dir_cache
+
+    override = os.environ.get("KOAN_TMP_DIR")
+    if override:
+        base = Path(override)
+    else:
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg:
+            base = Path(xdg) / "koan"
+        else:
+            base = Path(tempfile.gettempdir()) / f"koan-{os.getuid()}"
+
+    _ensure_secure_dir(base)
+
+    _koan_tmp_dir_cache = str(base)
+    return _koan_tmp_dir_cache
+
+
+def _ensure_secure_dir(base: Path) -> None:
+    """Create *base* mode 0700, or validate a pre-existing one is safe.
+
+    Guards against the classic shared-``/tmp`` pre-creation/symlink attack: if
+    another user pre-creates the predictable ``/tmp/koan-<uid>`` path, a naive
+    ``makedirs(exist_ok=True)`` would silently accept it and we'd write secrets
+    and the provider lock into their directory. We instead create with
+    ``exist_ok=False`` and, when the path already exists, accept it only when it
+    is a real directory (not a symlink) owned by the current uid; group/other
+    permission bits are tightened. Anything else raises.
+    """
+    try:
+        os.makedirs(base, mode=0o700, exist_ok=False)
+        return  # freshly created — owned by us, 0700
+    except FileExistsError:
+        pass
+
+    st = os.lstat(base)  # lstat, not stat: a symlink must not pass the check
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(
+            f"Refusing to use temp dir {base!r}: not a real directory "
+            "(possible symlink attack). Set KOAN_TMP_DIR to a safe path."
+        )
+    if st.st_uid != os.getuid():
+        raise RuntimeError(
+            f"Refusing to use temp dir {base!r}: owned by uid {st.st_uid}, "
+            f"not {os.getuid()} (possible pre-creation attack). "
+            "Set KOAN_TMP_DIR to a safe path."
+        )
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        # We own it, so tightening group/other access succeeds.
+        os.chmod(base, 0o700)
+
+
 def atomic_write(path: Path, content: str):
     """Write content to a file atomically using write-to-temp + rename.
 
@@ -234,11 +421,76 @@ def atomic_write(path: Path, content: str):
             os.fsync(f.fileno())
         os.replace(tmp, str(path))
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
+
+
+def atomic_write_json(path: Path, data, indent=None):
+    """Serialize ``data`` to JSON and write atomically via :func:`atomic_write`.
+
+    Convenience wrapper used by modules that persist dicts/lists as JSON.
+    """
+    import json
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=indent))
+
+
+def update_config_yaml(config_path: Path, keys, value) -> None:
+    """Set a nested key in a YAML config file, preserving comments.
+
+    ``keys`` is a list of nested keys (e.g. ``["models", "claude"]``) or a
+    single dotted string (e.g. ``"dashboard.nickname"``). Intermediate dicts
+    are created as needed.
+
+    Uses ruamel.yaml to round-trip the file so user comments and formatting
+    survive the edit; falls back to plain pyyaml when ruamel is unavailable.
+    Both paths write atomically via :func:`atomic_write`.
+
+    This is the single shared implementation for comment-preserving config
+    edits; callers in onboarding, dashboard, and tui_dashboard delegate here.
+    """
+    import io
+
+    if isinstance(keys, str):
+        keys = keys.split(".")
+
+    # Isolate the optional dependency check so operational errors raised by
+    # ruamel internals propagate instead of being silently swallowed into the
+    # pyyaml fallback.
+    try:
+        from ruamel.yaml import YAML
+        _has_ruamel = True
+    except ImportError:
+        _has_ruamel = False
+
+    if _has_ruamel:
+        ry = YAML()
+        ry.preserve_quotes = True
+        data = ry.load(config_path.read_text()) if config_path.exists() else {}
+        if data is None:
+            data = {}
+        node = data
+        for k in keys[:-1]:
+            node = node.setdefault(k, {})
+        node[keys[-1]] = value
+        stream = io.StringIO()
+        ry.dump(data, stream)
+        atomic_write(config_path, stream.getvalue())
+        return
+
+    try:
+        data = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        data = data or {}
+    except yaml.YAMLError as e:
+        print(f"[utils] update_config_yaml: invalid YAML in {config_path}: {e}", file=sys.stderr)
+        return
+
+    node = data
+    for k in keys[:-1]:
+        node = node.setdefault(k, {})
+    node[keys[-1]] = value
+
+    atomic_write(config_path, yaml.safe_dump(data, sort_keys=False))
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -246,6 +498,73 @@ def truncate_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n...(truncated)"
+
+
+def truncate_diff(diff: str, max_chars: int) -> str:
+    """Truncate a unified diff intelligently, preserving whole file blocks.
+
+    Instead of cutting at an arbitrary character offset (which leaves the
+    reviewer guessing what was cut), this splits the diff into per-file
+    blocks and keeps as many complete blocks as fit within *max_chars*.
+    Files that don't fit are listed as a summary at the end so the
+    reviewer knows they exist.
+    """
+    if not diff or len(diff) <= max_chars:
+        return diff
+
+    # Split into per-file blocks at 'diff --git' boundaries.
+    raw_blocks = re.split(r'(?=^diff --git )', diff, flags=re.MULTILINE)
+    blocks = [b for b in raw_blocks if b.strip()]
+
+    if not blocks:
+        # Can't parse structure — fall back to character truncation.
+        return truncate_text(diff, max_chars)
+
+    # Pre-scan filenames so we can estimate the worst-case footer size
+    # and reserve budget for it, ensuring output stays within max_chars.
+    filenames: list[str] = []
+    for block in blocks:
+        m = re.match(r'diff --git a/\S+ b/(\S+)', block)
+        filenames.append(m.group(1) if m else "(unknown file)")
+
+    # Greedy first pass: keep blocks that fit without any footer.
+    kept: list[str] = []
+    skipped: list[str] = []
+    used = 0
+
+    for block, name in zip(blocks, filenames, strict=True):
+        if used + len(block) <= max_chars:
+            kept.append((block, name))
+            used += len(block)
+        else:
+            skipped.append(name)
+
+    # If we skipped files, we need a footer — trim kept blocks until
+    # the footer fits too.
+    while skipped and kept:
+        footer = _build_footer(skipped, len(kept))
+        if used + len(footer) <= max_chars:
+            break
+        # Drop the last kept block to make room for the footer.
+        dropped_block, dropped_name = kept.pop()
+        used -= len(dropped_block)
+        skipped.insert(0, dropped_name)
+
+    result = "".join(b for b, _ in kept)
+    if skipped:
+        result += _build_footer(skipped, len(kept))
+    return result
+
+
+def _build_footer(skipped: list[str], kept_count: int) -> str:
+    """Build the omitted-files footer string."""
+    listing = "\n".join(f"  - {f}" for f in skipped)
+    return (
+        f"\n\n...(diff truncated — {len(skipped)} file(s) omitted, "
+        f"{kept_count} file(s) shown)\n"
+        f"Omitted files:\n{listing}\n"
+    )
+
 
 
 def _locked_missions_rw(missions_path: Path, transform):
@@ -293,10 +612,8 @@ def _locked_missions_rw(missions_path: Path, transform):
                         os.fsync(f.fileno())
                     os.replace(tmp, str(missions_path))
                 except BaseException:
-                    try:
+                    with contextlib.suppress(OSError):
                         os.unlink(tmp)
-                    except OSError:
-                        pass
                     raise
             finally:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
@@ -304,7 +621,9 @@ def _locked_missions_rw(missions_path: Path, transform):
     return new_content
 
 
-def insert_pending_mission(missions_path: Path, entry: str, *, urgent: bool = False):
+def insert_pending_mission(
+    missions_path: Path, entry: str, *, urgent: bool = False,
+) -> bool:
     """Insert a mission entry into the pending section of missions.md.
 
     By default, inserts at the bottom of the pending section (FIFO queue).
@@ -313,13 +632,24 @@ def insert_pending_mission(missions_path: Path, entry: str, *, urgent: bool = Fa
     Uses file locking for the entire read-modify-write cycle to prevent
     TOCTOU race conditions between awake.py and dashboard.py.
     Creates the file with default structure if it doesn't exist.
-    """
-    from app.missions import insert_mission
 
-    _locked_missions_rw(
-        missions_path,
-        lambda content: insert_mission(content, entry, urgent=urgent),
-    )
+    Returns:
+        True if the mission was inserted, False if it was a duplicate
+        (same command + URL already pending or in progress).
+    """
+    from app.missions import insert_mission, is_duplicate_mission
+
+    inserted = True
+
+    def _transform(content: str) -> str:
+        nonlocal inserted
+        if is_duplicate_mission(content, entry):
+            inserted = False
+            return content
+        return insert_mission(content, entry, urgent=urgent)
+
+    _locked_missions_rw(missions_path, _transform)
+    return inserted
 
 
 def modify_missions_file(missions_path: Path, transform):
@@ -334,19 +664,12 @@ def modify_missions_file(missions_path: Path, transform):
     return _locked_missions_rw(missions_path, transform)
 
 
-def get_known_projects() -> list:
-    """Return sorted list of (name, path) tuples.
-
-    Resolution order:
-    1. Merged registry: projects.yaml + workspace/ (if either exists)
-    2. KOAN_PROJECTS env var (fallback)
-
-    Returns empty list if none is configured.
-    """
+def _get_known_projects_for_root(koan_root: Path) -> list:
+    """Return sorted list of (name, path) tuples for a specific Koan root."""
     # 1. Try merged registry (projects.yaml + workspace/)
     try:
         from app.projects_merged import get_all_projects
-        result = get_all_projects(str(KOAN_ROOT))
+        result = get_all_projects(str(koan_root))
         if result:
             return result
     except Exception as e:
@@ -355,7 +678,7 @@ def get_known_projects() -> list:
     # 2. Try projects.yaml alone (fallback if merged module fails)
     try:
         from app.projects_config import load_projects_config, get_projects_from_config
-        config = load_projects_config(str(KOAN_ROOT))
+        config = load_projects_config(str(koan_root))
         if config is not None:
             return get_projects_from_config(config)
     except Exception as e:
@@ -375,6 +698,18 @@ def get_known_projects() -> list:
     return []
 
 
+def get_known_projects() -> list:
+    """Return sorted list of (name, path) tuples.
+
+    Resolution order:
+    1. Merged registry: projects.yaml + workspace/ (if either exists)
+    2. KOAN_PROJECTS env var (fallback)
+
+    Returns empty list if none is configured.
+    """
+    return _get_known_projects_for_root(KOAN_ROOT)
+
+
 def is_known_project(name: str) -> bool:
     """Check if a name matches a known project (case-insensitive)."""
     try:
@@ -384,15 +719,173 @@ def is_known_project(name: str) -> bool:
         return False
 
 
+def _normalise_project_path_for_match(project_path: str) -> Optional[Path]:
+    """Normalize a project path for identity comparisons."""
+    if not project_path:
+        return None
+    try:
+        return Path(project_path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
+def find_known_project_name_for_path(
+    project_path: str,
+    koan_root: Optional[str] = None,
+) -> Optional[str]:
+    """Return the configured or workspace project name for a local path.
+
+    Unlike ``project_name_for_path``, returns ``None`` when there is no merged
+    registry match so callers can decide whether to warn before falling back.
+    """
+    target = _normalise_project_path_for_match(project_path)
+    if target is None:
+        return None
+
+    root = Path(koan_root) if koan_root else KOAN_ROOT
+    for name, path in _get_known_projects_for_root(root):
+        candidate = _normalise_project_path_for_match(path)
+        if candidate == target:
+            return name
+
+    workspace = _normalise_project_path_for_match(str(root / "workspace"))
+    if workspace is not None:
+        try:
+            relative = target.relative_to(workspace)
+        except ValueError:
+            relative = None
+        if relative is not None and len(relative.parts) == 1:
+            name = relative.parts[0]
+            if name and not name.startswith("."):
+                return name
+    return None
+
+
 def project_name_for_path(project_path: str) -> str:
     """Get the project name for a given local path.
 
     Checks known projects first; falls back to the directory basename.
     """
-    for name, path in get_known_projects():
-        if path == project_path:
-            return name
-    return Path(project_path).name
+    known = find_known_project_name_for_path(project_path)
+    if known:
+        return known
+    return Path(project_path).name if project_path else ""
+
+
+def _find_partial_name_candidates(
+    repo_lower: str, projects: list
+) -> list:
+    """Find projects whose name/basename partially matches the repo name.
+
+    Catches aliased clones: e.g. repo "perl-convert-asn1" with local dir
+    "convert-asn1".  Matches when one name is a dash-separated suffix of
+    the other.
+
+    Returns a list of (name, path) tuples — candidates to validate via remote.
+    """
+    candidates = []
+    for name, path in projects:
+        name_lower = name.lower()
+        basename_lower = Path(path).name.lower()
+        for local in (name_lower, basename_lower):
+            if local == repo_lower:
+                continue  # Already handled by exact-match steps
+            # repo name ends with -<local> (e.g., "perl-convert-asn1" ends with "-convert-asn1")
+            if repo_lower.endswith(f"-{local}") or repo_lower.endswith(f"_{local}"):
+                candidates.append((name, path))
+                break
+            # local name ends with -<repo> (e.g., local "perl-convert-asn1" for repo "convert-asn1")
+            if local.endswith(f"-{repo_lower}") or local.endswith(f"_{repo_lower}"):
+                candidates.append((name, path))
+                break
+    return candidates
+
+
+def _persist_and_cache_remotes(
+    name: str, path: str, all_remotes: list, projects: list
+) -> None:
+    """Persist discovered github remotes to yaml and in-memory cache."""
+    primary = get_github_remote(path)
+    try:
+        from app.projects_config import load_projects_config, save_projects_config
+        config = load_projects_config(str(KOAN_ROOT))
+        if config and name in config.get("projects", {}):
+            proj = config["projects"][name]
+            if isinstance(proj, dict) and proj.get("path"):
+                if primary and not proj.get("github_url"):
+                    proj["github_url"] = primary
+                proj["github_urls"] = all_remotes
+                save_projects_config(str(KOAN_ROOT), config)
+    except Exception as e:
+        print(f"[utils] Failed to persist github_urls for {name}: {e}", file=sys.stderr)
+    if primary:
+        try:
+            from app.projects_merged import set_github_url
+            set_github_url(name, primary)
+        except Exception as e:
+            print(f"[utils] Failed to cache github_url for {name}: {e}", file=sys.stderr)
+
+
+def _resolve_via_fork_parent(
+    target: str, projects: list, config: Optional[dict] = None
+) -> Optional[str]:
+    """Resolve a GitHub repo via its fork parent.
+
+    When ``target`` (owner/repo) isn't found in any local remote, ask GitHub
+    whether it's a fork and try matching the parent repo instead. Handles the
+    common case where a user provides a PR URL from their personal fork but
+    the local project is cloned from the upstream org repo.
+
+    Returns the project path if the fork's parent matches a known project,
+    None otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{target}", "--jq", ".parent.full_name"],
+            capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        parent_slug = result.stdout.strip().lower()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    if config is None:
+        from app.projects_config import load_projects_config
+        try:
+            config = load_projects_config(str(KOAN_ROOT))
+        except (OSError, ValueError):
+            return None
+    if not config:
+        return None
+
+    for project in config.get("projects", {}).values():
+        if not isinstance(project, dict):
+            continue
+        gh_url = (project.get("github_url") or "").lower()
+        if gh_url == parent_slug:
+            path = project.get("path")
+            if path:
+                return path
+        for u in project.get("github_urls", []):
+            if u.lower() == parent_slug:
+                path = project.get("path")
+                if path:
+                    return path
+
+    # Also check in-memory cache (workspace projects not in projects.yaml)
+    try:
+        from app.projects_merged import get_github_url_cache
+        for proj_name, gh_url in get_github_url_cache().items():
+            if gh_url.lower() == parent_slug:
+                for name, path in projects:
+                    if name == proj_name:
+                        return path
+    except (ImportError, OSError):
+        pass
+
+    return None
 
 
 def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optional[str]:
@@ -404,24 +897,35 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
        so cross-owner matches work on the fast path
     2. Exact match on project name (case-insensitive)
     3. Match on directory basename (case-insensitive)
+    3b. Partial name match + remote validation: when the repo was cloned with
+        a different local name (e.g., perl-Convert-ASN1 → Convert-ASN1), check
+        if a project name/basename is a suffix of the repo name (or vice versa)
+        and validate via git remotes.
     4. Auto-discover from ALL git remotes (if owner provided): subprocess
        fallback for projects not yet populated by ensure_github_urls()
     5. Fallback to single project if only one configured
     6. Cross-owner repo-name match (if owner provided): match the repo name
        against the repo component of configured github_url/github_urls.
-       E.g. "sukria/koan" matches a project with github_url "atoomic/koan".
+       E.g. "contributor/repo" matches a project with github_url "org/repo".
        Only used when exactly one project matches (avoids ambiguity).
+    7. Fork resolution via GitHub API (if owner provided): ask GitHub whether
+       the target repo is a fork and match its parent against known projects.
+       Handles the common case where a PR URL points to a contributor's fork.
     """
     projects = get_known_projects()
     target = f"{owner}/{repo_name}".lower() if owner else None
+
+    # Config loaded once at step 1 and reused at steps 6 and 7 to avoid
+    # triple-parsing projects.yaml on the same call.
+    _projects_config: Optional[dict] = None
 
     # 1. GitHub URL match via projects.yaml and in-memory cache
     if target:
         try:
             from app.projects_config import load_projects_config
-            config = load_projects_config(str(KOAN_ROOT))
-            if config:
-                for name, project in config.get("projects", {}).items():
+            _projects_config = load_projects_config(str(KOAN_ROOT))
+            if _projects_config:
+                for project in _projects_config.get("projects", {}).values():
                     if isinstance(project, dict):
                         # Check primary github_url
                         gh_url = project.get("github_url", "")
@@ -437,16 +941,29 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
                                 return path
         except Exception as e:
             print(f"[utils] GitHub URL match via projects.yaml failed: {e}", file=sys.stderr)
-        # Also check in-memory github_url cache (workspace projects)
+        # Also check in-memory github_url caches (workspace projects)
         try:
-            from app.projects_merged import get_github_url_cache
+            from app.projects_merged import get_all_github_urls_cache, get_github_url_cache
+            # Check primary URL cache
             for proj_name, gh_url in get_github_url_cache().items():
                 if gh_url.lower() == target:
                     for name, path in projects:
                         if name == proj_name:
                             return path
+            # Check all-URLs cache (covers forks with upstream remotes)
+            for proj_name, urls in get_all_github_urls_cache().items():
+                if target in (u.lower() for u in urls):
+                    for name, path in projects:
+                        if name == proj_name:
+                            return path
         except Exception as e:
             print(f"[utils] GitHub URL cache lookup failed: {e}", file=sys.stderr)
+
+    # 1b. Alias resolution — translate alias to canonical name before matching
+    if not owner:
+        canonical = resolve_project_alias(repo_name)
+        if canonical:
+            repo_name = canonical
 
     # 2. Exact match on project name
     for name, path in projects:
@@ -454,55 +971,47 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
             return path
 
     # 3. Match on directory basename
-    for name, path in projects:
+    for _name, path in projects:
         if Path(path).name.lower() == repo_name.lower():
             return path
 
+    # 3b. Partial name match + remote validation
+    #     Handles aliased clones: repo "perl-Convert-ASN1" cloned as "Convert-ASN1".
+    #     Checks if a project name/basename is a suffix of the repo name (or vice
+    #     versa) separated by a dash, then validates via git remote.
+    if target:
+        repo_lower = repo_name.lower()
+        candidates = _find_partial_name_candidates(repo_lower, projects)
+        for _cname, cpath in candidates:
+            all_remotes = get_all_github_remotes(cpath)
+            if target in all_remotes:
+                _persist_and_cache_remotes(_cname, cpath, all_remotes, projects)
+                return cpath
+
     # 4. Auto-discover from ALL git remotes (origin, upstream, etc.)
-    #    This catches cross-owner matches: e.g. local origin is atoomic/koan
-    #    but the PR URL points to sukria/koan (the upstream remote).
+    #    This catches cross-owner matches: e.g. local origin is org/repo
+    #    but the PR URL points to contributor/repo (the upstream remote).
     if target:
         for name, path in projects:
             all_remotes = get_all_github_remotes(path)
             if target in all_remotes:
-                # Persist discovery to projects.yaml for yaml projects
-                primary = get_github_remote(path)
-                try:
-                    from app.projects_config import load_projects_config, save_projects_config
-                    config = load_projects_config(str(KOAN_ROOT))
-                    if config and name in config.get("projects", {}):
-                        proj = config["projects"][name]
-                        if isinstance(proj, dict) and proj.get("path"):
-                            if primary and not proj.get("github_url"):
-                                proj["github_url"] = primary
-                            proj["github_urls"] = all_remotes
-                            save_projects_config(str(KOAN_ROOT), config)
-                except Exception as e:
-                    print(f"[utils] Failed to persist github_urls for {name}: {e}", file=sys.stderr)
-                if primary:
-                    # Also cache in memory (works for workspace projects)
-                    try:
-                        from app.projects_merged import set_github_url
-                        set_github_url(name, primary)
-                    except Exception as e:
-                        print(f"[utils] Failed to cache github_url for {name}: {e}", file=sys.stderr)
+                _persist_and_cache_remotes(name, path, all_remotes, projects)
                 return path
 
     # 5. Fallback to single project (skip when owner-specific lookup found nothing)
     if not owner and len(projects) == 1:
         return projects[0][1]
 
-    # 6. Cross-owner repo-name match: e.g. "sukria/koan" matches a project
-    #    whose github_url is "atoomic/koan" — same repo, different owner.
+    # 6. Cross-owner repo-name match: e.g. "contributor/repo" matches a project
+    #    whose github_url is "org/repo" — same repo, different owner.
     #    Only used when exactly one project matches to avoid ambiguity.
     if target:
         repo_lower = repo_name.lower()
         try:
-            from app.projects_config import load_projects_config
-            config = load_projects_config(str(KOAN_ROOT))
+            config = _projects_config
             if config:
                 candidates = []
-                for pname, project in config.get("projects", {}).items():
+                for project in config.get("projects", {}).values():
                     if not isinstance(project, dict):
                         continue
                     all_urls = []
@@ -521,15 +1030,89 @@ def resolve_project_path(repo_name: str, owner: Optional[str] = None) -> Optiona
         except Exception as e:
             print(f"[utils] Cross-owner repo-name match failed: {e}", file=sys.stderr)
 
+    # 7. Fork resolution via GitHub API: when the URL points to a fork not
+    #    in any local remote, ask GitHub for the parent repo and try matching.
+    if target:
+        resolved = _resolve_via_fork_parent(target, projects, config=_projects_config)
+        if resolved:
+            return resolved
+
     return None
 
 
-def append_to_outbox(outbox_path: Path, content: str):
+def resolve_project_name_and_path(
+    name: str,
+) -> Tuple[str, Optional[str]]:
+    """Resolve alias and find project path in one call.
+
+    Returns (canonical_name, path_or_none).
+    """
+    canonical = resolve_project_alias(name) or name
+    return canonical, resolve_project_path(canonical)
+
+
+def resolve_project_from_list(
+    projects: List[Tuple[str, str]], target: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve project by exact name then alias from a (name, path) list.
+
+    Returns (canonical_name, path) or (None, None).
+    """
+    lower = target.lower()
+    for name, path in projects:
+        if name.lower() == lower:
+            return name, path
+    canonical = resolve_project_alias(target)
+    if canonical:
+        canon_lower = canonical.lower()
+        for name, path in projects:
+            if name.lower() == canon_lower:
+                return name, path
+    return None, None
+
+
+def resolve_project_from_dict(projects: dict, target: str) -> Optional[str]:
+    """Resolve project by exact name then alias from a project dict.
+
+    Returns the canonical key from the dict, or None.
+    """
+    lower = target.lower()
+    for key in projects:
+        if key.lower() == lower:
+            return key
+    canonical = resolve_project_alias(target)
+    if canonical:
+        canon_lower = canonical.lower()
+        for key in projects:
+            if key.lower() == canon_lower:
+                return key
+    return None
+
+
+def append_to_outbox(outbox_path: Path, content: str, priority=None):
     """Append content to outbox.md with file locking.
 
     Safe to call from run.py via: python3 -c "from app.utils import append_to_outbox; ..."
     or from Python directly.
+
+    Args:
+        outbox_path: Path to outbox.md
+        content: Message content to append
+        priority: Optional NotificationPriority — when provided, prepends a
+                  [priority:name] header so flush_outbox() can parse and apply
+                  priority-based filtering. Legacy callers omitting priority
+                  default to ACTION in flush_outbox().
     """
+    if priority is not None:
+        # Import here to avoid circular imports (utils is imported at module level
+        # by many modules including notify.py which defines NotificationPriority)
+        try:
+            from app.notify import NotificationPriority
+            if isinstance(priority, NotificationPriority):
+                content = f"[priority:{priority.name.lower()}]\n{content}"
+        except ImportError:
+            pass  # If import fails, write without header (treated as action)
+
     with open(outbox_path, "a", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -537,6 +1120,107 @@ def append_to_outbox(outbox_path: Path, content: str):
             f.flush()
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# Diff filtering utilities
+# ---------------------------------------------------------------------------
+
+
+def filter_diff_by_ignore(
+    diff: str,
+    glob_patterns: list,
+    regex_patterns: list,
+) -> "tuple[str, list[str]]":
+    """Remove file hunks from a unified diff based on ignore patterns.
+
+    Splits the unified diff at 'diff --git' boundaries and removes any
+    file block whose path matches a glob or regex pattern.
+
+    Args:
+        diff: Unified diff string (as returned by GitHub).
+        glob_patterns: List of glob patterns. Patterns without '/' are matched
+            against the basename only (so '*.lock' matches at any depth).
+            Patterns with '/' are matched against the full path.
+        regex_patterns: List of regex patterns matched against the full path.
+            Malformed patterns are skipped with a warning.
+
+    Returns:
+        (filtered_diff, skipped_files) tuple. filtered_diff is the diff with
+        ignored file blocks removed. skipped_files is the list of file paths
+        that were removed (for logging). Returns original diff unchanged if
+        the diff cannot be split into file blocks (safety net).
+    """
+    import fnmatch
+    import os
+
+    if not diff:
+        return diff, []
+
+    if not glob_patterns and not regex_patterns:
+        return diff, []
+
+    # Compile regex patterns once; log and skip malformed ones
+    compiled_regexes = []
+    for pat in regex_patterns:
+        try:
+            compiled_regexes.append(re.compile(pat))
+        except re.error as e:
+            print(
+                f"[utils] filter_diff_by_ignore: skipping malformed regex {pat!r}: {e}",
+                file=sys.stderr,
+            )
+
+    # Split diff into file blocks. Each block starts with 'diff --git'.
+    # Re-join the delimiter with the block that follows it.
+    raw_blocks = re.split(r'(?=^diff --git )', diff, flags=re.MULTILINE)
+
+    # If splitting yields <=1 block, the format is unexpected — return unchanged
+    if len(raw_blocks) <= 1:
+        return diff, []
+
+    def _should_ignore(path: str) -> bool:
+        # Glob matching
+        for pat in glob_patterns:
+            if "/" in pat:
+                if fnmatch.fnmatch(path, pat):
+                    return True
+            else:
+                # Match against basename for patterns without slash
+                if fnmatch.fnmatch(os.path.basename(path), pat):
+                    return True
+                # Also try full path for patterns like '*.generated'
+                if fnmatch.fnmatch(path, pat):
+                    return True
+        # Regex matching against full path
+        for rx in compiled_regexes:
+            if rx.search(path):
+                return True
+        return False
+
+    kept_blocks = []
+    skipped_files = []
+    _diff_git_re = re.compile(r'^diff --git a/(.+) b/(.+)$', re.MULTILINE)
+
+    for block in raw_blocks:
+        if not block.strip():
+            # Preserve any leading whitespace/preamble before the first block
+            kept_blocks.append(block)
+            continue
+
+        match = _diff_git_re.search(block)
+        if not match:
+            kept_blocks.append(block)
+            continue
+
+        # Use the b/ path as canonical (post-rename / current name)
+        file_path = match.group(2)
+        if _should_ignore(file_path):
+            skipped_files.append(file_path)
+        else:
+            kept_blocks.append(block)
+
+    return "".join(kept_blocks), skipped_files
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +1236,7 @@ from app.config import (  # noqa: E402, F401
     get_tools_description,
     get_model_config,
     get_start_on_pause,
+    get_start_passive,
     get_max_runs,
     get_interval_seconds,
     get_fast_reply_model,
@@ -561,8 +1246,6 @@ from app.config import (  # noqa: E402, F401
     get_claude_flags_for_role,
     get_cli_binary_for_shell,
     get_cli_provider_name,
-    get_tool_flags_for_shell,
-    get_output_flags_for_shell,
     get_auto_merge_config,
 )
 

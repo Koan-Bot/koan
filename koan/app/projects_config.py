@@ -9,34 +9,98 @@ Provides:
 - get_project_models(config, name) -> dict: Get model overrides for a project
 - get_project_tools(config, name) -> dict: Get tool restrictions for a project
 - get_project_exploration(config, name) -> bool: Get exploration flag for a project
+- get_project_autoreview(config, name) -> bool: Get autoreview flag for a project
 - get_project_max_open_prs(config, name) -> int: Get max open PRs limit for a project
+- get_project_max_pending_branches(config, name) -> int: Get max pending branches limit
 - get_project_github_authorized_users(config, name) -> list: Get GitHub authorized users
+- get_project_issue_tracker(config, name) -> dict: Get issue tracker routing config
 
-File location: projects.yaml at KOAN_ROOT (next to .env).
+File location: resolved by resolve_projects_config_path() — instance/projects.yaml
+(persistent volume) takes priority, then projects.yaml at KOAN_ROOT (next to .env).
 """
 
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import yaml
 
+# Thread-safe mtime-keyed cache for load_projects_config().
+# Avoids repeated YAML file I/O when multiple config getters call
+# load_projects_config() within the same pipeline pass.
+_cache_lock = threading.Lock()
+_cache: dict = {}  # (koan_root, yaml_path) -> (mtime, result)
+
+
+def resolve_projects_config_path(koan_root: str) -> Path:
+    """Resolve the projects.yaml path with priority order.
+
+    1. ``instance/projects.yaml`` (highest priority — persistent on a
+       managed/hosted deployment's volume, decoupled from the public repo).
+    2. ``projects.yaml`` at KOAN_ROOT (repo-root fallback for local/dev).
+
+    Returns the first existing path. If neither exists, returns the repo-root
+    path (backward-compatible default for local installs).
+    """
+    instance_path = Path(koan_root) / "instance" / "projects.yaml"
+    if instance_path.exists():
+        return instance_path
+    return Path(koan_root) / "projects.yaml"
+
+
+def resolve_projects_config_write_path(koan_root: str) -> Path:
+    """Resolve the projects.yaml path to write/create.
+
+    Mirrors :func:`resolve_projects_config_path` for reads, but for first-time
+    creation (neither file exists) prefers ``instance/projects.yaml`` when an
+    ``instance/`` directory is present — so config persists on a managed
+    deployment's volume instead of the ephemeral repo root.
+    """
+    instance_path = Path(koan_root) / "instance" / "projects.yaml"
+    if instance_path.exists():
+        return instance_path
+    root_path = Path(koan_root) / "projects.yaml"
+    if root_path.exists():
+        return root_path
+    # Neither exists: prefer instance/ when the volume directory is present.
+    if (Path(koan_root) / "instance").is_dir():
+        return instance_path
+    return root_path
+
 
 def load_projects_config(koan_root: str) -> Optional[dict]:
     """Load projects.yaml from KOAN_ROOT.
 
+    Resolves the file via :func:`resolve_projects_config_path` —
+    ``instance/projects.yaml`` wins over the repo-root file when present.
+
     Returns the parsed config dict, or None if file doesn't exist.
     Raises ValueError on invalid YAML or schema violations.
+
+    Results are cached by file mtime — repeated calls with an unchanged
+    file return the cached dict without re-reading the YAML.
     """
-    config_path = Path(koan_root) / "projects.yaml"
+    config_path = resolve_projects_config_path(koan_root)
     if not config_path.exists():
         return None
+
+    try:
+        current_mtime = config_path.stat().st_mtime
+    except OSError:
+        return None
+
+    cache_key = (koan_root, str(config_path))
+    with _cache_lock:
+        cached = _cache.get(cache_key)
+        if cached is not None and cached[0] == current_mtime:
+            return cached[1]
 
     try:
         with open(config_path, "r") as f:
             data = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        raise ValueError(f"Invalid YAML in projects.yaml: {e}")
+        raise ValueError(f"Invalid YAML in projects.yaml: {e}") from e
 
     if data is None:
         return None
@@ -45,7 +109,50 @@ def load_projects_config(koan_root: str) -> Optional[dict]:
         raise ValueError("projects.yaml must be a YAML mapping (dict)")
 
     _validate_config(data)
+
+    with _cache_lock:
+        _cache[cache_key] = (current_mtime, data)
+
     return data
+
+
+def invalidate_projects_config_cache() -> None:
+    """Clear the load_projects_config() mtime cache.
+
+    Call from test teardown to prevent cross-test contamination.
+    """
+    with _cache_lock:
+        _cache.clear()
+
+
+_PROJECT_KEY_TYPES = {
+    "path": (str,),
+    "github_url": (str,),
+    "github_urls": (list,),
+    "git_auto_merge": (dict,),
+    "models": (dict,),
+    "tools": (dict,),
+    "github": (dict,),
+    "security": (dict,),
+    "security_review": (dict,),
+    "private_review_gate": (dict,),
+    "cli_provider": (str,),
+    "submit_to_repository": (dict,),
+    "stagnation": (dict, bool),
+    "complexity_routing": (dict, bool),
+    "exploration": (bool, str),
+    "autoreview": (bool, str),
+    "focus": (bool, str),
+    "max_open_prs": (int, str),
+    "max_pending_branches": (int, str),
+    "mcp": (list,),
+    "rtk": (bool, str),
+    "devcontainer": (bool,),
+}
+
+_DEFAULTS_KEY_TYPES = {
+    k: v for k, v in _PROJECT_KEY_TYPES.items() if k != "path"
+}
 
 
 def _validate_config(config: dict) -> None:
@@ -57,6 +164,9 @@ def _validate_config(config: dict) -> None:
     defaults = config.get("defaults")
     if defaults is not None and not isinstance(defaults, dict):
         raise ValueError("'defaults' must be a mapping")
+
+    if isinstance(defaults, dict):
+        _validate_section_keys(defaults, _DEFAULTS_KEY_TYPES, "defaults")
 
     # projects section is optional — missing means 0 projects (workspace provides them)
     projects = config.get("projects")
@@ -96,6 +206,34 @@ def _validate_config(config: dict) -> None:
         if path is not None and (not isinstance(path, str) or not path.strip()):
             raise ValueError(f"Project '{name}' has invalid path: {path!r}")
 
+        _validate_section_keys(project, _PROJECT_KEY_TYPES, f"projects.{name}")
+
+
+def _validate_section_keys(section: dict, schema: dict, context: str) -> None:
+    """Validate types of known keys in a config section.
+
+    Skips unknown keys (those are passed through as overrides).
+    Raises ValueError when a known key has the wrong type.
+    """
+    for key, value in section.items():
+        if value is None:
+            continue
+        expected_types = schema.get(key)
+        if expected_types is None:
+            continue
+        # bool is subclass of int — check bool before int
+        if isinstance(value, bool) and bool not in expected_types:
+            type_names = "/".join(t.__name__ for t in expected_types)
+            raise ValueError(
+                f"'{context}.{key}' must be {type_names}, got bool"
+            )
+        if not isinstance(value, expected_types):
+            type_names = "/".join(t.__name__ for t in expected_types)
+            raise ValueError(
+                f"'{context}.{key}' must be {type_names}, "
+                f"got {type(value).__name__}"
+            )
+
 
 def validate_project_paths(config: dict) -> Optional[str]:
     """Check that all project paths exist on disk.
@@ -133,14 +271,29 @@ def get_projects_from_config(config: dict) -> List[Tuple[str, str]]:
     return sorted(result, key=lambda x: x[0].lower())
 
 
+def _find_project_entry(projects: dict, project_name: str) -> dict:
+    """Case-insensitive lookup of a project entry in the projects dict."""
+    # Fast path: exact match
+    entry = projects.get(project_name)
+    if entry is not None:
+        return entry
+    # Slow path: case-insensitive scan
+    lower = project_name.lower()
+    for key, value in projects.items():
+        if key.lower() == lower:
+            return value
+    return {}
+
+
 def get_project_config(config: dict, project_name: str) -> dict:
     """Get merged config for a project (defaults + project overrides).
 
     Deep-merges per-section: project-level keys override default-level keys.
     Unknown sections are passed through as-is.
+    Project name lookup is case-insensitive.
     """
     defaults = config.get("defaults", {}) or {}
-    project = config.get("projects", {}).get(project_name, {}) or {}
+    project = _find_project_entry(config.get("projects", {}), project_name) or {}
 
     merged = {}
     # Start with all default keys
@@ -207,7 +360,7 @@ def resolve_base_branch(
 
                 # Check if the project explicitly sets base_branch
                 projects = config.get("projects", {}) or {}
-                proj_cfg = projects.get(project_name, {}) or {}
+                proj_cfg = _find_project_entry(projects, project_name) or {}
                 proj_am = proj_cfg.get("git_auto_merge", {}) or {}
                 if proj_am.get("base_branch"):
                     project_explicit = True
@@ -239,7 +392,7 @@ def resolve_base_branch(
 def get_project_cli_provider(config: dict, project_name: str) -> str:
     """Get CLI provider for a project from projects.yaml.
 
-    Returns the provider name ("claude", "copilot", "local") or empty string
+    Returns the provider name ("claude", "copilot", "ollama-launch") or empty string
     if not configured (meaning: use the global provider).
 
     Note: Data accessor only — the provider resolution in cli_provider.py
@@ -278,6 +431,86 @@ def get_project_tools(config: dict, project_name: str) -> dict:
     return tools
 
 
+def get_project_rtk_enabled(config: dict, project_name: str) -> bool:
+    """Return whether the rtk awareness section should fire for a project.
+
+    Reads ``rtk`` from the per-project config (with defaults merged in).
+    Accepts the same shapes as the global ``optimizations.rtk.enabled``
+    knob — bool, ``"auto"``, ``"true"``, ``"false"``, etc.
+
+    Resolution:
+      1. If the project sets ``rtk: false`` (or any false-y value) →
+         hard opt-out, returns ``False`` regardless of global state.
+      2. If the project sets ``rtk: true`` → opts in even when the global
+         knob would say no.
+      3. If the project sets ``rtk: auto`` (or omits it entirely, or sets
+         it to anything else) → defer to the global resolution in
+         :func:`app.config.is_rtk_mode`.
+
+    The intent: the global config tracks "do I want rtk on this Kōan
+    instance"; the per-project field tracks "does this project's tooling
+    play nicely with rtk's filters".  A project can opt out (e.g. its test
+    runner emits unusual JSON that rtk's filter would clobber) without
+    affecting the rest of the instance.
+    """
+    project_cfg = get_project_config(config, project_name)
+    from app.config import coerce_rtk_enabled, is_rtk_mode
+    if "rtk" in project_cfg:
+        explicit = coerce_rtk_enabled(project_cfg["rtk"])
+        if explicit is not None:
+            return explicit
+        # "auto" or unrecognised → fall through to global.
+    return is_rtk_mode()
+
+
+def get_project_mcp(config: dict, project_name: str) -> list:
+    """Get MCP config file paths for a project from projects.yaml.
+
+    Returns a list of file path strings. Only includes entries explicitly
+    set — caller should fall back to global config.yaml mcp list.
+
+    Used to resolve per-project MCP server configs when projects.yaml
+    contains a ``mcp:`` key (list of JSON file paths) under a project
+    entry, complementing the global ``mcp:`` list in config.yaml.
+    """
+    project_cfg = get_project_config(config, project_name)
+    mcp = project_cfg.get("mcp", [])
+    if not isinstance(mcp, list):
+        return []
+    return mcp
+
+
+def get_project_devcontainer_enabled(config: dict, project_name: str) -> bool:
+    """Return whether devcontainer execution mode is enabled for a project."""
+    return bool(get_project_config(config, project_name).get("devcontainer", False))
+
+
+def get_project_focus(config: dict, project_name: str) -> bool:
+    """Get focus flag for a project from projects.yaml.
+
+    When True, the agent only works on explicitly queued missions for this
+    project — no contemplative sessions, no DEEP mode, no autonomous
+    exploration. Equivalent to ``exploration: false`` but unified under the
+    focus concept.
+
+    Supports defaults-level and per-project overrides. Common patterns:
+      - ``defaults: { focus: true }`` + ``myapp: { focus: false }``
+        → all projects focused except myapp
+      - ``defaults: { focus: false }`` + ``vendor: { focus: true }``
+        → only vendor is focused
+
+    Returns False by default (focus not enforced).
+    """
+    project_cfg = get_project_config(config, project_name)
+    value = project_cfg.get("focus", False)
+
+    # Handle string values like "true", "yes", "1"
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+
+    return bool(value)
+
+
 def get_project_exploration(config: dict, project_name: str) -> bool:
     """Get exploration flag for a project from projects.yaml.
 
@@ -289,6 +522,24 @@ def get_project_exploration(config: dict, project_name: str) -> bool:
     """
     project_cfg = get_project_config(config, project_name)
     value = project_cfg.get("exploration", True)
+
+    # Handle string values like "false", "no", "0"
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "no", "0", "")
+
+    return bool(value)
+
+
+def get_project_autoreview(config: dict, project_name: str) -> bool:
+    """Get autoreview flag for a project from projects.yaml.
+
+    When True, automatically queues /review then /rebase after any mission
+    that creates a PR (and was not auto-merged). Off by default.
+
+    Returns False by default (autoreview disabled).
+    """
+    project_cfg = get_project_config(config, project_name)
+    value = project_cfg.get("autoreview", False)
 
     # Handle string values like "false", "no", "0"
     if isinstance(value, str):
@@ -319,6 +570,28 @@ def get_project_max_open_prs(config: dict, project_name: str) -> int:
     return result if result > 0 else 0
 
 
+def get_project_max_pending_branches(config: dict, project_name: str) -> int:
+    """Get max pending branches limit for a project from projects.yaml.
+
+    Controls the maximum number of pending branches (open PRs ∪ local
+    unmerged branches) allowed before mission pickup and exploration are
+    blocked for this project.
+
+    Returns 10 by default. Returns 0 for unlimited (no limit).
+    """
+    project_cfg = get_project_config(config, project_name)
+    value = project_cfg.get("max_pending_branches", 10)
+
+    # Coerce to int; invalid values map to 0 (unlimited)
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return 0
+
+    # Negative or zero → unlimited
+    return result if result > 0 else 0
+
+
 def get_project_github_authorized_users(config: dict, project_name: str) -> list:
     """Get GitHub authorized users for a project from projects.yaml.
 
@@ -330,6 +603,21 @@ def get_project_github_authorized_users(config: dict, project_name: str) -> list
     github = project_cfg.get("github", {}) or {}
     users = github.get("authorized_users", [])
     return users if isinstance(users, list) else []
+
+
+def get_project_github_reply_authorized_users(config: dict, project_name: str) -> Optional[list]:
+    """Get GitHub reply_authorized_users for a project from projects.yaml.
+
+    Per-project github.reply_authorized_users completely replaces global list.
+    Returns the list of authorized GitHub usernames, or ["*"] for wildcard.
+    Returns None if not configured (meaning: fall back to global config.yaml).
+    """
+    project_cfg = get_project_config(config, project_name)
+    github = project_cfg.get("github", {}) or {}
+    users = github.get("reply_authorized_users")
+    if users is None:
+        return None
+    return users if isinstance(users, list) else None
 
 
 def get_project_github_natural_language(config: dict, project_name: str) -> Optional[bool]:
@@ -345,6 +633,79 @@ def get_project_github_natural_language(config: dict, project_name: str) -> Opti
     if value is None:
         return None
     return bool(value)
+
+
+def get_project_security_review(config: dict, project_name: str) -> dict:
+    """Get differential security review config for a project from projects.yaml.
+
+    Controls whether a security review is run on mission diffs before auto-merge.
+    Returns a dict with keys: enabled, blocking, severity_threshold.
+
+    - enabled: Whether to run the review (default: False).
+    - blocking: Whether a failed review blocks auto-merge (default: False).
+    - severity_threshold: Maximum acceptable risk level before flagging
+      ("low", "medium", "high", "critical"). Default: "high".
+    """
+    project_cfg = get_project_config(config, project_name)
+    sr = project_cfg.get("security_review", {}) or {}
+
+    va = sr.get("variant_analysis", {}) or {}
+    if not isinstance(va, dict):
+        print(
+            f"[projects_config] Invalid variant_analysis config for '{project_name}' "
+            f"(expected dict, got {type(va).__name__}), using defaults",
+            file=sys.stderr,
+        )
+        va = {}
+    raw_max = va.get("max_variant_missions", 3)
+    try:
+        max_missions = int(raw_max)
+    except (ValueError, TypeError):
+        print(
+            f"[projects_config] Invalid max_variant_missions={raw_max!r} "
+            f"for '{project_name}', using default 3",
+            file=sys.stderr,
+        )
+        max_missions = 3
+    max_missions = min(max(max_missions, 0), 10)
+
+    return {
+        "enabled": bool(sr.get("enabled", False)),
+        "blocking": bool(sr.get("blocking", False)),
+        "severity_threshold": str(sr.get("severity_threshold", "high")).strip().lower(),
+        "variant_analysis": {
+            "enabled": bool(va.get("enabled", False)),
+            "max_variant_missions": max_missions,
+        },
+    }
+
+
+def get_project_review_verdict(config: dict, project_name: str) -> dict:
+    """Get review verdict overrides for a project from projects.yaml.
+
+    Per-project review_verdict settings (merged from defaults + project
+    overrides via get_project_config) override global config.yaml values.
+    Caller should merge the result with get_review_verdict_config().
+
+    Fails closed: if review_verdict is present but malformed (non-dict or
+    contains non-boolean values for known keys), returns approved=False
+    so a misconfigured project never submits an unintended verdict.
+    """
+    project_cfg = get_project_config(config, project_name)
+    rv = project_cfg.get("review_verdict", {}) or {}
+    if not isinstance(rv, dict):
+        return {"approved": False}
+    result = {}
+    has_invalid = False
+    for key in ("approved", "body_enabled", "include_blockers"):
+        if key in rv:
+            if isinstance(rv[key], bool):
+                result[key] = rv[key]
+            else:
+                has_invalid = True
+    if has_invalid:
+        result["approved"] = False
+    return result
 
 
 def get_project_submit_to_repository(config: dict, project_name: str) -> dict:
@@ -366,6 +727,48 @@ def get_project_submit_to_repository(config: dict, project_name: str) -> dict:
     return result
 
 
+def get_project_issue_tracker(config: dict, project_name: str) -> dict:
+    """Get normalized issue tracker config for a project from projects.yaml."""
+    from app.issue_tracker.config import get_project_issue_tracker as _get
+
+    return _get(config, project_name)
+
+
+def get_project_security_config(config: dict, project_name: str) -> dict:
+    """Get security configuration for a project from projects.yaml.
+
+    Returns a dict with keys:
+      - ``pvrs``: ``"auto"`` (default), ``"true"``, or ``"false"``
+      - ``pvrs_threshold``: ``"high"`` (default) — minimum severity routed
+        to PVRS. One of ``"critical"``, ``"high"``, ``"medium"``, ``"low"``.
+
+    Example projects.yaml::
+
+        defaults:
+          security:
+            pvrs: auto
+            pvrs_threshold: high
+        projects:
+          myapp:
+            security:
+              pvrs: false  # force public issues
+    """
+    project_cfg = get_project_config(config, project_name)
+    security = project_cfg.get("security", {})
+    if not isinstance(security, dict):
+        security = {}
+
+    pvrs = str(security.get("pvrs", "auto")).strip().lower()
+    if pvrs not in ("auto", "true", "false"):
+        pvrs = "auto"
+
+    threshold = str(security.get("pvrs_threshold", "high")).strip().lower()
+    if threshold not in ("critical", "high", "medium", "low"):
+        threshold = "high"
+
+    return {"pvrs": pvrs, "pvrs_threshold": threshold}
+
+
 def save_projects_config(koan_root: str, config: dict) -> None:
     """Write config back to projects.yaml atomically, preserving comments.
 
@@ -375,7 +778,10 @@ def save_projects_config(koan_root: str, config: dict) -> None:
     """
     from app.utils import atomic_write
 
-    config_path = Path(koan_root) / "projects.yaml"
+    # Write to the resolved target (instance/ wins when present; first-time
+    # creation prefers instance/ when the volume exists), so updates persist
+    # on the deployment's persistent volume.
+    config_path = resolve_projects_config_write_path(koan_root)
 
     try:
         from ruamel.yaml import YAML

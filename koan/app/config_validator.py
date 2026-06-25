@@ -3,10 +3,16 @@
 Checks config keys for known names, validates types, and warns on typos
 or unrecognized keys. Called during startup to surface bad config early
 instead of silently replacing with defaults.
+
+Also detects config drift: keys present in the template (instance.example/config.yaml)
+but missing from the user's config (instance/config.yaml), helping users discover
+new features they may not know about.
 """
 
 import difflib
-from typing import Any, Dict, List, Tuple
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.run_log import log
 
@@ -24,22 +30,44 @@ _NESTED = "dict"  # marker for nested schema lookup
 CONFIG_SCHEMA: Dict[str, Any] = {
     "max_runs_per_day": "int",
     "interval_seconds": "int",
+    "startup_delay": "int",
     "fast_reply": "bool",
     "debug": "bool",
     "cli_output_journal": "bool",
     "branch_prefix": "str",
     "skill_timeout": "int",
+    "skill_max_turns": "int",
+    "analysis_max_turns": "int",
     "mission_timeout": "int",
+    "first_output_timeout": "int",
+    "rebase_first_output_timeout": "int",
+    "rebase_review_idle_timeout": "int",
+    "rebase_review_max_duration": "int",
+    "rebase_ci_idle_timeout": "int",
+    "rebase_ci_max_duration": "int",
+    "rebase_include_bot_feedback": "bool",
+    "allow_rebase_foreign_prs": "bool",
+    "post_mission_timeout": "int",
     "contemplative_chance": "int",
+    "ci_fix_max_attempts": "int",
+    "spec_complexity_threshold": "int",
     "start_on_pause": "bool",
+    "start_passive": "bool",
+    "startup_reflection": "bool",
+    "auto_pause": "bool",
+    "attention_github_notifications": "bool",
+    "enable_multiple_instances": "bool",
+    "focus": "bool",
     "skip_permissions": "bool",
     "cli_provider": "str",
+    "mcp": "list",
     "telegram": _NESTED,
     "budget": _NESTED,
     "tools": _NESTED,
     "models": _NESTED,
     "git_auto_merge": _NESTED,
     "github": _NESTED,
+    "jira": _NESTED,
     "schedule": _NESTED,
     "logs": _NESTED,
     "local_llm": _NESTED,
@@ -49,6 +77,29 @@ CONFIG_SCHEMA: Dict[str, Any] = {
     "messaging": _NESTED,
     "auto_update": _NESTED,
     "dashboard": _NESTED,
+    "notifications": _NESTED,
+    "notification_polling": _NESTED,
+    "prompt_caching": _NESTED,
+    "prompt_guard": _NESTED,
+    "plan_review": _NESTED,
+    "branch_cleanup": _NESTED,
+    "review_concurrency": _NESTED,
+    "review_ignore": _NESTED,
+    "automation_rules": _NESTED,
+    "effort": _NESTED,
+    "thinking": _NESTED,
+    "stagnation": _NESTED,
+    "optimizations": _NESTED,
+}
+
+# Top-level keys that are recognized but deprecated: they still work (honored
+# elsewhere for backward compatibility) but should migrate to a new location.
+# These must NOT be reported as "unrecognized" — only with their migration hint.
+_DEPRECATED_TOP_LEVEL_KEYS: Dict[str, str] = {
+    "unlimited_quota": (
+        "'unlimited_quota' moved to 'usage.unlimited_quota'; "
+        "the top-level form is deprecated"
+    ),
 }
 
 # Sub-schemas for nested sections
@@ -71,6 +122,7 @@ SECTION_SCHEMAS: Dict[str, Dict[str, str]] = {
         "chat": "str",
         "lightweight": "str",
         "fallback": "str",
+        "reflect": "str",
         "review_mode": "str",
     },
     "git_auto_merge": {
@@ -84,9 +136,21 @@ SECTION_SCHEMAS: Dict[str, Dict[str, str]] = {
         "commands_enabled": "bool",
         "authorized_users": "list",
         "reply_enabled": "bool",
+        "reply_authorized_users": "list",
+        "reply_rate_limit": "int",
+        "natural_language": "bool",
+        "subscribe_enabled": "bool",
+        "subscribe_max_per_cycle": "int",
         "max_age_hours": "int",
+        "stale_drain_hours": "int",
         "check_interval_seconds": "int",
         "max_check_interval_seconds": "int",
+        "parallel_workers": "int",
+        "review_scan_interval_minutes": "int",
+        "mention_scan_interval_minutes": "int",
+        "ack_enabled": "bool",
+        "max_replies_per_thread_per_hour": "int",
+        "webhook": "dict",
     },
     "schedule": {
         "deep_hours": "str",
@@ -109,6 +173,7 @@ SECTION_SCHEMAS: Dict[str, Dict[str, str]] = {
         "session_token_limit": "int",
         "weekly_token_limit": "int",
         "budget_mode": "str",
+        "unlimited_quota": "bool",
     },
     "email": {
         "enabled": "bool",
@@ -126,6 +191,88 @@ SECTION_SCHEMAS: Dict[str, Dict[str, str]] = {
     "dashboard": {
         "enabled": "bool",
         "port": "int",
+        "nickname": "str",
+    },
+    "jira": {
+        "enabled": "bool",
+        "base_url": "str",
+        "email": "str",
+        "api_token": "str",
+        "nickname": "str",
+        "commands_enabled": "bool",
+        "authorized_users": "list",
+        "max_age_hours": "int",
+        "check_interval_seconds": "int",
+        "max_check_interval_seconds": "int",
+        "projects": "dict",
+    },
+    "notifications": {
+        "min_priority": "str",
+    },
+    "notification_polling": {
+        "check_interval_seconds": "int",
+        "max_check_interval_seconds": "int",
+    },
+    "prompt_caching": {
+        "same_project_stickiness_percent": "int",
+    },
+    "prompt_guard": {
+        "enabled": "bool",
+        "block_mode": "bool",
+    },
+    "plan_review": {
+        "enabled": "bool",
+        "max_rounds": "int",
+        "implement_gate": "bool",
+    },
+    "stagnation": {
+        "enabled": "bool",
+        "check_interval_seconds": "int",
+        "abort_after_cycles": "int",
+        "sample_lines": "int",
+        "max_retry_on_stagnation": "int",
+    },
+    "branch_cleanup": {
+        "enabled": "bool",
+        "delete_remote_branches": "bool",
+        "cleanup_interval_hours": "int",
+        "notify_orphans": "bool",
+    },
+    "review_concurrency": {
+        "enabled": "bool",
+        "github_workers": "int",
+    },
+    "review_ignore": {
+        "glob": "list",
+        "regex": "list",
+    },
+    "automation_rules": {
+        "max_fires_per_minute": "int",
+    },
+    "effort": {
+        "review": "str",
+        "implement": "str",
+        "deep": "str",
+    },
+    "thinking": {
+        "enabled": "bool",
+        "budget_tokens": "int",
+        "min_mode": "str",
+    },
+    "optimizations": {
+        # Caveman is configured exclusively via the nested mapping
+        # ``caveman: {enabled: bool, include: [skill, ...]}``.  Deep
+        # validation of that mapping lives in
+        # :func:`_validate_caveman_nested` below.
+        "caveman": "dict",
+        # RTK (https://github.com/rtk-ai/rtk) — optional CLI proxy that
+        # compresses common dev-command output before Claude reads it.
+        # Configured via ``rtk: {enabled: auto|true|false, awareness: bool,
+        # require_jq: bool}``.  Validation lives in
+        # :func:`_validate_rtk_nested` below.
+        "rtk": "dict",
+        "review_compressor": "dict",
+        "ponytail": "dict",
     },
 }
 
@@ -188,9 +335,27 @@ def validate_config(config: dict) -> List[Tuple[str, str]]:
     if not isinstance(config, dict):
         return [("", "config.yaml root is not a mapping")]
 
+    # The 'local' CLI provider has been removed; warn instead of silently
+    # falling back to 'claude'.
+    if str(config.get("cli_provider", "")).strip().lower() == "local":
+        warnings.append((
+            "cli_provider",
+            "cli_provider: 'local' has been removed and is now ignored "
+            "(falling back to 'claude'). To run local models use "
+            "'ollama-launch'. See docs/providers/ollama-launch.md.",
+        ))
+
     known_top = list(CONFIG_SCHEMA.keys())
 
+    for deprecated_key, hint in _DEPRECATED_TOP_LEVEL_KEYS.items():
+        if deprecated_key in config:
+            warnings.append((deprecated_key, hint))
+
     for key, value in config.items():
+        if key in _DEPRECATED_TOP_LEVEL_KEYS:
+            # Recognized-but-deprecated: already warned above; do not also
+            # flag as unrecognized.
+            continue
         if key not in CONFIG_SCHEMA:
             suggestion = _suggest_typo(key, known_top)
             msg = f"unrecognized key '{key}'"
@@ -205,7 +370,12 @@ def validate_config(config: dict) -> List[Tuple[str, str]]:
         if expected == _NESTED:
             if value is None:
                 continue
+            # Some keys accept both a scalar shorthand and a dict form
+            # (e.g. effort: "high" vs effort: {review: low, deep: high}).
+            # Accept strings silently for these keys.
             if not isinstance(value, dict):
+                if key == "effort" and isinstance(value, str):
+                    continue
                 warnings.append((key, f"'{key}' should be a mapping, got {type(value).__name__}"))
                 continue
             section_schema = SECTION_SCHEMAS.get(key)
@@ -240,6 +410,22 @@ def validate_config(config: dict) -> List[Tuple[str, str]]:
                     f"'{key}' should be {exp_label}, got {type(value).__name__}",
                 ))
 
+    # Semantic check: deep-validate optimizations.caveman when it's a dict.
+    optimizations = config.get("optimizations")
+    if isinstance(optimizations, dict):
+        caveman = optimizations.get("caveman")
+        if isinstance(caveman, dict):
+            warnings.extend(_validate_caveman_nested(caveman))
+        rtk = optimizations.get("rtk")
+        if isinstance(rtk, dict):
+            warnings.extend(_validate_rtk_nested(rtk))
+        ponytail = optimizations.get("ponytail")
+        if isinstance(ponytail, dict):
+            warnings.extend(_validate_ponytail_nested(ponytail))
+        review_compressor = optimizations.get("review_compressor")
+        if isinstance(review_compressor, dict):
+            warnings.extend(_validate_review_compressor_nested(review_compressor))
+
     # Semantic check: warn on overlapping deep_hours and work_hours
     schedule = config.get("schedule")
     if isinstance(schedule, dict):
@@ -255,6 +441,172 @@ def validate_config(config: dict) -> List[Tuple[str, str]]:
                     f"Recommended: use non-overlapping ranges (e.g., deep_hours: \"0-8\", work_hours: \"8-20\")",
                 ))
 
+    try:
+        from app.issue_tracker.config import (
+            detect_legacy_jira_projects,
+            format_legacy_jira_projects_warning,
+        )
+
+        legacy_jira_keys = detect_legacy_jira_projects(config)
+        if legacy_jira_keys:
+            warnings.append((
+                "jira.projects",
+                format_legacy_jira_projects_warning(legacy_jira_keys),
+            ))
+    except ImportError:
+        pass
+
+    return warnings
+
+
+_CAVEMAN_NESTED_SCHEMA: Dict[str, Any] = {
+    "enabled": "bool",
+    "include": "list",
+}
+
+
+# RTK accepts ``enabled: auto`` (string) in addition to bool, so the schema
+# uses a tuple of accepted types.  ``_check_type`` already handles tuples.
+_RTK_NESTED_SCHEMA: Dict[str, Any] = {
+    "enabled": ("bool", "str"),
+    "awareness": "bool",
+    "require_jq": "bool",
+}
+
+
+def _validate_rtk_nested(rtk: dict) -> List[Tuple[str, str]]:
+    """Validate the nested ``optimizations.rtk`` dict.
+
+    Mirrors :func:`_validate_caveman_nested` with one extra check: when
+    ``enabled`` is a string we constrain it to the documented set
+    (``auto``, ``true``, ``false``, …) — same set
+    :func:`app.config.coerce_rtk_enabled` accepts at runtime, so a typo
+    like ``enabld: yse`` surfaces clearly here instead of silently
+    falling through to ``auto``.
+    """
+    from app.config import RTK_ENABLED_VALID
+
+    warnings: List[Tuple[str, str]] = []
+    known = list(_RTK_NESTED_SCHEMA.keys())
+    for key, value in rtk.items():
+        path = f"optimizations.rtk.{key}"
+        if key not in _RTK_NESTED_SCHEMA:
+            suggestion = _suggest_typo(key, known)
+            msg = f"unrecognized key '{path}'"
+            if suggestion:
+                msg += f" (did you mean 'optimizations.rtk.{suggestion}'?)"
+            warnings.append((path, msg))
+            continue
+        if value is None:
+            continue
+        expected = _RTK_NESTED_SCHEMA[key]
+        if not _check_type(value, expected):
+            exp_label = expected if isinstance(expected, str) else "/".join(expected)
+            warnings.append((
+                path,
+                f"'{path}' should be {exp_label}, got {type(value).__name__}",
+            ))
+            continue
+        if key == "enabled" and isinstance(value, str):
+            if value.strip().lower() not in RTK_ENABLED_VALID:
+                warnings.append((
+                    path,
+                    f"'{path}' should be one of "
+                    f"{sorted(RTK_ENABLED_VALID - {''})}, got {value!r}",
+                ))
+    return warnings
+
+
+def _validate_caveman_nested(caveman: dict) -> List[Tuple[str, str]]:
+    """Validate the nested ``optimizations.caveman`` dict."""
+    warnings: List[Tuple[str, str]] = []
+    known = list(_CAVEMAN_NESTED_SCHEMA.keys())
+    for key, value in caveman.items():
+        path = f"optimizations.caveman.{key}"
+        if key not in _CAVEMAN_NESTED_SCHEMA:
+            suggestion = _suggest_typo(key, known)
+            msg = f"unrecognized key '{path}'"
+            if suggestion:
+                msg += f" (did you mean 'optimizations.caveman.{suggestion}'?)"
+            warnings.append((path, msg))
+            continue
+        if value is None:
+            continue
+        expected = _CAVEMAN_NESTED_SCHEMA[key]
+        if not _check_type(value, expected):
+            exp_label = expected if isinstance(expected, str) else "/".join(expected)
+            warnings.append((
+                path,
+                f"'{path}' should be {exp_label}, got {type(value).__name__}",
+            ))
+            continue
+        if key == "include" and isinstance(value, list):
+            for idx, entry in enumerate(value):
+                if not isinstance(entry, str):
+                    warnings.append((
+                        f"{path}[{idx}]",
+                        f"'{path}[{idx}]' should be str, got {type(entry).__name__}",
+                    ))
+    return warnings
+
+
+_PONYTAIL_NESTED_SCHEMA: Dict[str, Any] = {
+    "enabled": "bool",
+}
+
+
+def _validate_ponytail_nested(ponytail: dict) -> List[Tuple[str, str]]:
+    """Validate the nested ``optimizations.ponytail`` dict."""
+    warnings: List[Tuple[str, str]] = []
+    known = list(_PONYTAIL_NESTED_SCHEMA.keys())
+    for key, value in ponytail.items():
+        path = f"optimizations.ponytail.{key}"
+        if key not in _PONYTAIL_NESTED_SCHEMA:
+            suggestion = _suggest_typo(key, known)
+            msg = f"unrecognized key '{path}'"
+            if suggestion:
+                msg += f" (did you mean 'optimizations.ponytail.{suggestion}'?)"
+            warnings.append((path, msg))
+            continue
+        if value is None:
+            continue
+        expected = _PONYTAIL_NESTED_SCHEMA[key]
+        if not _check_type(value, expected):
+            exp_label = expected if isinstance(expected, str) else "/".join(expected)
+            warnings.append((
+                path,
+                f"'{path}' should be {exp_label}, got {type(value).__name__}",
+            ))
+    return warnings
+
+
+_REVIEW_COMPRESSOR_NESTED_SCHEMA: Dict[str, Any] = {
+    "enabled": "bool",
+}
+
+
+def _validate_review_compressor_nested(rc: dict) -> List[Tuple[str, str]]:
+    """Validate the nested ``optimizations.review_compressor`` dict."""
+    warnings: List[Tuple[str, str]] = []
+    known = list(_REVIEW_COMPRESSOR_NESTED_SCHEMA.keys())
+    for key, value in rc.items():
+        path = f"optimizations.review_compressor.{key}"
+        if key not in _REVIEW_COMPRESSOR_NESTED_SCHEMA:
+            suggestion = _suggest_typo(key, known)
+            msg = f"unrecognized key '{path}'"
+            if suggestion:
+                msg += f" (did you mean 'optimizations.review_compressor.{suggestion}'?)"
+            warnings.append((path, msg))
+            continue
+        if value is None:
+            continue
+        expected = _REVIEW_COMPRESSOR_NESTED_SCHEMA[key]
+        if not _check_type(value, expected):
+            exp_label = expected if isinstance(expected, str) else "/".join(expected)
+            warnings.append((
+                path,
+                f"'{path}' should be {exp_label}, got {type(value).__name__}",
+            ))
     return warnings
 
 
@@ -278,8 +630,256 @@ def _check_schedule_overlap(deep_spec: str, work_spec: str) -> bool:
     return False
 
 
-def validate_and_warn(config: dict) -> List[str]:
-    """Validate config and log warnings.
+def _collect_keys(d: dict, prefix: str = "") -> set:
+    """Recursively collect all key paths from a dict.
+
+    Returns a set of dotted key paths (e.g., {"budget.warn_at_percent", "models.chat"}).
+    Top-level keys are returned without prefix. Nested dicts are descended into.
+    """
+    keys = set()
+    for key, value in d.items():
+        path = f"{prefix}.{key}" if prefix else key
+        keys.add(path)
+        if isinstance(value, dict):
+            keys.update(_collect_keys(value, path))
+    return keys
+
+
+def _find_commented_keys(text: str) -> Set[str]:
+    """Extract key names from commented-out YAML lines.
+
+    Matches lines like "# key_name:" or "#key_name: value" at any indentation.
+    Returns the set of key names found (leaf names only, not full paths).
+    """
+    pattern = re.compile(r"^\s*#\s*(\w+)\s*:", re.MULTILINE)
+    return {m.group(1) for m in pattern.finditer(text)}
+
+
+def detect_config_drift(
+    koan_root: str,
+    user_config: Optional[dict] = None,
+) -> List[str]:
+    """Compare user's config.yaml against the template and report missing keys.
+
+    Compares key trees recursively. Reports keys present in the template
+    but absent from the user's config as advisory info (not errors).
+
+    Keys that are commented out in the user's config file are excluded from
+    the drift report — a commented key means the user is aware of it and
+    has chosen to use the default value.
+
+    Args:
+        koan_root: Path to the koan root directory (where instance.example/ lives).
+        user_config: The user's loaded config dict. If None, loads from instance/config.yaml.
+
+    Returns:
+        List of missing key paths (dotted notation, e.g. "auto_update.notify").
+    """
+    root = Path(koan_root)
+    template_path = root / "instance.example" / "config.yaml"
+
+    if not template_path.exists():
+        return []
+
+    try:
+        import yaml
+        template_config = yaml.safe_load(template_path.read_text()) or {}
+    except Exception as e:
+        log("warn", f"[config] Could not load template config: {e}")
+        return []
+
+    if not isinstance(template_config, dict):
+        return []
+
+    # Read raw user config text to detect commented-out keys
+    user_path = root / "instance" / "config.yaml"
+    commented_keys: Set[str] = set()
+    if user_path.exists():
+        try:
+            commented_keys = _find_commented_keys(user_path.read_text())
+        except Exception as e:
+            log("warn", f"[config] Could not read config for comment detection: {e}")
+
+    if user_config is None:
+        if not user_path.exists():
+            return []
+        try:
+            user_config = yaml.safe_load(user_path.read_text()) or {}
+        except Exception as e:
+            log("warn", f"[config] Could not load user config for drift check: {e}")
+            return []
+
+    if not isinstance(user_config, dict):
+        return []
+
+    template_keys = _collect_keys(template_config)
+    user_keys = _collect_keys(user_config)
+
+    # Keys in template but not in user config
+    missing = sorted(template_keys - user_keys)
+
+    # Filter out parent keys whose children are also missing
+    # (e.g., if "auto_update" is missing, don't also report "auto_update.enabled")
+    # Also filter out keys that are commented out in the user's config file
+    filtered = []
+    for key in missing:
+        parent = key.rsplit(".", 1)[0] if "." in key else None
+        if parent and parent in missing:
+            continue
+        # Check if the leaf key name is commented out in the user's config
+        leaf = key.rsplit(".", 1)[-1]
+        if leaf in commented_keys:
+            continue
+        filtered.append(key)
+
+    return filtered
+
+
+def find_extra_config_keys(
+    koan_root: str,
+    user_config: Optional[dict] = None,
+) -> List[str]:
+    """Report keys present in the user's config but absent from the template.
+
+    Extras usually mean deprecated or removed features — or user typos that
+    `validate_config` didn't catch (e.g. misspelled keys nested under dicts).
+
+    Keys that are commented out in the template (e.g. ``# auto_pause: false``
+    shown as an opt-in example) are treated as known and not reported — users
+    uncommenting such a key should not be told it's a typo.
+
+    Like :func:`detect_config_drift`, parent keys are preferred over children
+    when both are missing from the template, to keep reports concise.
+
+    Args:
+        koan_root: Path to the koan root directory (where instance.example/ lives).
+        user_config: The user's loaded config dict. If None, loads from instance/config.yaml.
+
+    Returns:
+        List of extra key paths (dotted notation).
+    """
+    root = Path(koan_root)
+    template_path = root / "instance.example" / "config.yaml"
+
+    if not template_path.exists():
+        return []
+
+    try:
+        import yaml
+        template_text = template_path.read_text()
+        template_config = yaml.safe_load(template_text) or {}
+    except Exception as e:
+        log("warn", f"[config] Could not load template config: {e}")
+        return []
+
+    if not isinstance(template_config, dict):
+        return []
+
+    # Keys that appear commented-out in the template are documented defaults
+    # the user may legitimately uncomment — don't flag them as extras.
+    template_commented_keys: Set[str] = _find_commented_keys(template_text)
+
+    if user_config is None:
+        user_path = root / "instance" / "config.yaml"
+        if not user_path.exists():
+            return []
+        try:
+            user_config = yaml.safe_load(user_path.read_text()) or {}
+        except Exception as e:
+            log("warn", f"[config] Could not load user config for drift check: {e}")
+            return []
+
+    if not isinstance(user_config, dict):
+        return []
+
+    template_keys = _collect_keys(template_config)
+    user_keys = _collect_keys(user_config)
+
+    extra = sorted(user_keys - template_keys)
+
+    # Collapse children into their parent when the parent is also extra,
+    # and drop keys whose leaf name is commented out in the template.
+    filtered = []
+    for key in extra:
+        parent = key.rsplit(".", 1)[0] if "." in key else None
+        if parent and parent in extra:
+            continue
+        leaf = key.rsplit(".", 1)[-1]
+        if leaf in template_commented_keys:
+            continue
+        filtered.append(key)
+
+    return filtered
+
+
+def validate_config_or_raise(koan_root: str) -> None:
+    """Validate config.yaml strictly — raise ValueError on critical issues.
+
+    Called at startup to fail fast on broken config files. Checks:
+    1. YAML is parseable.
+    2. Root value is a mapping (dict).
+    3. Known section keys have correct types (dict sections aren't scalars).
+
+    Raises:
+        ValueError: With a human-readable message describing the issue.
+    """
+    import yaml as _yaml
+
+    config_path = Path(koan_root) / "instance" / "config.yaml"
+    if not config_path.exists():
+        return
+
+    try:
+        raw = config_path.read_text()
+    except OSError as e:
+        raise ValueError(f"Cannot read config.yaml: {e}") from e
+
+    try:
+        data = _yaml.safe_load(raw)
+    except _yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in config.yaml: {e}") from e
+
+    if data is None:
+        return
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"config.yaml root must be a mapping, got {type(data).__name__}"
+        )
+
+    errors = []
+    for key, value in data.items():
+        if value is None or key not in CONFIG_SCHEMA:
+            continue
+        expected = CONFIG_SCHEMA[key]
+        if expected == _NESTED:
+            if key == "effort" and isinstance(value, str):
+                continue
+            if key == "stagnation" and value is False:
+                continue
+            if not isinstance(value, dict):
+                errors.append(
+                    f"'{key}' must be a mapping, got {type(value).__name__}"
+                )
+        else:
+            if not _check_type(value, expected):
+                exp_label = expected if isinstance(expected, str) else "/".join(expected)
+                errors.append(
+                    f"'{key}' must be {exp_label}, got {type(value).__name__}"
+                )
+
+    if errors:
+        raise ValueError(
+            "config.yaml has invalid entries:\n  - " + "\n  - ".join(errors)
+        )
+
+
+def validate_and_warn(config: dict, koan_root: Optional[str] = None) -> List[str]:
+    """Validate config and log warnings. Optionally detect config drift.
+
+    Args:
+        config: The loaded config dict.
+        koan_root: If provided, also runs config drift detection.
 
     Returns list of warning messages (for testing).
     """
@@ -289,4 +889,18 @@ def validate_and_warn(config: dict) -> List[str]:
         full_msg = f"[config] {msg}"
         log("warn", full_msg)
         messages.append(full_msg)
+
+    # Config drift detection (advisory only)
+    if koan_root:
+        missing_keys = detect_config_drift(koan_root, user_config=config)
+        if missing_keys:
+            keys_list = ", ".join(missing_keys)
+            drift_msg = (
+                f"[config] Config drift: {len(missing_keys)} key(s) in template "
+                f"not in your config.yaml: {keys_list}"
+                f" — see instance.example/config.yaml for documentation"
+            )
+            log("info", drift_msg)
+            messages.append(drift_msg)
+
     return messages

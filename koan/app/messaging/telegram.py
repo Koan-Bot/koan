@@ -84,6 +84,12 @@ class TelegramProvider(MessagingProvider):
         # Message ID tracking — populated by _send_chunk(), cleared by _send_raw()
         self._last_message_ids: List[int] = []
 
+        # Consecutive poll failure tracking for exponential backoff
+        self._consecutive_poll_failures: int = 0
+
+        # Bot identity — populated from getMe during configure()
+        self._bot_username: str = ""
+
     # -- MessagingProvider interface ------------------------------------------
 
     def configure(self) -> bool:
@@ -101,20 +107,34 @@ class TelegramProvider(MessagingProvider):
             return False
 
         self._api_base = f"https://api.telegram.org/bot{self._bot_token}"
+
+        try:
+            me = requests.get(f"{self._api_base}/getMe", timeout=5).json()
+            if me.get("ok"):
+                self._bot_username = me.get("result", {}).get("username", "")
+        except Exception as e:
+            print(f"[telegram] getMe failed: {e}", file=sys.stderr)
+
         return True
 
     def get_provider_name(self) -> str:
         return "telegram"
 
+    def get_api_base(self) -> str:
+        return self._api_base
+
     def get_channel_id(self) -> str:
         return self._chat_id
 
-    def send_message(self, text: str) -> bool:
+    def get_bot_username(self) -> str:
+        return self._bot_username
+
+    def send_message(self, text: str, reply_to_message_id: int = 0) -> bool:
         """Send a message with flood protection and chunking.
-        
+
         Empty messages bypass flood protection but are still sent
         (e.g., for clearing chat state in tests).
-        
+
         Returns:
             True if message was sent OR suppressed (both count as success).
             False only on actual send failure.
@@ -150,7 +170,7 @@ class TelegramProvider(MessagingProvider):
             )
             return True
 
-        return self._send_raw(text)
+        return self._send_raw(text, reply_to=reply_to_message_id)
 
     def get_last_message_ids(self) -> List[int]:
         """Return message IDs from the last send_message() call."""
@@ -173,8 +193,14 @@ class TelegramProvider(MessagingProvider):
             data = resp.json()
             raw_updates = data.get("result", [])
         except (requests.RequestException, ValueError) as e:
-            print(f"[telegram] poll_updates error: {e}", file=sys.stderr)
+            self._consecutive_poll_failures += 1
+            backoff = min(2 ** self._consecutive_poll_failures, 60)
+            safe_msg = self._redact_token(str(e))
+            print(f"[telegram] poll_updates error: {safe_msg}", file=sys.stderr)
+            time.sleep(backoff)
             return []
+
+        self._consecutive_poll_failures = 0
 
         updates: List[Update] = []
         for raw in raw_updates:
@@ -241,7 +267,13 @@ class TelegramProvider(MessagingProvider):
 
     # -- Internal helpers -----------------------------------------------------
 
-    def _send_raw(self, text: str) -> bool:
+    def _redact_token(self, msg: str) -> str:
+        """Redact bot token from error messages to prevent leaking credentials."""
+        if self._bot_token:
+            msg = msg.replace(self._bot_token, "***")
+        return msg
+
+    def _send_raw(self, text: str, reply_to: int = 0) -> bool:
         """Send text to the Telegram API (no flood check).
 
         Retries each chunk up to 3 times with exponential backoff (1s/2s/4s)
@@ -271,10 +303,12 @@ class TelegramProvider(MessagingProvider):
         total = len(chunks)
         sent = 0
         failed = 0
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            # Only reply_to on the first chunk — subsequent chunks are continuations
+            chunk_reply = reply_to if i == 0 else 0
             try:
                 if retry_with_backoff(
-                    lambda c=chunk, pm=parse_mode: self._send_chunk(c, pm),
+                    lambda c=chunk, pm=parse_mode, rt=chunk_reply: self._send_chunk(c, pm, rt),
                     retryable=(requests.RequestException, ValueError),
                     label="telegram send",
                 ):
@@ -297,11 +331,13 @@ class TelegramProvider(MessagingProvider):
 
         return failed == 0
 
-    def _send_chunk(self, chunk: str, parse_mode: str = None) -> bool:
+    def _send_chunk(self, chunk: str, parse_mode: str = None, reply_to: int = 0) -> bool:
         """Send a single chunk via Telegram API. Raises on network error."""
         payload = {"chat_id": self._chat_id, "text": chunk}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_to:
+            payload["reply_parameters"] = {"message_id": reply_to}
         resp = requests.post(
             f"{self._api_base}/sendMessage",
             json=payload,
@@ -321,8 +357,13 @@ class TelegramProvider(MessagingProvider):
             self._last_message_ids.append(msg_id)
         return True
 
-    def send_typing(self) -> bool:
-        """Send 'typing...' indicator to the Telegram chat."""
+    def send_typing(self, reply_to_message_id: int = 0, status: str = "") -> bool:
+        """Send 'typing...' indicator to the Telegram chat.
+
+        Telegram has a single chat-wide typing action with no custom text, so
+        ``reply_to_message_id`` and ``status`` are accepted for interface
+        compatibility but ignored.
+        """
         if not self._bot_token or not self._chat_id:
             return False
         try:

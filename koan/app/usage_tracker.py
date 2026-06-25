@@ -91,7 +91,7 @@ class UsageTracker:
 
         # Parse session line
         session_match = re.search(
-            r'Session\s*\([^)]+\)\s*:\s*(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
+            r'Session\s*\([^)]+\)\s*:\s*~?(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
             content,
             re.IGNORECASE
         )
@@ -101,7 +101,7 @@ class UsageTracker:
 
         # Parse weekly line
         weekly_match = re.search(
-            r'Weekly\s*\([^)]+\)\s*:\s*(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
+            r'Weekly\s*\([^)]+\)\s*:\s*~?(\d+)%\s*\((?:reset|resets)\s+in\s+([^)]+)\)',
             content,
             re.IGNORECASE
         )
@@ -156,23 +156,23 @@ class UsageTracker:
             return self.session_pct / self.runs_this_session
         return 5.0  # Conservative default for first run
 
-    def can_afford_run(self, mode: str) -> bool:
+    def can_afford_run(self, mode: str, tier_multiplier: float = 1.0) -> bool:
         """Check if budget allows a run in the given mode.
 
         Args:
             mode: One of "review", "implement", "deep"
+            tier_multiplier: Additional cost multiplier from complexity tier
+                (e.g. 1.5 for complex, 2.0 for critical). Applied on top of
+                the mode multiplier so tier-based model upgrades are reflected
+                in the budget check.
 
         Returns:
             True if estimated cost fits within available budget
         """
-        cost_multipliers = {
-            "review": 0.5,      # Low-cost: read-only activities
-            "implement": 1.0,   # Medium-cost: normal development
-            "deep": 2.0,        # High-cost: intensive work
-        }
+        from app.burn_rate import MODE_MULTIPLIERS
 
         base_cost = self.estimate_run_cost()
-        estimated_cost = base_cost * cost_multipliers.get(mode, 1.0)
+        estimated_cost = base_cost * MODE_MULTIPLIERS.get(mode, 1.0) * tier_multiplier
 
         session_rem, weekly_rem = self.remaining_budget()
         available = min(session_rem, weekly_rem)
@@ -273,15 +273,35 @@ def _get_budget_mode() -> str:
     """Read budget_mode from config.yaml → usage.budget_mode.
 
     Valid values: "full" (default), "session_only", "disabled".
+    Automatically returns "disabled" when:
+    - ``usage.unlimited_quota`` is True (operator declares no quota limit), or
+    - the active provider's ``has_api_quota()`` returns False (ollama, local).
     """
     try:
         from app.utils import load_config
         config = load_config()
-        mode = config.get("usage", {}).get("budget_mode", "session_only")
+
+        # unlimited_quota is a hard override — skip all proactive gating
+        from app.config import is_unlimited_quota
+        if is_unlimited_quota():
+            return "disabled"
+
+        usage = config.get("usage", {})
+        if not isinstance(usage, dict):
+            return "session_only"
+        mode = usage.get("budget_mode", "session_only")
         if mode in ("full", "session_only", "disabled"):
+            # Override to disabled for no-quota providers
+            if mode != "disabled":
+                try:
+                    from app.cli_provider import get_provider
+                    if not get_provider().has_api_quota():
+                        return "disabled"
+                except Exception as exc:
+                    logger.warning("Provider quota check failed: %s", exc)
             return mode
-    except (ImportError, OSError, ValueError):
-        pass
+    except Exception as exc:  # noqa: BLE001 — never-raises helper, safe default
+        logger.warning("budget_mode resolution failed, defaulting: %s", exc)
     return "session_only"
 
 

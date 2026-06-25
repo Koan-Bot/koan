@@ -1,5 +1,6 @@
 {% extends "base.html" %}
-{% block title %}Koan — Usage{% endblock %}
+{% block title_suffix %} — Usage{% endblock %}
+{% block page_title %}Usage{% endblock %}
 {% block content %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
 
@@ -12,28 +13,148 @@
     font-weight: 600;
     white-space: nowrap;
 }
-.trend-improving { color: var(--green); background: rgba(63,185,80,0.12); }
-.trend-declining { color: var(--orange); background: rgba(210,153,34,0.12); }
-.trend-stable    { color: var(--text-muted); background: rgba(139,148,158,0.12); }
+.trend-improving { color: var(--success); background: var(--success-bg); }
+.trend-declining { color: var(--warning); background: var(--warning-bg); }
+.trend-stable    { color: var(--text-muted); background: var(--surface-3); }
 .project-link { color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .project-link:hover { color: var(--text); }
 .chart-container { position: relative; width: 100%; }
 .empty-state { color: var(--text-muted); font-style: italic; padding: 1rem 0; text-align: center; }
 .filter-bar { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.nav-btn {
+    padding: 0.3rem 0.7rem;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+.nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.nav-btn:not(:disabled):hover { background: var(--border); }
+.sortable-header { cursor: pointer; user-select: none; }
+.sortable-header:hover { color: var(--text); }
+.sort-indicator { font-size: 0.7rem; margin-left: 0.2rem; }
+.type-bar-container { display: flex; align-items: center; gap: 0.5rem; }
+.type-bar-track { flex: 1; height: 6px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
+.type-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+.type-pct { font-size: 0.75rem; color: var(--text-muted); min-width: 3rem; text-align: right; }
+
+/* Inline filter selects in table headers */
+.inline-filter {
+    background: transparent; border: none; color: var(--text-muted);
+    font-family: var(--font-mono); font-size: var(--fs-caption); font-weight: var(--fw-medium);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    cursor: pointer; padding: 0 var(--space-1); height: auto;
+    -webkit-appearance: none; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239a9ead' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 0 center; padding-right: 14px;
+}
+.inline-filter:focus { outline: 1px solid var(--brand); border-radius: 2px; }
+.inline-filter option { background: var(--surface-2); color: var(--text-primary); }
+
+/* Mission popover */
+#mission-popover {
+    position: fixed; z-index: 500; max-width: 520px; min-width: 260px;
+    font-size: var(--fs-body-sm); line-height: 1.6; white-space: pre-wrap;
+    word-break: break-word; pointer-events: auto;
+    opacity: 0; transition: opacity 0.15s; display: none;
+}
+#mission-popover.visible { opacity: 1; display: block; }
+#mission-popover a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+#mission-popover a:hover { opacity: 0.85; }
+.mission-text-cell { cursor: default; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Right-aligned numeric cells in k-table */
+.k-table .text-right { text-align: right; }
+.k-table .text-nowrap { white-space: nowrap; }
+
+/* Efficiency heatmap */
+.heatmap-wrap { overflow-x: auto; }
+.heatmap-grid {
+    display: grid;
+    gap: 3px;
+    min-width: fit-content;
+}
+.heatmap-corner { /* empty top-left */ }
+.heatmap-col-label {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 0 2px 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 48px;
+}
+.heatmap-row-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 6px 0 0;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+}
+.heatmap-row-label:hover { color: var(--text); }
+.heatmap-cell {
+    min-width: 48px;
+    height: 36px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.65rem;
+    font-weight: 600;
+    cursor: default;
+    transition: filter 0.1s;
+    text-shadow: 0 0 2px rgba(0,0,0,0.45);
+}
+.heatmap-cell:hover { filter: brightness(1.15); }
+.heatmap-cell.empty-cell {
+    background: var(--surface-3) !important;
+    opacity: 0.25;
+    color: transparent;
+    text-shadow: none;
+}
+/* Custom tooltip for heatmap */
+#heatmap-tooltip {
+    position: fixed; z-index: 600;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.1s;
+    white-space: pre-line;
+    max-width: 200px;
+}
+#heatmap-tooltip.visible { opacity: 1; }
 </style>
 
-<h1>Usage</h1>
-
 <div class="filter-bar">
+    <select id="project-select" style="padding:0.4rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;">
+        <option value="">All Projects</option>
+    </select>
     <select id="range-select" style="padding:0.4rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;">
         <option value="1">Today</option>
         <option value="7" selected>Last 7 days</option>
         <option value="30">Last 30 days</option>
+        <option value="90">Last 90 days</option>
     </select>
-    <span id="filter-label" style="display:none;color:var(--text-muted);font-size:0.85rem;">
-        Filtering: <strong id="filter-project"></strong>
-        <a href="#" id="clear-filter" style="color:var(--accent);margin-left:0.5rem;">clear</a>
-    </span>
+    <select id="granularity-select" style="padding:0.4rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;">
+        <option value="day" selected>By day</option>
+        <option value="week">By week</option>
+        <option value="month">By month</option>
+    </select>
+    <button class="nav-btn" id="prev-btn">&#8592; Prev</button>
+    <span id="window-label" style="font-size:0.85rem;color:var(--text-muted);"></span>
+    <button class="nav-btn" id="next-btn" disabled>Next &#8594;</button>
 </div>
 
 <div class="grid" id="totals">
@@ -49,14 +170,149 @@
         <div class="stat-label">Est. Cost</div>
         <div class="stat-value" id="total-cost">-</div>
     </div>
+    <div class="card">
+        <div class="stat-label">Prompt Cache Hit</div>
+        <div class="stat-value" id="cache-hit-rate">-</div>
+    </div>
+    <div class="card" id="cache-savings-card" style="display:none;">
+        <div class="stat-label">Est. Cache Savings</div>
+        <div class="stat-value" id="cache-savings">-</div>
+    </div>
+    <div class="card" id="forecast-badge-card">
+        <div class="stat-label">Quota Forecast</div>
+        <div class="stat-value" id="forecast-badge-text" style="font-size:var(--fs-body-md);">-</div>
+        <div id="forecast-badge-rate" style="font-size:var(--fs-caption);color:var(--text-muted);margin-top:0.2rem;"></div>
+    </div>
 </div>
 
-<h2>Daily Token Spend</h2>
+<h2>Token Spend</h2>
 <div class="card">
     <div class="chart-container" style="height:260px;">
         <canvas id="daily-chart"></canvas>
     </div>
     <div class="empty-state" id="daily-empty" style="display:none;">No usage data for this period.</div>
+</div>
+
+<h2>Spend by Project</h2>
+<div class="card">
+    <div class="chart-container" style="height:260px;">
+        <canvas id="stacked-chart"></canvas>
+    </div>
+    <div class="empty-state" id="stacked-empty" style="display:none;">No project data for this period.</div>
+</div>
+
+<h2>Spend by Skill Type</h2>
+<div class="card" style="display:flex;align-items:flex-start;gap:2rem;flex-wrap:wrap;">
+    <div style="flex:0 0 220px;">
+        <div class="chart-container" style="width:220px;height:220px;">
+            <canvas id="type-chart"></canvas>
+        </div>
+        <div class="empty-state" id="type-empty" style="display:none;">No type data.</div>
+    </div>
+    <div style="flex:1;min-width:320px;overflow-x:auto;">
+        <div class="k-table-wrap">
+        <table id="by-type-table" class="k-table">
+            <thead id="by-type-thead">
+                <tr>
+                    <th class="sortable-header" data-col="type">Type <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="runs">Runs <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="input">Input <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="output">Output <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="total">Total <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="cost">Cost <span class="sort-indicator">&#8597;</span></th>
+                    <th style="text-align:right;min-width:120px;">Share</th>
+                </tr>
+            </thead>
+            <tbody id="by-type-tbody"></tbody>
+        </table>
+        </div>
+        <div class="empty-state" id="type-table-empty" style="display:none;">No type data available.</div>
+    </div>
+</div>
+
+<h2>Spend by Autonomous Mode</h2>
+<div class="card" style="display:flex;align-items:flex-start;gap:2rem;flex-wrap:wrap;">
+    <div style="flex:0 0 220px;">
+        <div class="chart-container" style="width:220px;height:220px;">
+            <canvas id="mode-chart"></canvas>
+        </div>
+        <div class="empty-state" id="mode-empty" style="display:none;">No mode data.</div>
+    </div>
+    <div style="flex:1;min-width:320px;overflow-x:auto;">
+        <div class="k-table-wrap">
+        <table id="by-mode-table" class="k-table">
+            <thead id="by-mode-thead">
+                <tr>
+                    <th class="sortable-header" data-col="mode">Mode <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="runs">Runs <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="input">Input <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="output">Output <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="total">Total <span class="sort-indicator">&#8597;</span></th>
+                    <th class="sortable-header text-right" data-col="cost">Cost <span class="sort-indicator">&#8597;</span></th>
+                    <th style="text-align:right;min-width:120px;">Share</th>
+                </tr>
+            </thead>
+            <tbody id="by-mode-tbody"></tbody>
+        </table>
+        </div>
+        <div class="empty-state" id="mode-table-empty" style="display:none;">No mode data available.</div>
+    </div>
+</div>
+
+<h2>Efficiency Heatmap <span style="font-size:var(--fs-caption);color:var(--text-muted);font-weight:normal;">token density by project × skill type</span></h2>
+<div class="card">
+    <div class="heatmap-wrap">
+        <div id="heatmap-container"></div>
+    </div>
+    <div class="empty-state" id="heatmap-empty" style="display:none;">Need at least 2 projects and 2 skill types to render heatmap.</div>
+</div>
+<div id="heatmap-tooltip"></div>
+
+<h2>Top Missions <span style="font-size:var(--fs-caption);color:var(--text-muted);font-weight:normal;">max 100</span></h2>
+<div class="card">
+    <div id="top-missions-content">
+        <div class="empty-state" id="missions-loading" style="display:none;">Loading...</div>
+        <div class="empty-state" id="missions-empty" style="display:none;">No mission data for this period.</div>
+        <div id="top-missions-table-wrap" class="k-table-wrap" style="display:none;">
+            <table id="top-missions-table" class="k-table">
+                <thead id="top-missions-thead">
+                    <tr>
+                        <th class="sortable-header text-nowrap" data-mcol="date">Date <span class="sort-indicator">&#8597;</span></th>
+                        <th>
+                            <select id="mission-project-filter" class="inline-filter">
+                                <option value="">Project &#9662;</option>
+                            </select>
+                        </th>
+                        <th class="sortable-header" data-mcol="type">Type <span class="sort-indicator">&#8597;</span></th>
+                        <th>
+                            <select id="mission-mode-filter" class="inline-filter">
+                                <option value="">Mode &#9662;</option>
+                            </select>
+                        </th>
+                        <th>Mission</th>
+                        <th class="sortable-header" data-mcol="model">Model <span class="sort-indicator">&#8597;</span></th>
+                        <th class="sortable-header text-right" data-mcol="input">Input <span class="sort-indicator">&#8597;</span></th>
+                        <th class="sortable-header text-right" data-mcol="output">Output <span class="sort-indicator">&#8597;</span></th>
+                        <th class="sortable-header text-right" data-mcol="cache">Cache <span class="sort-indicator">&#8597;</span></th>
+                        <th class="sortable-header text-right" data-mcol="cost">Cost <span class="sort-indicator">&#8597;</span></th>
+                        <th class="sortable-header text-right" data-mcol="duration">Duration <span class="sort-indicator">&#8597;</span></th>
+                        <th class="sortable-header" data-mcol="lastaction">Last Action <span class="sort-indicator">&#8597;</span></th>
+                    </tr>
+                </thead>
+                <tbody id="top-missions-tbody"></tbody>
+                <tfoot id="top-missions-tfoot" style="display:none;">
+                    <tr>
+                        <td colspan="6" style="font-weight:var(--fw-medium);color:var(--text-primary);">Total</td>
+                        <td class="text-right" id="missions-total-input"></td>
+                        <td class="text-right" id="missions-total-output"></td>
+                        <td class="text-right" id="missions-total-cache"></td>
+                        <td class="text-right" id="missions-total-cost" style="font-weight:var(--fw-medium);"></td>
+                        <td colspan="2"></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+    </div>
 </div>
 
 <h2>Mission Outcomes</h2>
@@ -68,44 +324,140 @@
     <div class="empty-state" id="outcome-empty" style="display:none;width:100%;">No mission data available.</div>
 </div>
 
+<h2>Last Action</h2>
+<div class="card" style="display:flex;align-items:center;gap:2rem;flex-wrap:wrap;">
+    <div class="chart-container" style="width:200px;height:200px;flex-shrink:0;">
+        <canvas id="last-action-chart"></canvas>
+    </div>
+    <div id="last-action-legend" style="font-size:0.85rem;"></div>
+    <div class="empty-state" id="last-action-empty" style="display:none;width:100%;">No last-action data available.</div>
+</div>
+
 <h2>By Project</h2>
 <div class="card" id="by-project-card">
-    <table id="by-project" style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:0.85rem;">
+    <div class="k-table-wrap">
+    <table id="by-project" class="k-table">
         <thead>
-            <tr style="color:var(--text-muted);text-align:left;">
-                <th style="padding:0.5rem 0;">Project</th>
-                <th style="padding:0.5rem 0;text-align:right;">Input</th>
-                <th style="padding:0.5rem 0;text-align:right;">Output</th>
-                <th style="padding:0.5rem 0;text-align:right;">Total</th>
-                <th style="padding:0.5rem 0;text-align:right;">Runs</th>
-                <th style="padding:0.5rem 0;text-align:right;">Success</th>
-                <th style="padding:0.5rem 0;text-align:right;">Trend</th>
+            <tr>
+                <th>Project</th>
+                <th class="text-right">Input</th>
+                <th class="text-right">Output</th>
+                <th class="text-right">Total</th>
+                <th class="text-right">Cost</th>
+                <th class="text-right">Runs</th>
+                <th class="text-right">Cache Hit %</th>
+                <th class="text-right">Success</th>
+                <th class="text-right">Trend</th>
+                <th class="text-right" title="Estimated fraction of tokens spent on non-productive sessions (proportional approximation)">Waste %</th>
             </tr>
         </thead>
         <tbody></tbody>
     </table>
+    </div>
+</div>
+
+<h2>Efficiency</h2>
+<p style="color:var(--text-muted);font-size:0.85rem;margin:-0.5rem 0 0.75rem;">
+    Tokens per productive outcome by project (lower is better).
+    Token split is proportional — not per-session attribution.
+</p>
+<div class="card" id="efficiency-card">
+    <canvas id="efficiency-chart" height="200"></canvas>
+    <div class="empty-state" id="efficiency-empty" style="display:none;">No efficiency data available.</div>
 </div>
 
 <h2>By Model</h2>
 <div class="card" id="by-model-card">
-    <table id="by-model" style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:0.85rem;">
+    <div class="k-table-wrap">
+    <table id="by-model" class="k-table">
         <thead>
-            <tr style="color:var(--text-muted);text-align:left;">
-                <th style="padding:0.5rem 0;">Model</th>
-                <th style="padding:0.5rem 0;text-align:right;">Input</th>
-                <th style="padding:0.5rem 0;text-align:right;">Output</th>
-                <th style="padding:0.5rem 0;text-align:right;">Total</th>
-                <th style="padding:0.5rem 0;text-align:right;">Runs</th>
+            <tr>
+                <th>Model</th>
+                <th class="text-right">Input</th>
+                <th class="text-right">Output</th>
+                <th class="text-right">Total</th>
+                <th class="text-right">Cost</th>
+                <th class="text-right">Runs</th>
             </tr>
         </thead>
         <tbody></tbody>
     </table>
+    </div>
 </div>
+
+<div id="mission-popover" class="k-popover"></div>
 
 <script>
 let dailyChart = null;
+let stackedChart = null;
 let outcomeChart = null;
+let typeChart = null;
+let modeChart = null;
+let lastActionChart = null;
+let efficiencyChart = null;
 let currentProject = '';
+let windowOffset = 0;
+
+const PROJECT_COLORS = [
+    'rgba(88,166,255,0.8)',
+    'rgba(63,185,80,0.8)',
+    'rgba(210,153,34,0.8)',
+    'rgba(248,81,73,0.8)',
+    'rgba(188,140,255,0.8)',
+    'rgba(255,168,87,0.8)',
+    'rgba(87,220,188,0.8)',
+    'rgba(255,107,139,0.8)',
+];
+const TYPE_COLORS = {
+    review:      'rgba(88,166,255,0.8)',
+    implement:   'rgba(63,185,80,0.8)',
+    rebase:      'rgba(210,153,34,0.8)',
+    plan:        'rgba(188,140,255,0.8)',
+    audit:       'rgba(248,81,73,0.8)',
+    check:       'rgba(255,168,87,0.8)',
+    maintenance: 'rgba(87,220,188,0.8)',
+    refactor:    'rgba(255,107,139,0.8)',
+    pr:          'rgba(130,180,255,0.8)',
+    chat:        'rgba(160,160,160,0.8)',
+    incident:    'rgba(255,80,80,0.8)',
+    recreate:    'rgba(180,130,255,0.8)',
+    autonomous:  'rgba(100,120,140,0.6)',
+    freetext:    'rgba(140,140,140,0.6)',
+    unknown:     'rgba(80,80,80,0.5)',
+};
+let _fallbackColorIdx = 0;
+function typeColor(name) {
+    if (TYPE_COLORS[name]) return TYPE_COLORS[name];
+    TYPE_COLORS[name] = PROJECT_COLORS[_fallbackColorIdx % PROJECT_COLORS.length];
+    _fallbackColorIdx++;
+    return TYPE_COLORS[name];
+}
+const MODE_COLORS = {
+    review:    'rgba(88,166,255,0.8)',
+    implement: 'rgba(63,185,80,0.8)',
+    deep:      'rgba(188,140,255,0.8)',
+    unknown:   'rgba(80,80,80,0.5)',
+};
+let _modeFallbackIdx = 0;
+function modeColor(name) {
+    if (MODE_COLORS[name]) return MODE_COLORS[name];
+    MODE_COLORS[name] = PROJECT_COLORS[_modeFallbackIdx % PROJECT_COLORS.length];
+    _modeFallbackIdx++;
+    return MODE_COLORS[name];
+}
+function modeLabel(name) {
+    return name === 'unknown' ? 'Unknown (non-autonomous)' : capitalize(name);
+}
+
+const _projectColorMap = {};
+let _colorIdx = 0;
+function projectColor(name) {
+    if (!_projectColorMap[name]) {
+        _projectColorMap[name] = PROJECT_COLORS[_colorIdx % PROJECT_COLORS.length];
+        _colorIdx++;
+    }
+    return _projectColorMap[name];
+}
 
 function fmtTokens(n) {
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
@@ -113,7 +465,18 @@ function fmtTokens(n) {
     return n.toString();
 }
 
+function fmtCost(v) {
+    if (v === null || v === undefined || v === 0) return '-';
+    if (v < 0.01) return '<$0.01';
+    return '$' + v.toFixed(2);
+}
+
+function capitalize(s) {
+    return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 function shortModel(id) {
+    if (!id) return '';
     if (id.includes('opus')) return 'Opus';
     if (id.includes('sonnet')) return 'Sonnet';
     if (id.includes('haiku')) return 'Haiku';
@@ -121,29 +484,129 @@ function shortModel(id) {
 }
 
 function trendBadge(trend) {
-    const symbols = {improving: '\u2191', declining: '\u2193', stable: '\u2192'};
+    const symbols = {improving: '↑', declining: '↓', stable: '→'};
     const cls = 'trend-' + (trend || 'stable');
-    return '<span class="trend-badge ' + cls + '">' + (symbols[trend] || '\u2192') + ' ' + (trend || 'stable') + '</span>';
+    return '<span class="trend-badge ' + cls + '">' + (symbols[trend] || '→') + ' ' + (trend || 'stable') + '</span>';
+}
+
+function seriesLabel(entry, granularity) {
+    if (granularity === 'week') return entry.week || entry.date.slice(5);
+    if (granularity === 'month') return entry.month || entry.date.slice(0, 7);
+    return entry.date.slice(5);
+}
+
+/* ── Badge helpers ── */
+const TYPE_BADGE = {
+    review:'blue', implement:'green', rebase:'orange', plan:'purple',
+    audit:'red', check:'teal', maintenance:'teal', refactor:'yellow',
+    pr:'blue', chat:'muted', incident:'red', recreate:'purple',
+    freetext:'muted', autonomous:'muted', unknown:'muted',
+};
+function typeBadgeHtml(t) {
+    var c = TYPE_BADGE[t] || 'muted';
+    return '<span class="badge badge-' + c + '">' + escapeHtml(t || 'unknown') + '</span>';
+}
+
+const MODE_BADGE = {
+    implement:'green', review:'blue', deep:'purple', unknown:'muted',
+};
+function modeBadgeHtml(m) {
+    var c = MODE_BADGE[m] || 'muted';
+    return '<span class="badge badge-' + c + '">' + escapeHtml(m || '—') + '</span>';
+}
+
+const PROJECT_BADGE_CYCLE = ['blue','green','orange','purple','teal','yellow','red','muted'];
+const _projBadgeMap = {};
+let _projBadgeIdx = 0;
+function projectBadgeHtml(name) {
+    if (!name) return '';
+    if (!_projBadgeMap[name]) {
+        _projBadgeMap[name] = PROJECT_BADGE_CYCLE[_projBadgeIdx++ % PROJECT_BADGE_CYCLE.length];
+    }
+    return '<span class="badge badge-' + _projBadgeMap[name] + '">' + escapeHtml(name) + '</span>';
+}
+
+/* ── Date formatter ── */
+const _DAY = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const _MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function fmtDate(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso.slice(5, 16).replace('T', ' ');
+    var dow = _DAY[d.getDay()];
+    var mon = _MON[d.getMonth()];
+    var day = d.getDate();
+    var h = d.getHours();
+    var m = String(d.getMinutes()).padStart(2, '0');
+    return dow + ' ' + mon + ' ' + day + ' ' + h + ':' + m;
+}
+
+/* ── Text helpers ── */
+function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function shortenUrl(url) {
+    var m = url.match(/^https?:\/\/(?:[^/]+\.)?github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/(\d+)(?:[?#].*)?$/);
+    if (m) return '#' + m[1];
+    m = url.match(/^https?:\/\/[^/]+\/browse\/([A-Z][A-Z0-9_]+-\d+)(?:[?#].*)?$/);
+    if (m) return m[1];
+    return url.length > 60 ? url.slice(0, 57) + '...' : url;
+}
+
+function linkifyHtml(text) {
+    return escapeHtml(text).replace(/(https?:\/\/[^\s<>)\]]+)/g, function(_, url) {
+        var decoded = url.replace(/&amp;/g, '&');
+        return '<a href="' + decoded + '" target="_blank" rel="noopener noreferrer">' + shortenUrl(decoded) + '</a>';
+    });
+}
+
+function fmtCostDetail(v, hasPricing) {
+    if (!hasPricing) return '-';
+    if (v === null || v === undefined) return '-';
+    if (v === 0) return '$0.00';
+    if (v < 0.01) return '<$0.01';
+    return '$' + v.toFixed(2);
 }
 
 function setProjectFilter(project) {
     currentProject = project;
-    const label = document.getElementById('filter-label');
-    if (project) {
-        document.getElementById('filter-project').textContent = project;
-        label.style.display = '';
-        history.replaceState(null, '', '?project=' + encodeURIComponent(project));
-    } else {
-        label.style.display = 'none';
-        history.replaceState(null, '', location.pathname);
-    }
+    document.getElementById('project-select').value = project;
+    updateURL();
     loadAll();
 }
 
-function renderDailyChart(daily, hasPricing) {
+function updateURL() {
+    const params = new URLSearchParams();
+    if (currentProject) params.set('project', currentProject);
+    if (windowOffset > 0) params.set('offset', windowOffset);
+    const granularity = document.getElementById('granularity-select').value;
+    if (granularity !== 'day') params.set('granularity', granularity);
+    const str = params.toString();
+    history.replaceState(null, '', str ? '?' + str : location.pathname);
+}
+
+function loadProjects() {
+    fetch('/api/projects')
+        .then(r => r.json())
+        .then(data => {
+            const sel = document.getElementById('project-select');
+            const projects = (data.projects || []).sort();
+            projects.forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p;
+                opt.textContent = p;
+                if (p === currentProject) opt.selected = true;
+                sel.appendChild(opt);
+            });
+        })
+        .catch(err => { console.error('Failed to load projects:', err); });
+}
+
+function renderDailyChart(series, hasPricing, granularity) {
     const canvas = document.getElementById('daily-chart');
     const emptyEl = document.getElementById('daily-empty');
-    const hasData = daily.some(d => d.total_input > 0 || d.total_output > 0);
+    const hasData = series.some(d => d.total_input > 0 || d.total_output > 0);
 
     if (!hasData) {
         canvas.style.display = 'none';
@@ -154,26 +617,38 @@ function renderDailyChart(daily, hasPricing) {
     canvas.style.display = '';
     emptyEl.style.display = 'none';
 
-    const labels = daily.map(d => d.date.slice(5)); // MM-DD
+    const labels = series.map(d => seriesLabel(d, granularity));
     const datasets = [
         {
             label: 'Input',
-            data: daily.map(d => d.total_input),
+            data: series.map(d => d.total_input),
             backgroundColor: 'rgba(88,166,255,0.7)',
             stack: 'tokens',
         },
         {
             label: 'Output',
-            data: daily.map(d => d.total_output),
+            data: series.map(d => d.total_output),
             backgroundColor: 'rgba(63,185,80,0.7)',
+            stack: 'tokens',
+        },
+        {
+            label: 'Cache Read',
+            data: series.map(d => d.cache_read_input_tokens || 0),
+            backgroundColor: 'rgba(210,153,34,0.7)',
+            stack: 'tokens',
+        },
+        {
+            label: 'Cache Create',
+            data: series.map(d => d.cache_creation_input_tokens || 0),
+            backgroundColor: 'rgba(248,81,73,0.55)',
             stack: 'tokens',
         },
     ];
 
-    if (hasPricing && daily.some(d => d.cost !== null)) {
+    if (hasPricing && series.some(d => d.cost !== null)) {
         datasets.push({
             label: 'Cost ($)',
-            data: daily.map(d => d.cost),
+            data: series.map(d => d.cost),
             type: 'line',
             borderColor: 'rgba(210,153,34,0.9)',
             backgroundColor: 'transparent',
@@ -183,6 +658,22 @@ function renderDailyChart(daily, hasPricing) {
         });
     }
 
+    const hasCacheData = series.some(d => (d.cache_hit_rate || 0) > 0);
+    if (hasCacheData) {
+        datasets.push({
+            label: 'Cache Hit %',
+            data: series.map(d => parseFloat(((d.cache_hit_rate || 0) * 100).toFixed(1))),
+            type: 'line',
+            borderColor: 'rgba(163,113,247,0.9)',
+            backgroundColor: 'transparent',
+            borderDash: [5, 3],
+            yAxisID: 'cacheRate',
+            pointRadius: 2,
+            tension: 0.3,
+        });
+    }
+
+    const hasCost = hasPricing && series.some(d => d.cost !== null);
     if (dailyChart) dailyChart.destroy();
     dailyChart = new Chart(canvas, {
         type: 'bar',
@@ -198,13 +689,73 @@ function renderDailyChart(daily, hasPricing) {
                     ticks: {color: '#8b949e', callback: v => fmtTokens(v)},
                     grid: {color: 'rgba(48,54,61,0.5)'},
                 },
-                ...(hasPricing && daily.some(d => d.cost !== null) ? {
+                ...(hasCost ? {
                     cost: {
                         position: 'right',
                         ticks: {color: '#d29922', callback: v => '$' + v.toFixed(2)},
                         grid: {drawOnChartArea: false},
                     }
                 } : {}),
+                ...(hasCacheData ? {
+                    cacheRate: {
+                        position: 'right',
+                        min: 0,
+                        max: 100,
+                        ticks: {color: 'rgba(163,113,247,0.9)', callback: v => v.toFixed(0) + '%'},
+                        grid: {drawOnChartArea: false},
+                    }
+                } : {}),
+            },
+        },
+    });
+}
+
+function renderStackedChart(series, granularity) {
+    const canvas = document.getElementById('stacked-chart');
+    const emptyEl = document.getElementById('stacked-empty');
+
+    const projectSet = new Set();
+    series.forEach(entry => {
+        if (entry.by_project) Object.keys(entry.by_project).forEach(p => projectSet.add(p));
+    });
+    const projects = Array.from(projectSet);
+
+    const hasData = projects.length > 0 && series.some(e => e.by_project && Object.keys(e.by_project).length > 0);
+    if (!hasData) {
+        canvas.style.display = 'none';
+        emptyEl.style.display = '';
+        if (stackedChart) { stackedChart.destroy(); stackedChart = null; }
+        return;
+    }
+    canvas.style.display = '';
+    emptyEl.style.display = 'none';
+
+    const labels = series.map(d => seriesLabel(d, granularity));
+    const datasets = projects.map(proj => ({
+        label: proj,
+        data: series.map(e => {
+            const bp = e.by_project && e.by_project[proj];
+            return bp ? (bp.total_input + bp.total_output) : 0;
+        }),
+        backgroundColor: projectColor(proj),
+        stack: 'projects',
+    }));
+
+    if (stackedChart) stackedChart.destroy();
+    stackedChart = new Chart(canvas, {
+        type: 'bar',
+        data: {labels, datasets},
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {legend: {labels: {color: '#8b949e'}}},
+            scales: {
+                x: {ticks: {color: '#8b949e'}, grid: {color: 'rgba(48,54,61,0.5)'}},
+                y: {
+                    stacked: true,
+                    ticks: {color: '#8b949e', callback: v => fmtTokens(v)},
+                    grid: {color: 'rgba(48,54,61,0.5)'},
+                },
             },
         },
     });
@@ -258,19 +809,550 @@ function renderOutcomeChart(metrics) {
     });
 }
 
-function loadAll() {
-    const days = document.getElementById('range-select').value;
-    const projParam = currentProject ? '&project=' + encodeURIComponent(currentProject) : '';
+const ACTION_COLORS = {
+    'Edit': '#3fb950', 'Write': '#58a6ff', 'Read': '#8b949e',
+    'Bash': '#d29922', 'Grep': '#bc8cff', 'Glob': '#f0883e',
+    'Agent': '#f85149', 'WebSearch': '#39d353', 'WebFetch': '#1f6feb',
+};
+function actionColor(name) {
+    return ACTION_COLORS[name] || PROJECT_COLORS[(Object.keys(ACTION_COLORS).length + name.charCodeAt(0)) % PROJECT_COLORS.length];
+}
 
-    // Fetch usage data
-    fetch('/api/usage?days=' + days + projParam)
+function renderLastActionChart(byLastAction) {
+    const canvas = document.getElementById('last-action-chart');
+    const legendEl = document.getElementById('last-action-legend');
+    const emptyEl = document.getElementById('last-action-empty');
+
+    if (!byLastAction || Object.keys(byLastAction).length === 0) {
+        canvas.style.display = 'none';
+        legendEl.innerHTML = '';
+        emptyEl.style.display = '';
+        if (lastActionChart) { lastActionChart.destroy(); lastActionChart = null; }
+        return;
+    }
+    canvas.style.display = '';
+    emptyEl.style.display = 'none';
+
+    const entries = Object.entries(byLastAction).sort((a, b) => b[1] - a[1]);
+    const labels = entries.map(([k]) => k);
+    const data = entries.map(([, v]) => v);
+    const colors = labels.map(l => actionColor(l));
+    const total = data.reduce((s, v) => s + v, 0);
+
+    legendEl.innerHTML = entries.map(([k, v], i) =>
+        '<div style="margin-bottom:0.25rem;">' +
+        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + colors[i] + ';margin-right:0.5rem;"></span>' +
+        k + ': <strong>' + v + '</strong> <span style="color:var(--text-muted);">(' + (v / total * 100).toFixed(0) + '%)</span></div>'
+    ).join('');
+
+    if (lastActionChart) lastActionChart.destroy();
+    lastActionChart = new Chart(canvas, {
+        type: 'doughnut',
+        data: {labels, datasets: [{data, backgroundColor: colors, borderWidth: 0}]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {legend: {display: false}},
+            cutout: '55%',
+        },
+    });
+}
+
+function renderTypeChart(byType, hasPricing) {
+    const canvas = document.getElementById('type-chart');
+    const emptyEl = document.getElementById('type-empty');
+    const tableEmptyEl = document.getElementById('type-table-empty');
+    const tbody = document.getElementById('by-type-tbody');
+
+    if (!byType || Object.keys(byType).length === 0) {
+        canvas.style.display = 'none';
+        emptyEl.style.display = '';
+        tbody.innerHTML = '';
+        tableEmptyEl.style.display = '';
+        if (typeChart) { typeChart.destroy(); typeChart = null; }
+        return;
+    }
+    canvas.style.display = '';
+    emptyEl.style.display = 'none';
+    tableEmptyEl.style.display = 'none';
+
+    const entries = Object.entries(byType)
+        .sort((a, b) => (b[1].input_tokens + b[1].output_tokens) - (a[1].input_tokens + a[1].output_tokens));
+    const labels = entries.map(([k]) => capitalize(k));
+    const values = entries.map(([, v]) => v.input_tokens + v.output_tokens);
+    const colors = entries.map(([k]) => typeColor(k));
+    const grandTotal = values.reduce((s, v) => s + v, 0);
+
+    if (typeChart) typeChart.destroy();
+    typeChart = new Chart(canvas, {
+        type: 'doughnut',
+        data: {labels, datasets: [{data: values, backgroundColor: colors, borderWidth: 0}]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {display: false},
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            const v = ctx.raw;
+                            const pct = grandTotal > 0 ? ((v / grandTotal) * 100).toFixed(1) : '0';
+                            return ctx.label + ': ' + fmtTokens(v) + ' (' + pct + '%)';
+                        }
+                    }
+                }
+            },
+            cutout: '55%',
+        },
+    });
+
+    tbody.innerHTML = '';
+    for (const [typeName, typeData] of entries) {
+        const total = typeData.input_tokens + typeData.output_tokens;
+        const pct = grandTotal > 0 ? ((total / grandTotal) * 100) : 0;
+        const costCell = hasPricing ? fmtCost(typeData.total_cost_usd || 0) : '-';
+        const color = typeColor(typeName);
+        tbody.innerHTML += '<tr data-type="' + typeName + '"' +
+            ' data-runs="' + typeData.count + '"' +
+            ' data-input="' + typeData.input_tokens + '"' +
+            ' data-output="' + typeData.output_tokens + '"' +
+            ' data-total="' + total + '"' +
+            ' data-cost="' + (typeData.total_cost_usd || 0) + '">' +
+            '<td>' +
+                '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + color + ';margin-right:0.5rem;vertical-align:middle;"></span>' +
+                capitalize(typeName) +
+            '</td>' +
+            '<td class="text-right">' + typeData.count + '</td>' +
+            '<td class="text-right">' + fmtTokens(typeData.input_tokens) + '</td>' +
+            '<td class="text-right">' + fmtTokens(typeData.output_tokens) + '</td>' +
+            '<td class="text-right">' + fmtTokens(total) + '</td>' +
+            '<td class="text-right">' + costCell + '</td>' +
+            '<td>' +
+                '<div class="type-bar-container">' +
+                    '<div class="type-bar-track"><div class="type-bar-fill" style="width:' + pct.toFixed(1) + '%;background:' + color + ';"></div></div>' +
+                    '<span class="type-pct">' + pct.toFixed(1) + '%</span>' +
+                '</div>' +
+            '</td>' +
+            '</tr>';
+    }
+}
+
+let typeSortCol = 'total';
+let typeSortAsc = false;
+
+function initTypeSortHandlers() {
+    document.querySelectorAll('#by-type-thead .sortable-header').forEach(th => {
+        th.addEventListener('click', () => {
+            const col = th.dataset.col;
+            if (typeSortCol === col) {
+                typeSortAsc = !typeSortAsc;
+            } else {
+                typeSortCol = col;
+                typeSortAsc = col === 'type';
+            }
+            resortTypeTable();
+        });
+    });
+}
+
+function resortTypeTable() {
+    const tbody = document.getElementById('by-type-tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    rows.sort((a, b) => {
+        if (typeSortCol === 'type') {
+            const va = a.dataset.type || '';
+            const vb = b.dataset.type || '';
+            return typeSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        const va = parseFloat(a.dataset[typeSortCol]) || 0;
+        const vb = parseFloat(b.dataset[typeSortCol]) || 0;
+        return typeSortAsc ? va - vb : vb - va;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+}
+
+function renderModeChart(byMode, hasPricing) {
+    const canvas = document.getElementById('mode-chart');
+    const emptyEl = document.getElementById('mode-empty');
+    const tableEmptyEl = document.getElementById('mode-table-empty');
+    const tbody = document.getElementById('by-mode-tbody');
+
+    if (!byMode || Object.keys(byMode).length === 0) {
+        canvas.style.display = 'none';
+        emptyEl.style.display = '';
+        tbody.innerHTML = '';
+        tableEmptyEl.style.display = '';
+        if (modeChart) { modeChart.destroy(); modeChart = null; }
+        return;
+    }
+    canvas.style.display = '';
+    emptyEl.style.display = 'none';
+    tableEmptyEl.style.display = 'none';
+
+    const entries = Object.entries(byMode)
+        .sort((a, b) => (b[1].input_tokens + b[1].output_tokens) - (a[1].input_tokens + a[1].output_tokens));
+    const labels = entries.map(([k]) => modeLabel(k));
+    const values = entries.map(([, v]) => v.input_tokens + v.output_tokens);
+    const colors = entries.map(([k]) => modeColor(k));
+    const grandTotal = values.reduce((s, v) => s + v, 0);
+
+    if (modeChart) modeChart.destroy();
+    modeChart = new Chart(canvas, {
+        type: 'doughnut',
+        data: {labels, datasets: [{data: values, backgroundColor: colors, borderWidth: 0}]},
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {display: false},
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            const v = ctx.raw;
+                            const pct = grandTotal > 0 ? ((v / grandTotal) * 100).toFixed(1) : '0';
+                            return ctx.label + ': ' + fmtTokens(v) + ' (' + pct + '%)';
+                        }
+                    }
+                }
+            },
+            cutout: '55%',
+        },
+    });
+
+    tbody.innerHTML = '';
+    for (const [modeName, modeData] of entries) {
+        const total = modeData.input_tokens + modeData.output_tokens;
+        const pct = grandTotal > 0 ? ((total / grandTotal) * 100) : 0;
+        const costCell = hasPricing ? fmtCost(modeData.total_cost_usd || 0) : '-';
+        const color = modeColor(modeName);
+        tbody.innerHTML += '<tr data-mode="' + modeName + '"' +
+            ' data-runs="' + modeData.count + '"' +
+            ' data-input="' + modeData.input_tokens + '"' +
+            ' data-output="' + modeData.output_tokens + '"' +
+            ' data-total="' + total + '"' +
+            ' data-cost="' + (modeData.total_cost_usd || 0) + '">' +
+            '<td>' +
+                '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + color + ';margin-right:0.5rem;vertical-align:middle;"></span>' +
+                modeLabel(modeName) +
+            '</td>' +
+            '<td class="text-right">' + modeData.count + '</td>' +
+            '<td class="text-right">' + fmtTokens(modeData.input_tokens) + '</td>' +
+            '<td class="text-right">' + fmtTokens(modeData.output_tokens) + '</td>' +
+            '<td class="text-right">' + fmtTokens(total) + '</td>' +
+            '<td class="text-right">' + costCell + '</td>' +
+            '<td>' +
+                '<div class="type-bar-container">' +
+                    '<div class="type-bar-track"><div class="type-bar-fill" style="width:' + pct.toFixed(1) + '%;background:' + color + ';"></div></div>' +
+                    '<span class="type-pct">' + pct.toFixed(1) + '%</span>' +
+                '</div>' +
+            '</td>' +
+            '</tr>';
+    }
+}
+
+let modeSortCol = 'total';
+let modeSortAsc = false;
+
+function initModeSortHandlers() {
+    document.querySelectorAll('#by-mode-thead .sortable-header').forEach(th => {
+        th.addEventListener('click', () => {
+            const col = th.dataset.col;
+            if (modeSortCol === col) {
+                modeSortAsc = !modeSortAsc;
+            } else {
+                modeSortCol = col;
+                modeSortAsc = col === 'mode';
+            }
+            resortModeTable();
+        });
+    });
+}
+
+function resortModeTable() {
+    const tbody = document.getElementById('by-mode-tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    rows.sort((a, b) => {
+        if (modeSortCol === 'mode') {
+            const va = a.dataset.mode || '';
+            const vb = b.dataset.mode || '';
+            return modeSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        const va = parseFloat(a.dataset[modeSortCol]) || 0;
+        const vb = parseFloat(b.dataset[modeSortCol]) || 0;
+        return modeSortAsc ? va - vb : vb - va;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+}
+
+/* ── Efficiency Heatmap ── */
+const _heatTip = document.getElementById('heatmap-tooltip');
+let _heatTipVisible = false;
+
+function _showHeatTip(e, html) {
+    _heatTip.innerHTML = html;
+    _heatTip.classList.add('visible');
+    _heatTipVisible = true;
+    _positionHeatTip(e);
+}
+function _hideHeatTip() {
+    _heatTip.classList.remove('visible');
+    _heatTipVisible = false;
+}
+function _positionHeatTip(e) {
+    const x = e.clientX + 14;
+    const y = e.clientY - 10;
+    const w = _heatTip.offsetWidth || 180;
+    const h = _heatTip.offsetHeight || 80;
+    _heatTip.style.left = Math.min(x, window.innerWidth - w - 12) + 'px';
+    _heatTip.style.top = Math.min(y, window.innerHeight - h - 12) + 'px';
+}
+document.addEventListener('mousemove', function(e) {
+    if (_heatTipVisible) _positionHeatTip(e);
+});
+
+function renderEfficiencyChart(effData) {
+    const canvas = document.getElementById('efficiency-chart');
+    const emptyEl = document.getElementById('efficiency-empty');
+    if (efficiencyChart) { efficiencyChart.destroy(); efficiencyChart = null; }
+
+    const projects = Object.entries(effData.by_project || {})
+        .filter(([, v]) => v.tokens_per_productive_outcome !== null && v.productive_count > 0)
+        .sort((a, b) => a[1].tokens_per_productive_outcome - b[1].tokens_per_productive_outcome);
+
+    if (projects.length === 0) {
+        canvas.style.display = 'none';
+        emptyEl.style.display = '';
+        return;
+    }
+    canvas.style.display = '';
+    emptyEl.style.display = 'none';
+
+    canvas.height = Math.max(200, projects.length * 36);
+
+    efficiencyChart = new Chart(canvas, {
+        type: 'bar',
+        data: {
+            labels: projects.map(([name]) => name),
+            datasets: [{
+                label: 'Tokens per productive outcome',
+                data: projects.map(([, v]) => v.tokens_per_productive_outcome),
+                backgroundColor: projects.map(([, v]) => {
+                    const waste = v.waste_pct || 0;
+                    const hue = Math.max(0, 120 - waste * 120);
+                    return 'hsla(' + hue + ',70%,55%,0.75)';
+                }),
+                borderWidth: 0,
+            }],
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            const v = projects[ctx.dataIndex][1];
+                            return fmtTokens(ctx.raw) + ' tokens/productive (' +
+                                v.productive_count + ' productive, ' +
+                                (v.empty_count + v.blocked_count) + ' wasted)';
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: {
+                    beginAtZero: true,
+                    ticks: { callback: v => fmtTokens(v), color: 'var(--text-secondary)' },
+                    grid: { color: 'rgba(128,128,128,0.1)' },
+                },
+                y: {
+                    ticks: { color: 'var(--text-primary)' },
+                    grid: { display: false },
+                },
+            },
+        },
+    });
+}
+
+function heatColor(intensity) {
+    // intensity 0 → green, 0.33 → yellow, 0.66 → orange, 1 → red
+    const stops = [
+        {r: 63,  g: 185, b: 80},   // green
+        {r: 210, g: 153, b: 34},   // yellow
+        {r: 240, g: 136, b: 62},   // orange
+        {r: 248, g: 81,  b: 73},   // red
+    ];
+    const scaled = Math.max(0, Math.min(1, intensity)) * 3;
+    const idx = Math.min(2, Math.floor(scaled));
+    const t = scaled - idx;
+    const a = stops[idx];
+    const b = stops[idx + 1];
+    const r = Math.round(a.r + (b.r - a.r) * t);
+    const g = Math.round(a.g + (b.g - a.g) * t);
+    const b_ = Math.round(a.b + (b.b - a.b) * t);
+    return 'rgb(' + r + ',' + g + ',' + b_ + ')';
+}
+
+function heatTextColor(intensity) {
+    const c = heatColor(intensity);
+    const m = c.match(/rgb\((\d+),(\d+),(\d+)\)/);
+    if (!m) return '#fff';
+    const r = parseInt(m[1]), g = parseInt(m[2]), b = parseInt(m[3]);
+    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    return lum > 0.58 ? '#161b22' : '#fff';
+}
+
+function renderHeatmap(byProjectAndType, hasPricing) {
+    const container = document.getElementById('heatmap-container');
+    const emptyEl = document.getElementById('heatmap-empty');
+    container.innerHTML = '';
+
+    // Accumulate totals per project and per type
+    const projectTotals = {};
+    const typeTotals = {};
+    for (const [proj, types] of Object.entries(byProjectAndType)) {
+        for (const [type, d] of Object.entries(types)) {
+            const tok = d.input_tokens + d.output_tokens;
+            projectTotals[proj] = (projectTotals[proj] || 0) + tok;
+            typeTotals[type] = (typeTotals[type] || 0) + tok;
+        }
+    }
+
+    const projects = Object.keys(projectTotals).sort((a, b) => projectTotals[b] - projectTotals[a]);
+    const types = Object.keys(typeTotals).sort((a, b) => typeTotals[b] - typeTotals[a]);
+
+    if (projects.length < 2 || types.length < 2) {
+        emptyEl.style.display = '';
+        return;
+    }
+    emptyEl.style.display = 'none';
+
+    // Global max for the main grid cells (cross-project, cross-type)
+    let maxCellTok = 1;
+    for (const proj of projects) {
+        for (const type of types) {
+            const d = (byProjectAndType[proj] || {})[type];
+            if (d) maxCellTok = Math.max(maxCellTok, d.input_tokens + d.output_tokens);
+        }
+    }
+    const logMaxCell = Math.log(maxCellTok + 1);
+
+    // Separate max for the total column (row totals only)
+    let maxTotalTok = 1;
+    for (const proj of projects) {
+        maxTotalTok = Math.max(maxTotalTok, projectTotals[proj]);
+    }
+    const logMaxTotal = Math.log(maxTotalTok + 1);
+
+    // Build CSS grid: row labels + type columns + total column
+    const colDef = '90px ' + types.map(() => 'minmax(44px,1fr)').join(' ') + ' minmax(56px,1fr)';
+    const grid = document.createElement('div');
+    grid.className = 'heatmap-grid';
+    grid.style.gridTemplateColumns = colDef;
+
+    // Header row: empty corner + type labels + Total
+    const corner = document.createElement('div');
+    corner.className = 'heatmap-corner';
+    grid.appendChild(corner);
+    for (const type of types) {
+        const th = document.createElement('div');
+        th.className = 'heatmap-col-label';
+        th.textContent = capitalize(type);
+        th.title = capitalize(type);
+        grid.appendChild(th);
+    }
+    const totalTh = document.createElement('div');
+    totalTh.className = 'heatmap-col-label';
+    totalTh.textContent = 'Total';
+    totalTh.title = 'Total tokens per project';
+    grid.appendChild(totalTh);
+
+    // Data rows
+    for (const proj of projects) {
+        const rowLabel = document.createElement('div');
+        rowLabel.className = 'heatmap-row-label';
+        rowLabel.textContent = proj;
+        rowLabel.title = proj;
+        rowLabel.addEventListener('click', function() { setProjectFilter(proj); });
+        grid.appendChild(rowLabel);
+
+        // Main grid cells
+        for (const type of types) {
+            const d = (byProjectAndType[proj] || {})[type];
+            const cell = document.createElement('div');
+            cell.className = 'heatmap-cell';
+
+            if (d) {
+                const tok = d.input_tokens + d.output_tokens;
+                const intensity = logMaxCell > 0 ? Math.log(tok + 1) / logMaxCell : 0;
+                const bg = heatColor(intensity);
+                const fg = heatTextColor(intensity);
+                cell.style.background = bg;
+                cell.style.color = fg;
+                cell.textContent = fmtTokens(tok);
+
+                const tipLines = [
+                    '<strong>' + escapeHtml(proj) + ' × ' + capitalize(type) + '</strong>',
+                    fmtTokens(tok) + ' tokens',
+                    d.count + ' run' + (d.count !== 1 ? 's' : ''),
+                ];
+                if (hasPricing && d.total_cost_usd) {
+                    tipLines.push(fmtCost(d.total_cost_usd) + ' cost');
+                }
+                const tipHtml = tipLines.join('<br>');
+
+                cell.addEventListener('mouseenter', function(e) { _showHeatTip(e, tipHtml); });
+                cell.addEventListener('mouseleave', function() { _hideHeatTip(); });
+            } else {
+                cell.classList.add('empty-cell');
+            }
+            grid.appendChild(cell);
+        }
+
+        // Total column cell — uses its own relative scale
+        const totalCell = document.createElement('div');
+        totalCell.className = 'heatmap-cell';
+        const totalTok = projectTotals[proj];
+        const totalIntensity = logMaxTotal > 0 ? Math.log(totalTok + 1) / logMaxTotal : 0;
+        totalCell.style.background = heatColor(totalIntensity);
+        totalCell.style.color = heatTextColor(totalIntensity);
+        totalCell.style.fontWeight = '700';
+        totalCell.textContent = fmtTokens(totalTok);
+
+        const totalTip = [
+            '<strong>' + escapeHtml(proj) + ' — Total</strong>',
+            fmtTokens(totalTok) + ' tokens',
+        ];
+        totalCell.addEventListener('mouseenter', function(e) { _showHeatTip(e, totalTip.join('<br>')); });
+        totalCell.addEventListener('mouseleave', function() { _hideHeatTip(); });
+        grid.appendChild(totalCell);
+    }
+
+    container.appendChild(grid);
+}
+
+function loadAll() {
+    _lastMissionParams = null;
+    const days = document.getElementById('range-select').value;
+    const granularity = document.getElementById('granularity-select').value;
+    const projParam = currentProject ? '&project=' + encodeURIComponent(currentProject) : '';
+    const offsetParam = windowOffset > 0 ? '&offset=' + windowOffset : '';
+    const granularityParam = granularity !== 'day' ? '&granularity=' + granularity : '';
+
+    document.getElementById('next-btn').disabled = windowOffset === 0;
+
+    const labelEl = document.getElementById('window-label');
+    labelEl.textContent = windowOffset > 0 ? 'offset: ' + windowOffset : '';
+
+    fetch('/api/usage?days=' + days + projParam + offsetParam + granularityParam + '&stacked=true')
         .then(r => r.json())
         .then(data => {
             document.getElementById('total-tokens').textContent =
                 fmtTokens(data.total_input + data.total_output);
             document.getElementById('total-count').textContent = data.count;
 
-            // Cost card
             const costCard = document.getElementById('cost-card');
             if (data.estimated_cost !== null && data.estimated_cost !== undefined) {
                 costCard.style.display = '';
@@ -279,8 +1361,28 @@ function loadAll() {
                 costCard.style.display = 'none';
             }
 
-            // Daily chart
-            renderDailyChart(data.daily || [], data.has_pricing);
+            const hitRate = (data.cache_hit_rate || 0) * 100;
+            document.getElementById('cache-hit-rate').textContent = hitRate.toFixed(1) + '%';
+
+            const savingsCard = document.getElementById('cache-savings-card');
+            if (data.estimated_cache_savings !== null && data.estimated_cache_savings !== undefined) {
+                savingsCard.style.display = '';
+                document.getElementById('cache-savings').textContent =
+                    '$' + Number(data.estimated_cache_savings).toFixed(2);
+            } else {
+                savingsCard.style.display = 'none';
+            }
+
+            window._lastHasPricing = !!data.has_pricing;
+            renderDailyChart(data.series || [], data.has_pricing, data.granularity || 'day');
+            renderStackedChart(data.series || [], data.granularity || 'day');
+            renderTypeChart(data.by_type || {}, data.has_pricing);
+            renderModeChart(data.by_mode || {}, data.has_pricing);
+            renderHeatmap(data.by_project_and_type || {}, data.has_pricing);
+
+            if (data.start && data.end) {
+                labelEl.textContent = data.start + ' — ' + data.end;
+            }
 
             // By project table
             const pTbody = document.querySelector('#by-project tbody');
@@ -288,26 +1390,33 @@ function loadAll() {
             const projects = Object.entries(data.by_project)
                 .sort((a, b) => (b[1].input_tokens + b[1].output_tokens) - (a[1].input_tokens + a[1].output_tokens));
             if (projects.length === 0) {
-                pTbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:0.5rem 0;">No data</td></tr>';
+                pTbody.innerHTML = '<tr><td colspan="10" class="empty-state">No data</td></tr>';
             }
+            const hasPricing = data.has_pricing;
             for (const [name, p] of projects) {
                 const total = p.input_tokens + p.output_tokens;
+                const cacheHitPct = p.cache_hit_rate !== undefined
+                    ? (p.cache_hit_rate * 100).toFixed(0) + '%'
+                    : '0%';
                 const successCell = p.success_rate !== undefined
                     ? (p.success_rate * 100).toFixed(0) + '%'
                     : '-';
                 const trendCell = p.trend ? trendBadge(p.trend) : '-';
-                pTbody.innerHTML += '<tr style="border-top:1px solid var(--border);">' +
-                    '<td style="padding:0.5rem 0;"><a class="project-link" data-project="' + name + '">' + name + '</a></td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + fmtTokens(p.input_tokens) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + fmtTokens(p.output_tokens) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + fmtTokens(total) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + p.count + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + successCell + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + trendCell + '</td>' +
+                const costCell = hasPricing ? fmtCost(p.total_cost_usd || 0) : '-';
+                pTbody.innerHTML += '<tr>' +
+                    '<td><a class="project-link" data-project="' + escapeHtml(name) + '">' + escapeHtml(name) + '</a></td>' +
+                    '<td class="text-right">' + fmtTokens(p.input_tokens) + '</td>' +
+                    '<td class="text-right">' + fmtTokens(p.output_tokens) + '</td>' +
+                    '<td class="text-right">' + fmtTokens(total) + '</td>' +
+                    '<td class="text-right">' + costCell + '</td>' +
+                    '<td class="text-right">' + p.count + '</td>' +
+                    '<td class="text-right">' + cacheHitPct + '</td>' +
+                    '<td class="text-right">' + successCell + '</td>' +
+                    '<td class="text-right">' + trendCell + '</td>' +
+                    '<td class="text-right waste-cell" data-project="' + escapeHtml(name) + '">-</td>' +
                     '</tr>';
             }
 
-            // Attach click handlers to project links
             document.querySelectorAll('.project-link').forEach(el => {
                 el.addEventListener('click', () => setProjectFilter(el.dataset.project));
             });
@@ -318,28 +1427,31 @@ function loadAll() {
             const models = Object.entries(data.by_model)
                 .sort((a, b) => (b[1].input_tokens + b[1].output_tokens) - (a[1].input_tokens + a[1].output_tokens));
             if (models.length === 0) {
-                mTbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);padding:0.5rem 0;">No data</td></tr>';
+                mTbody.innerHTML = '<tr><td colspan="6" class="empty-state">No data</td></tr>';
             }
             for (const [name, m] of models) {
                 const total = m.input_tokens + m.output_tokens;
-                mTbody.innerHTML += '<tr style="border-top:1px solid var(--border);">' +
-                    '<td style="padding:0.5rem 0;">' + shortModel(name) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + fmtTokens(m.input_tokens) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + fmtTokens(m.output_tokens) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + fmtTokens(total) + '</td>' +
-                    '<td style="padding:0.5rem 0;text-align:right;">' + m.count + '</td>' +
+                const modelCost = hasPricing ? fmtCost(m.cost_usd || m.total_cost_usd || 0) : '-';
+                mTbody.innerHTML += '<tr>' +
+                    '<td>' + shortModel(name) + '</td>' +
+                    '<td class="text-right">' + fmtTokens(m.input_tokens) + '</td>' +
+                    '<td class="text-right">' + fmtTokens(m.output_tokens) + '</td>' +
+                    '<td class="text-right">' + fmtTokens(total) + '</td>' +
+                    '<td class="text-right">' + modelCost + '</td>' +
+                    '<td class="text-right">' + m.count + '</td>' +
                     '</tr>';
             }
+
+            loadTopMissions(true);
         })
         .catch(() => {});
 
-    // Fetch metrics data (for outcome chart and project trends)
-    fetch('/api/metrics?days=' + days + projParam)
+    fetch('/api/metrics?days=' + days + projParam + offsetParam)
         .then(r => r.json())
         .then(metrics => {
             renderOutcomeChart(metrics);
+            renderLastActionChart(metrics.by_last_action);
 
-            // Merge trend/success data into project table if available
             if (metrics.by_project) {
                 document.querySelectorAll('#by-project tbody tr').forEach(row => {
                     const linkEl = row.querySelector('.project-link');
@@ -348,29 +1460,394 @@ function loadAll() {
                     const pm = metrics.by_project[proj];
                     if (!pm) return;
                     const cells = row.querySelectorAll('td');
-                    if (cells.length >= 7) {
-                        cells[5].textContent = (pm.success_rate * 100).toFixed(0) + '%';
-                        cells[6].innerHTML = trendBadge(pm.trend);
+                    if (cells.length >= 9) {
+                        cells[7].textContent = (pm.success_rate * 100).toFixed(0) + '%';
+                        cells[8].innerHTML = trendBadge(pm.trend);
                     }
                 });
             }
         })
         .catch(() => {});
+
+    // Fetch efficiency data and populate Waste % column
+    fetch('/api/efficiency?days=' + days + projParam + offsetParam + granularityParam)
+        .then(r => r.json())
+        .then(eff => {
+            document.querySelectorAll('#by-project tbody .waste-cell').forEach(cell => {
+                const proj = cell.dataset.project;
+                const pe = eff.by_project && eff.by_project[proj];
+                if (!pe || pe.waste_pct === null || pe.waste_pct === undefined) {
+                    cell.textContent = '-';
+                    return;
+                }
+                const pct = (pe.waste_pct * 100).toFixed(0);
+                const hue = Math.max(0, 120 - pe.waste_pct * 120);
+                cell.innerHTML = '<span style="color:hsl(' + hue + ',70%,45%)">' + pct + '%</span>';
+            });
+            renderEfficiencyChart(eff);
+        })
+        .catch(err => {
+            console.warn('efficiency fetch failed', err);
+            document.querySelectorAll('#by-project tbody .waste-cell').forEach(cell => {
+                cell.textContent = '-';
+            });
+            const canvas = document.getElementById('efficiency-chart');
+            const emptyEl = document.getElementById('efficiency-empty');
+            if (canvas) canvas.style.display = 'none';
+            if (emptyEl) emptyEl.style.display = '';
+        });
 }
 
-document.getElementById('range-select').addEventListener('change', () => loadAll());
-document.getElementById('clear-filter').addEventListener('click', e => {
-    e.preventDefault();
-    setProjectFilter('');
+document.getElementById('project-select').addEventListener('change', function() {
+    currentProject = this.value;
+    windowOffset = 0;
+    updateURL();
+    loadAll();
 });
 
-// Init from URL param
+document.getElementById('range-select').addEventListener('change', () => {
+    windowOffset = 0;
+    updateURL();
+    loadAll();
+});
+
+document.getElementById('granularity-select').addEventListener('change', () => {
+    windowOffset = 0;
+    updateURL();
+    loadAll();
+});
+
+document.getElementById('prev-btn').addEventListener('click', () => {
+    windowOffset++;
+    updateURL();
+    loadAll();
+});
+
+document.getElementById('next-btn').addEventListener('click', () => {
+    if (windowOffset > 0) {
+        windowOffset--;
+        updateURL();
+        loadAll();
+    }
+});
+
+// Init from URL params
 const params = new URLSearchParams(location.search);
 if (params.get('project')) {
     currentProject = params.get('project');
-    document.getElementById('filter-project').textContent = currentProject;
-    document.getElementById('filter-label').style.display = '';
 }
+if (params.get('offset')) {
+    windowOffset = Math.max(0, parseInt(params.get('offset')) || 0);
+}
+if (params.get('granularity')) {
+    const g = params.get('granularity');
+    if (['day', 'week', 'month'].includes(g)) {
+        document.getElementById('granularity-select').value = g;
+    }
+}
+
+let missionSortCol = 'total';
+let missionSortAsc = false;
+let _lastMissionParams = null;
+let _missionProjectFilter = '';
+let _missionModeFilter = '';
+
+/* ── Mission popover ── */
+let _popShowTimer = null;
+let _popHideTimer = null;
+const _popover = document.getElementById('mission-popover');
+
+function showMissionPopover(cell) {
+    clearTimeout(_popHideTimer);
+    clearTimeout(_popShowTimer);
+    _popShowTimer = setTimeout(function() {
+        var fullText = cell.dataset.full || '';
+        if (!fullText) return;
+        _popover.innerHTML = linkifyHtml(fullText);
+        _popover.style.display = 'block';
+        var r = cell.getBoundingClientRect();
+        var popH = _popover.offsetHeight;
+        var top = r.top - popH - 8;
+        if (top < 8) top = r.bottom + 8;
+        var left = Math.max(8, Math.min(r.left, window.innerWidth - 540));
+        _popover.style.top = top + 'px';
+        _popover.style.left = left + 'px';
+        _popover.classList.add('visible');
+    }, 300);
+}
+
+function hideMissionPopover() {
+    clearTimeout(_popShowTimer);
+    _popHideTimer = setTimeout(function() {
+        _popover.classList.remove('visible');
+        setTimeout(function() { _popover.style.display = 'none'; }, 150);
+    }, 200);
+}
+
+_popover.addEventListener('mouseenter', function() { clearTimeout(_popHideTimer); });
+_popover.addEventListener('mouseleave', function() { hideMissionPopover(); });
+document.addEventListener('scroll', function() {
+    clearTimeout(_popShowTimer);
+    clearTimeout(_popHideTimer);
+    _popover.classList.remove('visible');
+    _popover.style.display = 'none';
+}, true);
+
+// Event delegation on tbody
+document.getElementById('top-missions-tbody').addEventListener('mouseenter', function(e) {
+    var cell = e.target.closest('.mission-text-cell');
+    if (cell) showMissionPopover(cell);
+}, true);
+document.getElementById('top-missions-tbody').addEventListener('mouseleave', function(e) {
+    var cell = e.target.closest('.mission-text-cell');
+    if (cell) hideMissionPopover();
+}, true);
+
+function populateMissionFilters(missions) {
+    var projectSet = new Set();
+    var modeSet = new Set();
+    for (var i = 0; i < missions.length; i++) {
+        if (missions[i].project) projectSet.add(missions[i].project);
+        if (missions[i].mode) modeSet.add(missions[i].mode);
+    }
+    var projects = Array.from(projectSet).sort();
+    var modes = Array.from(modeSet).sort();
+
+    var pSel = document.getElementById('mission-project-filter');
+    pSel.innerHTML = '<option value="">Project ▾</option>';
+    for (var j = 0; j < projects.length; j++) {
+        pSel.innerHTML += '<option value="' + escapeHtml(projects[j]) + '">' + escapeHtml(projects[j]) + '</option>';
+    }
+
+    var mSel = document.getElementById('mission-mode-filter');
+    mSel.innerHTML = '<option value="">Mode ▾</option>';
+    for (var k = 0; k < modes.length; k++) {
+        mSel.innerHTML += '<option value="' + escapeHtml(modes[k]) + '">' + capitalize(modes[k]) + '</option>';
+    }
+}
+
+function applyMissionFilters() {
+    var rows = document.querySelectorAll('#top-missions-tbody tr');
+    for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        var projMatch = !_missionProjectFilter || row.dataset.project === _missionProjectFilter;
+        var modeMatch = !_missionModeFilter || row.dataset.mode === _missionModeFilter;
+        row.style.display = projMatch && modeMatch ? '' : 'none';
+    }
+}
+
+document.getElementById('mission-project-filter').addEventListener('change', function() {
+    _missionProjectFilter = this.value;
+    applyMissionFilters();
+});
+document.getElementById('mission-mode-filter').addEventListener('change', function() {
+    _missionModeFilter = this.value;
+    applyMissionFilters();
+});
+
+function renderTopMissionsTable(missions, hasPricing) {
+    var wrap = document.getElementById('top-missions-table-wrap');
+    var emptyEl = document.getElementById('missions-empty');
+    var tbody = document.getElementById('top-missions-tbody');
+    var tfoot = document.getElementById('top-missions-tfoot');
+
+    _missionProjectFilter = '';
+    _missionModeFilter = '';
+
+    tbody.innerHTML = '';
+
+    if (!missions || missions.length === 0) {
+        wrap.style.display = 'none';
+        tfoot.style.display = 'none';
+        emptyEl.textContent = 'No mission data for this period.';
+        emptyEl.style.display = '';
+        return;
+    }
+
+    missions = missions.slice(0, 100);
+
+    wrap.style.display = '';
+    emptyEl.style.display = 'none';
+
+    populateMissionFilters(missions);
+
+    var totalInput = 0, totalOutput = 0, totalCache = 0, totalCost = 0;
+    var html = '';
+
+    for (var i = 0; i < missions.length; i++) {
+        var m = missions[i];
+        var inp = m.input_tokens || 0;
+        var out = m.output_tokens || 0;
+        var cache = m.cache_read_input_tokens || 0;
+        var cost = m.cost_usd || 0;
+        totalInput += inp;
+        totalOutput += out;
+        totalCache += cache;
+        totalCost += cost;
+
+        var missionText = m.mission || '';
+        var preview = missionText.length > 80 ? missionText.slice(0, 80) + '…' : missionText;
+
+        var dur = m.duration_seconds || 0;
+        var durText = dur ? (dur >= 60 ? Math.round(dur / 60) + 'm' : dur + 's') : '';
+        var lastAct = m.last_action || '';
+
+        html += '<tr data-date="' + (m.ts || '') + '"' +
+            ' data-project="' + escapeHtml(m.project || '') + '"' +
+            ' data-type="' + escapeHtml(m.mission_type || '') + '"' +
+            ' data-mode="' + escapeHtml(m.mode || '') + '"' +
+            ' data-model="' + escapeHtml(m.model || '') + '"' +
+            ' data-input="' + inp + '"' +
+            ' data-output="' + out + '"' +
+            ' data-cache="' + cache + '"' +
+            ' data-cost="' + cost + '"' +
+            ' data-total="' + (m.total_tokens || 0) + '"' +
+            ' data-duration="' + dur + '"' +
+            ' data-lastaction="' + escapeHtml(lastAct) + '">' +
+            '<td class="text-nowrap">' + fmtDate(m.ts) + '</td>' +
+            '<td>' + projectBadgeHtml(m.project) + '</td>' +
+            '<td>' + typeBadgeHtml(m.mission_type) + '</td>' +
+            '<td>' + modeBadgeHtml(m.mode) + '</td>' +
+            '<td class="mission-text-cell" data-full="' + escapeHtml(missionText) + '">' + escapeHtml(preview) + '</td>' +
+            '<td class="text-nowrap">' + shortModel(m.model) + '</td>' +
+            '<td class="text-right">' + fmtTokens(inp) + '</td>' +
+            '<td class="text-right">' + fmtTokens(out) + '</td>' +
+            '<td class="text-right">' + fmtTokens(cache) + '</td>' +
+            '<td class="text-right">' + fmtCostDetail(cost, hasPricing) + '</td>' +
+            '<td class="text-right text-nowrap">' + escapeHtml(durText) + '</td>' +
+            '<td class="text-nowrap">' + escapeHtml(lastAct) + '</td>' +
+            '</tr>';
+    }
+
+    tbody.innerHTML = html;
+
+    if (hasPricing && totalCost > 0) {
+        tfoot.style.display = '';
+        document.getElementById('missions-total-input').textContent = fmtTokens(totalInput);
+        document.getElementById('missions-total-output').textContent = fmtTokens(totalOutput);
+        document.getElementById('missions-total-cache').textContent = fmtTokens(totalCache);
+        document.getElementById('missions-total-cost').textContent = fmtCost(totalCost);
+    } else {
+        tfoot.style.display = 'none';
+    }
+}
+
+function resortMissionsTable() {
+    const tbody = document.getElementById('top-missions-tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    rows.sort((a, b) => {
+        if (missionSortCol === 'date') {
+            const va = a.dataset.date || '';
+            const vb = b.dataset.date || '';
+            return missionSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        if (['project', 'type', 'mode', 'model', 'lastaction'].indexOf(missionSortCol) >= 0) {
+            const va = a.dataset[missionSortCol] || '';
+            const vb = b.dataset[missionSortCol] || '';
+            return missionSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        const va = parseFloat(a.dataset[missionSortCol]) || 0;
+        const vb = parseFloat(b.dataset[missionSortCol]) || 0;
+        return missionSortAsc ? va - vb : vb - va;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+}
+
+function initMissionSortHandlers() {
+    document.querySelectorAll('#top-missions-thead .sortable-header').forEach(th => {
+        th.addEventListener('click', () => {
+            const col = th.dataset.mcol;
+            if (!col) return;
+            if (missionSortCol === col) {
+                missionSortAsc = !missionSortAsc;
+            } else {
+                missionSortCol = col;
+                missionSortAsc = ['date', 'project', 'type', 'mode', 'model', 'lastaction'].includes(col);
+            }
+            resortMissionsTable();
+        });
+    });
+}
+
+function loadTopMissions(forceReload) {
+    const days = document.getElementById('range-select').value;
+    const projParam = currentProject ? '&project=' + encodeURIComponent(currentProject) : '';
+    const offsetParam = windowOffset > 0 ? '&offset=' + windowOffset : '';
+    const paramKey = days + projParam + offsetParam;
+
+    if (!forceReload && _lastMissionParams === paramKey) return;
+    _lastMissionParams = paramKey;
+
+    const loadingEl = document.getElementById('missions-loading');
+    const emptyEl = document.getElementById('missions-empty');
+    const wrap = document.getElementById('top-missions-table-wrap');
+    loadingEl.style.display = '';
+    emptyEl.style.display = 'none';
+    wrap.style.display = 'none';
+
+    fetch('/api/usage/missions?days=' + days + projParam + offsetParam + '&limit=100')
+        .then(r => r.json())
+        .then(data => {
+            loadingEl.style.display = 'none';
+            const hasPricing = window._lastHasPricing !== undefined ? window._lastHasPricing : false;
+            renderTopMissionsTable(data.missions || [], hasPricing);
+        })
+        .catch(() => {
+            loadingEl.style.display = 'none';
+            emptyEl.textContent = 'Failed to load missions.';
+            emptyEl.style.display = '';
+        });
+}
+
+loadProjects();
+initTypeSortHandlers();
+initModeSortHandlers();
+initMissionSortHandlers();
 loadAll();
+
+// Quota forecast badge
+(function() {
+    function formatForecastMins(mins) {
+        if (mins < 60) return Math.round(mins) + 'm';
+        if (mins < 1440) {
+            const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+            return m > 0 ? h + 'h ' + m + 'm' : h + 'h';
+        }
+        const d = Math.floor(mins / 1440), h = Math.round((mins % 1440) / 60);
+        return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
+    }
+
+    function updateForecast() {
+        fetch('/api/forecast')
+            .then(r => r.json())
+            .then(fc => {
+                const textEl = document.getElementById('forecast-badge-text');
+                const rateEl = document.getElementById('forecast-badge-rate');
+                if (!textEl) return;
+                if (fc.status === 'paused') {
+                    textEl.textContent = 'Paused';
+                    if (rateEl) rateEl.textContent = '';
+                } else if (fc.status === 'warming_up' || fc.time_to_exhaustion_minutes === null) {
+                    textEl.textContent = 'Warming up...';
+                    if (rateEl) rateEl.textContent = '';
+                } else {
+                    const modeLabel = fc.autonomous_mode || 'base';
+                    textEl.textContent = modeLabel + ' ≈ ' + formatForecastMins(fc.time_to_exhaustion_minutes) + ' remaining';
+                    if (rateEl && fc.burn_rate_pct_per_minute !== null) {
+                        rateEl.textContent = fc.burn_rate_pct_per_minute.toFixed(3) + '%/min · ' + Math.round(fc.session_pct) + '% used';
+                    }
+                }
+            })
+            .catch(() => {
+                const el = document.getElementById('forecast-badge-text');
+                if (el) el.textContent = 'Unavailable';
+                const r = document.getElementById('forecast-badge-rate');
+                if (r) r.textContent = '';
+            });
+    }
+
+    updateForecast();
+    setInterval(updateForecast, 30000);
+})();
 </script>
 {% endblock %}

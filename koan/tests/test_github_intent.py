@@ -59,6 +59,44 @@ class TestParseClassification:
         result = _parse_classification('{"command": "fix"}')
         assert result == {"command": "fix", "context": ""}
 
+    def test_numeric_command_coerced_to_string(self):
+        # A non-string command is coerced via str(), not rejected.
+        result = _parse_classification('{"command": 123, "context": ""}')
+        assert result == {"command": "123", "context": ""}
+
+    def test_numeric_context_coerced_to_string(self):
+        # A non-string context is coerced via str(), not rejected.
+        result = _parse_classification('{"command": "fix", "context": 42}')
+        assert result == {"command": "fix", "context": "42"}
+
+    def test_whitespace_only_command_becomes_none(self):
+        result = _parse_classification('{"command": "   ", "context": ""}')
+        assert result == {"command": None, "context": ""}
+
+    def test_slash_only_command_becomes_none(self):
+        # "/" strips to empty after lstrip("/"), so it normalizes to None.
+        result = _parse_classification('{"command": "/", "context": ""}')
+        assert result == {"command": None, "context": ""}
+
+    def test_context_whitespace_is_stripped(self):
+        result = _parse_classification('{"command": "fix", "context": "  hello  "}')
+        assert result == {"command": "fix", "context": "hello"}
+
+    def test_nested_braces_in_context(self):
+        # rfind('}') must capture the outermost closing brace, keeping the
+        # nested object intact inside the context string.
+        text = '{"command": "review", "context": "see {detail: x}"}'
+        result = _parse_classification(text)
+        assert result == {"command": "review", "context": "see {detail: x}"}
+
+    def test_code_block_without_json_label(self):
+        text = '```\n{"command": "rebase", "context": ""}\n```'
+        result = _parse_classification(text)
+        assert result == {"command": "rebase", "context": ""}
+
+    def test_whitespace_only_output_returns_none(self):
+        assert _parse_classification("   \n\t  ") is None
+
 
 def _patch_cli_and_prompt(mock_output):
     """Patch both run_command and load_prompt for classify_intent tests."""

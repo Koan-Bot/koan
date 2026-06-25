@@ -13,8 +13,8 @@ Categories:
 """
 
 import re
+import sys
 from enum import Enum
-from typing import Optional
 
 
 class ErrorCategory(Enum):
@@ -22,6 +22,7 @@ class ErrorCategory(Enum):
     RETRYABLE = "retryable"
     TERMINAL = "terminal"
     QUOTA = "quota"
+    AUTH = "auth"
     UNKNOWN = "unknown"
 
 
@@ -61,14 +62,69 @@ _TERMINAL_PATTERNS = [
     r"403\s+Forbidden",
 ]
 
+# Patterns indicating Claude is logged out / OAuth expired — needs human
+# intervention (re-login).  Checked before generic TERMINAL so we can
+# distinguish "auth expired, requeue the mission" from "bad API key, give up".
+_AUTH_PATTERNS = [
+    r"please\s+run\s+/login",
+    r"oauth\s+token\s+has\s+expired",
+    r"please\s+obtain\s+a\s+new\s+token",
+    r"refresh\s+your\s+existing\s+token",
+    r"not\s+authenticated",
+    r"please\s+log\s+in",
+]
+
+_AUTH_RE = re.compile("|".join(_AUTH_PATTERNS), re.IGNORECASE)
 _RETRYABLE_RE = re.compile("|".join(_RETRYABLE_PATTERNS), re.IGNORECASE)
 _TERMINAL_RE = re.compile("|".join(_TERMINAL_PATTERNS), re.IGNORECASE)
+
+
+def _detect_auth_for_provider(
+    *,
+    stdout_text: str,
+    stderr_text: str,
+    provider_name: str,
+    exit_code: int,
+) -> bool:
+    """Delegate provider-specific auth detection to the provider object.
+
+    Mirrors ``quota_handler._detect_quota_for_provider``: resolve via the public
+    ``get_provider_by_name`` API (which normalizes the name and raises a clean
+    ``KeyError`` on unknown names), and degrade conservatively to ``False`` on
+    any failure. ``classify_cli_error`` runs on some unwrapped call paths, so a
+    provider-side bug must never crash the caller — it is logged and swallowed.
+    """
+    if not provider_name:
+        return False
+    try:
+        from app.provider import get_provider_by_name
+
+        provider = get_provider_by_name(provider_name)
+        return provider.detect_auth_failure(
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            exit_code=exit_code,
+        )
+    except KeyError as e:
+        print(
+            f"[cli_errors] unknown provider {provider_name!r}: {e}",
+            file=sys.stderr,
+        )
+        return False
+    except Exception as e:
+        print(
+            f"[cli_errors] provider auth detector failed "
+            f"for {provider_name!r}: {e}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def classify_cli_error(
     exit_code: int,
     stdout: str = "",
     stderr: str = "",
+    provider_name: str = "",
 ) -> ErrorCategory:
     """Classify a CLI error based on exit code and output text.
 
@@ -76,6 +132,8 @@ def classify_cli_error(
         exit_code: Subprocess exit code (0 = success, not classified).
         stdout: Captured stdout from the CLI process.
         stderr: Captured stderr from the CLI process.
+        provider_name: Optional provider that produced the output. When set,
+            quota detection is delegated to that provider.
 
     Returns:
         ErrorCategory indicating how the caller should handle the error.
@@ -85,15 +143,39 @@ def classify_cli_error(
     if exit_code == 0:
         return ErrorCategory.UNKNOWN
 
+    # Coerce to strings — callers (and tests using MagicMock) may pass
+    # non-string values; regex search requires str input.
+    stdout = str(stdout) if stdout else ""
+    stderr = str(stderr) if stderr else ""
     combined = f"{stdout}\n{stderr}"
 
     # Check quota first — quota_handler is the authority for quota detection.
     # A 429 could be rate-limiting or quota exhaustion; defer to the
-    # specialized detector which has provider-specific patterns.
-    from app.quota_handler import detect_quota_exhaustion
+    # specialized detector which has provider-specific patterns and the same
+    # legacy split-detection fallback when ``provider_name`` is empty.
+    from app.quota_handler import _detect_quota_for_provider
 
-    if detect_quota_exhaustion(combined):
+    if _detect_quota_for_provider(
+        stdout_text=stdout,
+        stderr_text=stderr,
+        provider_name=provider_name,
+        exit_code=exit_code,
+    ):
         return ErrorCategory.QUOTA
+
+    # Auth errors — Claude is logged out, needs human intervention.
+    # Checked before generic TERMINAL so "401 + OAuth expired" routes here
+    # instead of falling into the generic "unauthorized" terminal bucket.
+    if _AUTH_RE.search(combined):
+        return ErrorCategory.AUTH
+
+    if _detect_auth_for_provider(
+        stdout_text=stdout,
+        stderr_text=stderr,
+        provider_name=provider_name,
+        exit_code=exit_code,
+    ):
+        return ErrorCategory.AUTH
 
     # Terminal errors — don't retry
     if _TERMINAL_RE.search(combined):

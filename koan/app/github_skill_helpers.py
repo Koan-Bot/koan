@@ -6,12 +6,92 @@ Common utilities for skills that interact with GitHub PRs and issues:
 - Mission queuing
 - Response formatting
 - Unified skill handling
+- Repo URL / limit / auto-fix flag parsing (shared by fix, review, audit handlers)
 """
 
 import re
 from typing import Callable, Optional, Tuple
 
+from app.github_url_parser import (
+    JIRA_ISSUE_URL_PATTERN,
+    PR_OR_ISSUE_PATTERN,
+    is_jira_url,
+)
 
+
+_LIMIT_PATTERN = re.compile(r'--limit[=\s]+(\d+)', re.IGNORECASE)
+_AUTO_FIX_RE = re.compile(r"--auto-fix(?:=(\w+))?\b", re.IGNORECASE)
+_GITHUB_SUBPATH_NAMES = frozenset(("issues", "pull", "pulls", "actions", "settings", "wiki"))
+
+
+def parse_repo_url(args: str) -> Optional[Tuple[str, str, str]]:
+    """Extract a repo-only URL (no issue/PR number) from args.
+
+    Returns (url, owner, repo) or None if args contain an issue/PR URL
+    or no valid repo URL.
+    """
+    # If there's already an issue or PR URL, don't treat as batch
+    if re.search(r'github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+', args):
+        return None
+
+    match = re.search(r'https?://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?(?=/|\s|$)', args)
+    if not match:
+        return None
+
+    owner = match.group(1)
+    repo = match.group(2)
+    url = f"https://github.com/{owner}/{repo}"
+
+    # Reject if the "repo" part looks like a sub-path (issues, pull, etc.)
+    if repo in _GITHUB_SUBPATH_NAMES:
+        return None
+
+    return url, owner, repo
+
+
+def parse_limit(args: str) -> Optional[int]:
+    """Extract --limit=N from args. Returns None if not specified."""
+    match = _LIMIT_PATTERN.search(args)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def extract_auto_fix(text: str) -> Tuple[Optional[str], str]:
+    """Extract --auto-fix[=severity] from text.
+
+    Returns (severity_or_None, cleaned_text). When ``--auto-fix`` is
+    present without ``=severity``, returns ``"high"`` (critical + high).
+    """
+    m = _AUTO_FIX_RE.search(text)
+    if not m:
+        return None, text
+    severity = m.group(1) or "high"
+    cleaned = (text[:m.start()] + text[m.end():]).strip()
+    cleaned = re.sub(r"  +", " ", cleaned)
+    return severity.lower(), cleaned
+
+
+def is_own_pr(owner: str, repo: str, pr_number: str) -> Tuple[bool, str]:
+    """Check if a PR was created by this Kōan instance (branch prefix match).
+
+    Returns:
+        Tuple of (is_owned, head_branch). is_owned is True if the PR's
+        head branch starts with this instance's configured branch_prefix.
+    """
+    import json
+    from app.config import get_branch_prefix
+    from app.github import run_gh
+
+    raw = run_gh(
+        "pr", "view", str(pr_number),
+        "--repo", f"{owner}/{repo}",
+        "--json", "headRefName",
+    )
+    data = json.loads(raw)
+    head_branch = data.get("headRefName", "")
+    prefix = get_branch_prefix()
+    return head_branch.startswith(prefix), head_branch
 
 
 def extract_github_url(args: str, url_type: str = "pr-or-issue") -> Optional[Tuple[str, Optional[str]]]:
@@ -45,6 +125,67 @@ def extract_github_url(args: str, url_type: str = "pr-or-issue") -> Optional[Tup
     return url, context if context else None
 
 
+def split_review_targets(args: str) -> Tuple[list[str], Optional[str]]:
+    """Split /review args into review target URLs and shared trailing context.
+
+    The ``--plan-url`` flag accepts a GitHub issue URL, but that URL is
+    supporting context for every review target rather than a target itself.
+    """
+    urls = []
+    context_tokens = []
+    consume_plan_value = False
+
+    for token in args.split():
+        if consume_plan_value:
+            context_tokens.append(token)
+            consume_plan_value = False
+            continue
+
+        if token == "--plan-url":
+            context_tokens.append(token)
+            consume_plan_value = True
+            continue
+
+        if token.startswith("--plan-url="):
+            context_tokens.append(token)
+            continue
+
+        url = _extract_review_target_url(token)
+        if url:
+            urls.append(url)
+        else:
+            context_tokens.append(token)
+
+    context = " ".join(context_tokens).strip()
+    return urls, context or None
+
+
+def _extract_review_target_url(token: str) -> Optional[str]:
+    """Return the PR/issue URL prefix from a single whitespace-delimited token."""
+    match = re.match(PR_OR_ISSUE_PATTERN, token)
+    if not match:
+        return None
+    return match.group(0).split("#")[0]
+
+
+def extract_issue_tracker_url(
+    args: str,
+    url_type: str = "pr-or-issue",
+) -> Optional[Tuple[str, Optional[str]]]:
+    """Extract a GitHub or Jira issue URL from command arguments."""
+    result = extract_github_url(args, url_type=url_type)
+    if result:
+        return result
+    if url_type == "pr":
+        return None
+    match = re.search(JIRA_ISSUE_URL_PATTERN, args)
+    if not match:
+        return None
+    url = match.group(0).split("#")[0]
+    context = args[match.end():].strip()
+    return url, context if context else None
+
+
 def resolve_project_for_repo(repo: str, owner: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     """Resolve local project path and name for a GitHub repository.
 
@@ -65,7 +206,66 @@ def resolve_project_for_repo(repo: str, owner: Optional[str] = None) -> Tuple[Op
     return project_path, project_name
 
 
-def queue_github_mission(ctx, command: str, url: str, project_name: str, context: Optional[str] = None) -> None:
+def resolve_project_via_pr(
+    owner: str, repo: str, number: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve project by querying a PR's base repository from GitHub.
+
+    When the URL owner doesn't match any configured project, queries
+    GitHub for the PR's base repository (the repo the PR targets) and
+    tries project resolution again.  Handles the common case where a PR
+    URL points to a contributor's fork but the local project is cloned
+    from the upstream org repo.
+
+    Args:
+        owner: GitHub owner from the PR URL
+        repo: Repository name from the PR URL
+        number: PR number as string
+
+    Returns:
+        Tuple of (project_path, project_name) or (None, None)
+    """
+    import json
+
+    from app.github import run_gh
+    from app.run_log import log_safe
+
+    try:
+        raw = run_gh(
+            "pr", "view", str(number),
+            "--repo", f"{owner}/{repo}",
+            "--json", "baseRepository,headRepository",
+        )
+        pr_info = json.loads(raw)
+
+        # Try the base repository first (the repo the PR targets — most likely
+        # to match a configured project when the URL is from a fork).
+        base_repo = pr_info.get("baseRepository") or {}
+        base_owner = (base_repo.get("owner") or {}).get("login")
+        base_name = base_repo.get("name")
+        if base_owner and base_name and (base_owner, base_name) != (owner, repo):
+            result = resolve_project_for_repo(base_name, owner=base_owner)
+            if result[0]:
+                return result
+
+        # Try the head repository (the fork that authored the PR).
+        head_repo = pr_info.get("headRepository") or {}
+        head_owner = (head_repo.get("owner") or {}).get("login")
+        head_name = head_repo.get("name")
+        if head_owner and head_name and (head_owner, head_name) != (owner, repo):
+            result = resolve_project_for_repo(head_name, owner=head_owner)
+            if result[0]:
+                return result
+    except Exception as e:
+        log_safe("github", f"PR lookup for {owner}/{repo}#{number} failed: {e}")
+
+    return None, None
+
+
+def queue_github_mission(
+    ctx, command: str, url: str, project_name: str,
+    context: Optional[str] = None, *, urgent: bool = False,
+) -> bool:
     """Queue a GitHub-related mission with consistent formatting.
 
     Args:
@@ -74,6 +274,10 @@ def queue_github_mission(ctx, command: str, url: str, project_name: str, context
         url: GitHub URL
         project_name: Project name for tagging
         context: Optional additional context to append
+        urgent: If True, insert at the top of the queue (--now flag)
+
+    Returns:
+        True if the mission was queued, False if it was a duplicate.
     """
     from app.utils import insert_pending_mission
 
@@ -83,7 +287,29 @@ def queue_github_mission(ctx, command: str, url: str, project_name: str, context
 
     mission_entry = f"- [project:{project_name}] {mission_text}"
     missions_path = ctx.instance_dir / "missions.md"
-    insert_pending_mission(missions_path, mission_entry)
+    return insert_pending_mission(missions_path, mission_entry, urgent=urgent)
+
+
+def queue_github_mission_once(
+    ctx, command: str, url: str, project_name: str,
+    context: Optional[str] = None, *, urgent: bool = False,
+    type_label: str = "PR", number: int = 0,
+    owner: str = "", repo: str = "",
+) -> Optional[str]:
+    """Queue a GitHub mission, returning a duplicate warning if skipped.
+
+    Combines queue_github_mission + standard duplicate message into one call.
+
+    Returns:
+        A ⚠️ duplicate warning string if skipped, None if successfully queued.
+    """
+    inserted = queue_github_mission(ctx, command, url, project_name, context, urgent=urgent)
+    if not inserted:
+        return (
+            f"\u26a0\ufe0f Duplicate ignored — /{command} already queued or running "
+            f"for {type_label} #{number} ({owner}/{repo})."
+        )
+    return None
 
 
 def format_project_not_found_error(repo: str, owner: Optional[str] = None) -> str:
@@ -132,7 +358,7 @@ def _find_repo_name_matches(repo: str) -> list:
         config = load_projects_config(str(KOAN_ROOT))
         if not config:
             return matches
-        for _name, project in config.get("projects", {}).items():
+        for project in config.get("projects", {}).values():
             if not isinstance(project, dict):
                 continue
             gh_url = project.get("github_url", "")
@@ -171,44 +397,71 @@ def handle_github_skill(
     url_type: str,
     parse_func: Callable[[str], Tuple[str, str, str]],
     success_prefix: str,
+    *,
+    urgent: bool = False,
 ) -> str:
     """Unified handler for GitHub-based skills (review, implement, refactor).
-    
+
     This consolidates the common pattern used by review, implement, and refactor skills:
     1. Extract and validate GitHub URL
     2. Parse URL to get owner/repo/number
     3. Resolve to local project
     4. Queue mission
     5. Return success message
-    
+
     Args:
         ctx: Skill context
         command: Command name (e.g., "review", "implement", "refactor")
         url_type: URL type filter ("pr", "issue", or "pr-or-issue")
         parse_func: Function to parse the URL, returns (owner, repo, number) or (owner, repo, type, number)
         success_prefix: Prefix for success message (e.g., "Review queued")
-        
+        urgent: If True, insert at the top of the queue (--now flag)
+
     Returns:
         Success or error message string
     """
     args = ctx.args.strip()
-    
+
     if not args:
         return _format_usage_message(command, url_type)
-    
+
     # Extract URL from arguments
-    result = extract_github_url(args, url_type=url_type)
+    result = extract_issue_tracker_url(args, url_type=url_type)
     if not result:
         return _format_no_url_error(url_type)
-    
+
     url, context = result
-    
+
+    if is_jira_url(url):
+        from app.issue_tracker import resolve_issue_ref
+
+        try:
+            ref = resolve_issue_ref(url)
+        except ValueError as e:
+            return f"\u274c {e}"
+        if not ref.project_name:
+            return (
+                f"\u274c Could not resolve Koan project for Jira issue {ref.key}.\n"
+                "Configure projects.yaml issue_tracker.jira_project."
+            )
+        inserted = queue_github_mission(
+            ctx, command, url, ref.project_name, context, urgent=urgent,
+        )
+        if not inserted:
+            return (
+                f"\u26a0\ufe0f Duplicate ignored — /{command} already queued "
+                f"or running for Jira issue {ref.key}."
+            )
+        priority = " (priority)" if urgent else ""
+        suffix = f" — {context}" if context else ""
+        return f"{success_prefix}{priority} for Jira issue {ref.key}{suffix}"
+
     # Parse URL
     try:
         parsed = parse_func(url)
     except ValueError as e:
         return f"\u274c {e}"
-    
+
     # Handle different parse result formats
     if len(parsed) == 3:
         owner, repo, number = parsed
@@ -216,17 +469,25 @@ def handle_github_skill(
     else:
         owner, repo, url_type_result, number = parsed
         type_label = "PR" if url_type_result == "pull" else "issue"
-    
-    # Resolve project
+
+    # Resolve project — try standard resolution first, then PR-level fallback
     project_path, project_name = resolve_project_for_repo(repo, owner=owner)
+    if not project_path and type_label == "PR":
+        project_path, project_name = resolve_project_via_pr(owner, repo, number)
     if not project_path:
         return format_project_not_found_error(repo, owner=owner)
-    
-    # Queue mission
-    queue_github_mission(ctx, command, url, project_name, context)
-    
+
+    # Queue mission (with duplicate detection)
+    duplicate = queue_github_mission_once(
+        ctx, command, url, project_name, context, urgent=urgent,
+        type_label=type_label, number=number, owner=owner, repo=repo,
+    )
+    if duplicate:
+        return duplicate
+
     # Return success message
-    return f"{success_prefix} for {format_success_message(type_label, number, owner, repo, context)}"
+    priority = " (priority)" if urgent else ""
+    return f"{success_prefix}{priority} for {format_success_message(type_label, number, owner, repo, context)}"
 
 
 def _format_usage_message(command: str, url_type: str) -> str:
@@ -255,12 +516,12 @@ def _format_usage_message(command: str, url_type: str) -> str:
 
 
 def _format_no_url_error(url_type: str) -> str:
-    """Format error for missing GitHub URL."""
+    """Format error for missing tracker URL."""
     if url_type == "issue":
-        example = "https://github.com/owner/repo/issues/123"
+        example = "https://github.com/owner/repo/issues/123 or https://org.atlassian.net/browse/PROJ-123"
     elif url_type == "pr":
         example = "https://github.com/owner/repo/pull/123"
     else:
         example = "https://github.com/owner/repo/pull/123"
     
-    return f"\u274c No valid GitHub URL found.\nEx: {example}"
+    return f"\u274c No valid issue tracker URL found.\nEx: {example}"

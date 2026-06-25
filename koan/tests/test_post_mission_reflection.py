@@ -21,6 +21,14 @@ from app.post_mission_reflection import (
 
 # --- Fixtures ---
 
+@pytest.fixture(autouse=True)
+def _reset_resume_counter():
+    import app.post_mission_reflection as mod
+    mod._RESUME_FAIL_COUNT = 0
+    yield
+    mod._RESUME_FAIL_COUNT = 0
+
+
 @pytest.fixture
 def instance_dir(tmp_path):
     """Create a minimal instance directory for testing."""
@@ -339,6 +347,88 @@ class TestRunReflection:
         }
         result = run_reflection(instance_dir, "Test mission")
         assert result == ""
+
+
+# --- TestSessionResume ---
+
+class TestSessionResume:
+    """Tests for session resume in run_reflection()."""
+
+    @patch("app.config.is_session_resume_enabled", return_value=True)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_passes_resume_session_id(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        mock_run_claude.return_value = {"success": True, "output": "Reflection", "error": ""}
+        run_reflection(instance_dir, "Audit mission", session_id="abc-123")
+        call_kwargs = mock_build.call_args[1]
+        assert call_kwargs.get("resume_session_id") == "abc-123"
+
+    @patch("app.config.is_session_resume_enabled", return_value=False)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_skips_resume_when_disabled(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        mock_run_claude.return_value = {"success": True, "output": "Reflection", "error": ""}
+        run_reflection(instance_dir, "Audit mission", session_id="abc-123")
+        call_kwargs = mock_build.call_args[1]
+        assert call_kwargs.get("resume_session_id") == ""
+
+    @patch("app.config.is_session_resume_enabled", return_value=True)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_no_resume_without_session_id(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        mock_run_claude.return_value = {"success": True, "output": "Reflection", "error": ""}
+        run_reflection(instance_dir, "Audit mission")
+        call_kwargs = mock_build.call_args[1]
+        assert call_kwargs.get("resume_session_id") == ""
+
+    @patch("app.config.is_session_resume_enabled", return_value=True)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_fallback_on_resume_failure(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        """When resume fails, retries without resume and succeeds."""
+        mock_run_claude.side_effect = [
+            {"success": False, "output": "", "error": "session not found"},
+            {"success": True, "output": "Fallback reflection", "error": ""},
+        ]
+        result = run_reflection(instance_dir, "Audit mission", session_id="abc-123")
+        assert result == "Fallback reflection"
+        assert mock_build.call_count == 2
+        # Second call should not have resume_session_id
+        second_call_kwargs = mock_build.call_args_list[1][1]
+        assert second_call_kwargs.get("resume_session_id", "") == ""
+
+    @patch("app.config.is_session_resume_enabled", return_value=True)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_no_fallback_without_session_id(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        """Without session_id, failure returns empty (no fallback retry)."""
+        mock_run_claude.return_value = {"success": False, "output": "", "error": "error"}
+        result = run_reflection(instance_dir, "Audit mission")
+        assert result == ""
+        assert mock_build.call_count == 1
+
+    @patch("app.config.is_session_resume_enabled", return_value=True)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_resume_skipped_after_threshold_failures(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        """After 3 consecutive resume failures, resume is not attempted."""
+        import app.post_mission_reflection as mod
+        mod._RESUME_FAIL_COUNT = 3
+        mock_run_claude.return_value = {"success": True, "output": "OK", "error": ""}
+        run_reflection(instance_dir, "Audit mission", session_id="abc-123")
+        assert mock_build.call_count == 1
+        assert mock_build.call_args[1]["resume_session_id"] == ""
+
+    @patch("app.config.is_session_resume_enabled", return_value=True)
+    @patch("app.claude_step.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "-p", "test"])
+    def test_counter_resets_on_successful_resume(self, mock_build, mock_run_claude, _mock_cfg, instance_dir):
+        """Counter resets to 0 when resume succeeds."""
+        import app.post_mission_reflection as mod
+        mod._RESUME_FAIL_COUNT = 2
+        mock_run_claude.return_value = {"success": True, "output": "OK", "error": ""}
+        run_reflection(instance_dir, "Audit mission", session_id="abc-123")
+        assert mod._RESUME_FAIL_COUNT == 0
 
 
 # --- TestReadJournalFile ---

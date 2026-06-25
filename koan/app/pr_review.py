@@ -19,16 +19,18 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 from app.claude_step import (
+    _force_push,
     _run_git,
     _rebase_onto_target,
     run_claude_step as _run_claude_step,
     run_project_tests,
 )
-from app.github import run_gh
+from app.config import get_skill_max_turns
+from app.github import run_gh, sanitize_github_comment
 from app.prompts import load_prompt_or_skill
 from app.rebase_pr import fetch_pr_context, _find_remote_for_repo
 
-# Matches skill names like `atoomic.refactor` or my.review (with or without backticks)
+# Matches skill names like `team.refactor` or my.review (with or without backticks)
 _SKILL_RE = re.compile(r'`?([a-zA-Z0-9_-]+\.(?:refactor|review))\b`?')
 
 
@@ -201,7 +203,7 @@ def run_pr_review(
     # ── Step 1: Fetch PR context ──────────────────────────────────────
     notify_fn(f"Reading PR #{pr_number}...")
     try:
-        context = fetch_pr_context(owner, repo, pr_number)
+        context = fetch_pr_context(owner, repo, pr_number, project_path)
     except Exception as e:
         return False, f"Failed to fetch PR context: {e}"
 
@@ -253,7 +255,7 @@ def run_pr_review(
             success_label="Addressed reviewer feedback",
             failure_label="Review feedback step failed",
             actions_log=actions_log,
-            max_turns=30,
+            max_turns=get_skill_max_turns(),
         )
 
     # ── Step 4: Refactor pass ─────────────────────────────────────────
@@ -309,7 +311,7 @@ def run_pr_review(
                 success_label="",  # handled below via retest
                 failure_label="",
                 actions_log=[],  # discard — we log based on retest below
-                max_turns=15,
+                max_turns=get_skill_max_turns(),
                 timeout=600,
             )
 
@@ -325,10 +327,7 @@ def run_pr_review(
     # ── Step 7: Force-push ────────────────────────────────────────────
     notify_fn(f"Pushing `{branch}`...")
     try:
-        _run_git(
-            ["git", "push", "origin", branch, "--force-with-lease"],
-            cwd=project_path,
-        )
+        _force_push("origin", branch, project_path)
         actions_log.append(f"Force-pushed `{branch}`")
     except Exception as e:
         return False, f"Push failed: {e}\n\nActions completed before failure:\n" + "\n".join(
@@ -344,7 +343,7 @@ def run_pr_review(
         run_gh(
             "pr", "comment", pr_number,
             "--repo", full_repo,
-            "--body", comment_body,
+            "--body", sanitize_github_comment(comment_body),
         )
         actions_log.append("Commented on PR")
     except Exception as e:

@@ -7,9 +7,11 @@ changed since the previous run — no GitHub noise, no wasted API calls.
 File location: ``instance/.check-tracker.json``
 """
 
-import fcntl
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_DEFAULT_TRACKER_MAX_AGE_DAYS = 30
 
 
 def _tracker_path(instance_dir):
@@ -32,14 +34,6 @@ def _load(instance_dir):
         return {}
 
 
-def _save(instance_dir, data):
-    """Persist tracker data to disk (atomic write)."""
-    from app.utils import atomic_write
-
-    path = _tracker_path(instance_dir)
-    atomic_write(path, json.dumps(data, indent=2) + "\n")
-
-
 def get_last_checked(instance_dir, url):
     """Return the ``updated_at`` value we last recorded for *url*, or None."""
     data = _load(instance_dir)
@@ -57,20 +51,27 @@ def mark_checked(instance_dir, url, updated_at):
         url: Canonical GitHub URL (PR or issue).
         updated_at: ISO-8601 timestamp from the GitHub API.
     """
-    from datetime import datetime, timezone
+    from app.locked_file import locked_json_modify
 
-    lock_path = Path(instance_dir) / ".check-tracker.lock"
-    with open(lock_path, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            data = _load(instance_dir)
-            data[url] = {
-                "updated_at": updated_at,
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-            }
-            _save(instance_dir, data)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    def _update(data):
+        _prune_stale(data)
+        data[url] = {
+            "updated_at": updated_at,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    locked_json_modify(_tracker_path(instance_dir), _update, indent=2)
+
+
+def _prune_stale(data, max_age_days=_DEFAULT_TRACKER_MAX_AGE_DAYS):
+    """Remove entries with ``checked_at`` older than *max_age_days*."""
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    stale = [
+        k for k, v in data.items()
+        if isinstance(v, dict) and (v.get("checked_at", "") or "") < cutoff_iso
+    ]
+    for k in stale:
+        del data[k]
 
 
 def has_changed(instance_dir, url, current_updated_at):

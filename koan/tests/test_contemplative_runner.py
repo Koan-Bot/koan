@@ -86,7 +86,6 @@ class TestBuildContemplativeCommand:
         assert "--allowedTools" in cmd
         assert "Read,Write,Glob,Grep" in cmd
         assert "--max-turns" in cmd
-        assert "10" in cmd
 
     @patch("app.config.get_contemplative_tools")
     @patch("app.prompt_builder.build_contemplative_prompt")
@@ -104,13 +103,14 @@ class TestBuildContemplativeCommand:
 
     @patch("app.config.get_contemplative_tools")
     @patch("app.prompt_builder.build_contemplative_prompt")
-    def test_max_turns_is_10(self, mock_prompt, mock_tools):
-        """Regression: max_turns=5 was too low for contemplative prompts.
+    @patch("app.config.get_contemplative_max_turns", return_value=15)
+    def test_max_turns_from_config(self, mock_max_turns, mock_prompt, mock_tools):
+        """max_turns is read from config via get_contemplative_max_turns().
 
         The contemplative prompt requires reading 5 files (soul.md, summary.md,
         emotional-memory.md, personality-evolution.md, learnings.md) plus writing
-        output — 6-7 tool calls minimum. max_turns=5 caused ~40% of contemplative
-        sessions to hit the limit before producing any output.
+        output — 6-7 tool calls minimum. The default of 15 allows headroom for
+        complex projects.
         """
         mock_prompt.return_value = "test prompt"
         mock_tools.return_value = "Read,Write,Glob,Grep"
@@ -120,7 +120,8 @@ class TestBuildContemplativeCommand:
             session_info="test session",
         )
         idx = cmd.index("--max-turns")
-        assert cmd[idx + 1] == "10"
+        assert cmd[idx + 1] == "15"
+        mock_max_turns.assert_called_once()
 
     @patch("app.config.get_contemplative_tools")
     @patch("app.prompt_builder.build_contemplative_prompt")
@@ -137,6 +138,7 @@ class TestBuildContemplativeCommand:
             instance="/my/instance",
             project_name="myproject",
             session_info="my info",
+            github_nickname="",
         )
 
     @patch("app.config.get_contemplative_tools")
@@ -537,6 +539,34 @@ class TestRunContemplativeSessionEdgeCases:
         )
 
         assert mock_run_claude.call_args.kwargs["timeout"] == 300
+
+
+class TestBuildContemplativeCommandNicknameFailure:
+    """Cover the exception path when GitHub nickname resolution fails (L61-63)."""
+
+    @patch("app.config.get_contemplative_tools")
+    @patch("app.prompt_builder.build_contemplative_prompt")
+    @patch("app.github_config.get_github_nickname", side_effect=RuntimeError("config missing"))
+    def test_nickname_load_error_falls_back_to_empty(
+        self, mock_nick, mock_prompt, mock_tools, capsys,
+    ):
+        """When get_github_nickname raises, nickname defaults to empty string."""
+        mock_prompt.return_value = "test prompt"
+        mock_tools.return_value = "Read,Write"
+        # github_nickname=None triggers the auto-load path
+        build_contemplative_command(
+            instance="/path/instance",
+            project_name="koan",
+            session_info="test session",
+            github_nickname=None,
+        )
+        # Prompt builder should have been called with empty nickname
+        mock_prompt.assert_called_once()
+        assert mock_prompt.call_args.kwargs["github_nickname"] == ""
+        # Error message printed to stderr
+        captured = capsys.readouterr()
+        assert "Could not load GitHub nickname" in captured.err
+        assert "config missing" in captured.err
 
 
 class TestCLIShouldRunEdgeCases:

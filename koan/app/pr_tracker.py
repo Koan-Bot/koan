@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 
 from app.github import get_gh_username, run_gh
 from app.projects_config import (
+    _find_project_entry,
     get_project_auto_merge,
     get_project_config,
     get_projects_from_config,
@@ -25,7 +26,7 @@ from app.projects_config import (
 # Fields requested from gh pr list
 _PR_FIELDS = (
     "number,title,author,headRefName,isDraft,url,"
-    "createdAt,reviewDecision,statusCheckRollup,state"
+    "createdAt,updatedAt,reviewDecision,statusCheckRollup,state"
 )
 
 # ---------------------------------------------------------------------------
@@ -154,8 +155,11 @@ def fetch_all_prs(
                 print(f"[pr_tracker] error fetching PRs: {e}", file=sys.stderr)
                 had_errors = True
 
-    # Sort by creation date descending (newest first)
-    all_prs.sort(key=lambda pr: pr.get("createdAt", ""), reverse=True)
+    # Sort by last activity descending (fallback to creation date).
+    all_prs.sort(
+        key=lambda pr: (pr.get("updatedAt") or pr.get("createdAt") or ""),
+        reverse=True,
+    )
 
     return {
         "prs": all_prs,
@@ -182,7 +186,7 @@ def fetch_pr_checks(
         return []
 
     proj_cfg = get_project_config(config, project_name)
-    project_path = (config.get("projects", {}).get(project_name) or {}).get("path", "")
+    project_path = (_find_project_entry(config.get("projects", {}), project_name) or {}).get("path", "")
     github_url = proj_cfg.get("github_url", "")
     if not project_path or not github_url:
         return []
@@ -230,7 +234,7 @@ def merge_pr(
         return {"ok": False, "error": f"Invalid merge strategy: {strategy}", "url": ""}
 
     proj_cfg = get_project_config(config, project_name)
-    project_path = (config.get("projects", {}).get(project_name) or {}).get("path", "")
+    project_path = (_find_project_entry(config.get("projects", {}), project_name) or {}).get("path", "")
     github_url = proj_cfg.get("github_url", "")
     if not project_path or not github_url:
         return {"ok": False, "error": "Project path or GitHub URL not configured", "url": ""}

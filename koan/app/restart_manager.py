@@ -1,56 +1,105 @@
 """Restart signal management for Kōan processes.
 
-Provides file-based restart signaling between bridge and run loop:
-- Bridge creates .koan-restart to signal both processes
-- run.py checks at loop start and exits with code 42
-- Bridge detects the signal and re-execs itself via os.execv()
+Provides file-based restart signaling between bridge and run loop.
+
+Two consumers (bridge and runner) each get their own marker so a fast
+wrapper-restart of the runner can no longer wipe the signal before the
+bridge's polling tick sees it.
 
 The restart flow:
-1. User sends /restart on Telegram
-2. Bridge writes .koan-restart
-3. Bridge sends ack to Telegram
-4. Bridge re-execs itself (os.execv replaces process in-place)
-5. run.py detects .koan-restart at next iteration, exits with code 42
-6. Wrapper re-launches run.py
+1. ``request_restart`` writes ``.koan-restart-bridge`` and ``.koan-restart-run``.
+2. Bridge's main loop notices ``.koan-restart-bridge`` and re-execs via
+   ``os.execv`` (same PID, fresh interpreter).
+3. Runner's main loop notices ``.koan-restart-run`` and exits with
+   ``RESTART_EXIT_CODE``; its wrapper relaunches it.
+4. Each process clears only its own marker on startup, so neither can
+   silence the signal for the other.
+
+Legacy ``.koan-restart`` (DEPRECATED): the single combined marker is no
+longer *written* by Kōan. It is read by nothing in-tree (both consumers poll
+their own per-process marker), so writing it was a no-op that lingered on disk.
+``check_restart``/``clear_restart`` still accept ``target=None`` → ``.koan-restart``
+purely so any out-of-tree script polling the old path keeps working; remove that
+mapping once you are certain no external consumer depends on it. All in-tree
+restart triggers (run loop, bridge, auto-update, REST API, dashboard) now go
+through ``request_restart`` so both consumer markers are written and the restart
+actually fires.
 
 Exit code 42 is the restart sentinel — any other exit is a real stop.
 """
 
+import contextlib
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from app.signals import RESTART_FILE
 RESTART_EXIT_CODE = 42
 
+# Per-consumer marker files. The legacy ``RESTART_FILE`` (``.koan-restart``)
+# is DEPRECATED: no longer written by ``request_restart``. The ``None``
+# entry below is retained only so ``check_restart``/``clear_restart`` keep
+# honouring ``target=None`` for any out-of-tree caller still polling the old
+# path; nothing in-tree reads or writes it.
+RESTART_BRIDGE_FILE = ".koan-restart-bridge"
+RESTART_RUN_FILE = ".koan-restart-run"
+
+# Files written by request_restart() — the two live per-consumer markers only.
+_WRITE_TARGETS = (RESTART_BRIDGE_FILE, RESTART_RUN_FILE)
+
+_TARGET_FILES = {
+    "bridge": RESTART_BRIDGE_FILE,
+    "run": RESTART_RUN_FILE,
+    None: RESTART_FILE,  # deprecated, read-only compat (see module docstring)
+}
+
+
+def _marker_path(koan_root: str, target: Optional[str]) -> str:
+    try:
+        fname = _TARGET_FILES[target]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown restart target {target!r}; "
+            f"expected one of {sorted(k for k in _TARGET_FILES if k)!r} or None"
+        ) from exc
+    return os.path.join(koan_root, fname)
+
 
 def request_restart(koan_root: str) -> None:
-    """Create the restart signal file.
+    """Create restart signal files for both consumers.
 
-    Both processes check for this file:
-    - run.py: at loop start, exits with code 42
-    - awake.py: in main loop, triggers os.execv()
+    Writes the two per-consumer markers (``.koan-restart-bridge`` and
+    ``.koan-restart-run``) so each consumer can clear its own without
+    silencing the other. The deprecated legacy ``.koan-restart`` is no
+    longer written — nothing reads it.
     """
     from app.utils import atomic_write
 
-    atomic_write(
-        Path(koan_root) / RESTART_FILE,
-        f"restart requested at {time.strftime('%H:%M:%S')}\n",
-    )
+    body = f"restart requested at {time.strftime('%H:%M:%S')}\n"
+    for fname in _WRITE_TARGETS:
+        atomic_write(Path(koan_root) / fname, body)
 
 
-def check_restart(koan_root: str, since: float = 0) -> bool:
-    """Check if a restart has been requested.
+def check_restart(
+    koan_root: str,
+    since: float = 0,
+    target: Optional[str] = None,
+) -> bool:
+    """Check if a restart has been requested for ``target``.
 
     Args:
         koan_root: Root path for the koan installation.
-        since: If > 0, only return True if the file was modified after this
-               timestamp.  Used to ignore stale restart signals left over
-               from a previous process incarnation (prevents restart loops
-               when Telegram re-delivers the /restart message).
+        since: If > 0, only return True if the marker was modified after
+            this timestamp.  Used to ignore stale restart signals left
+            over from a previous process incarnation (prevents restart
+            loops when Telegram re-delivers the /restart message).
+        target: ``"bridge"`` or ``"run"`` to check the per-consumer
+            marker.  ``None`` (default) checks the legacy single marker
+            for backward compatibility.
     """
-    restart_file = os.path.join(koan_root, RESTART_FILE)
+    restart_file = _marker_path(koan_root, target)
     if not os.path.isfile(restart_file):
         return False
     try:
@@ -61,13 +110,15 @@ def check_restart(koan_root: str, since: float = 0) -> bool:
     return True
 
 
-def clear_restart(koan_root: str) -> None:
-    """Remove the restart signal file."""
-    path = os.path.join(koan_root, RESTART_FILE)
-    try:
+def clear_restart(koan_root: str, target: Optional[str] = None) -> None:
+    """Remove the restart signal file for ``target``.
+
+    A consumer should only clear its own marker so the other consumer
+    can still observe the request on its next poll tick.
+    """
+    path = _marker_path(koan_root, target)
+    with contextlib.suppress(FileNotFoundError):
         os.remove(path)
-    except FileNotFoundError:
-        pass
 
 
 def reexec_bridge() -> None:

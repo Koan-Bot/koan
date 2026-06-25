@@ -2,6 +2,7 @@
 name: explore
 scope: core
 group: config
+emoji: 🔭
 description: Toggle per-project exploration mode in projects.yaml
 version: 1.0.0
 audience: bridge
@@ -12,7 +13,7 @@ commands:
     aliases: [exploration]
   - name: noexplore
     description: Disable exploration for a project
-    usage: /noexplore [project]
+    usage: /noexplore [project|all]
     aliases: []
 handler: handler.py
 ---

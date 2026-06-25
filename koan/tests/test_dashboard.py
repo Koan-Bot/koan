@@ -56,6 +56,7 @@ def app_client(instance_dir, tmp_path):
          patch.object(dashboard, "SUMMARY_FILE", instance_dir / "memory" / "summary.md"), \
          patch.object(dashboard, "JOURNAL_DIR", instance_dir / "journal"), \
          patch.object(dashboard, "PENDING_FILE", instance_dir / "journal" / "pending.md"), \
+         patch.object(dashboard, "RECURRING_FILE", instance_dir / "recurring.json"), \
          patch.object(dashboard, "KOAN_ROOT", tmp_path):
         dashboard.app.config["TESTING"] = True
         dashboard.app.jinja_loader = FileSystemLoader(str(tpl_dest))
@@ -75,6 +76,20 @@ class TestParsingMissions:
         with patch.object(dashboard, "MISSIONS_FILE", tmp_path / "nope.md"):
             result = dashboard.parse_missions()
             assert result == {"pending": [], "in_progress": [], "done": []}
+
+
+class TestStaticCacheBusting:
+    def test_static_urls_include_version_param(self, app_client):
+        resp = app_client.get("/")
+        html = resp.data.decode()
+        assert "css/koan.css?v=" in html
+        assert "js/koan.js?v=" in html
+        assert "js/dashboard.js?v=" in html
+
+    def test_favicon_directory_url_has_no_version(self, app_client):
+        resp = app_client.get("/")
+        html = resp.data.decode()
+        assert 'data-base="/static/favicon/"' in html
 
 
 class TestRoutes:
@@ -117,7 +132,13 @@ class TestRoutes:
     def test_chat_page(self, app_client):
         resp = app_client.get("/chat")
         assert resp.status_code == 200
-        assert b"Envoyer" in resp.data
+        assert b"Send" in resp.data
+
+    def test_usage_page(self, app_client):
+        resp = app_client.get("/usage")
+        assert resp.status_code == 200
+        assert b"Efficiency Heatmap" in resp.data
+        assert b"heatmap-container" in resp.data
 
     def test_api_status(self, app_client):
         resp = app_client.get("/api/status")
@@ -144,6 +165,421 @@ class TestRoutes:
         })
         data = resp.get_json()
         assert data["ok"] is False
+
+    def test_add_mission_records_in_index(self, app_client, instance_dir):
+        resp = app_client.post("/missions/add", data={
+            "mission": "Indexed mission",
+            "project": "koan",
+        }, follow_redirects=True)
+        assert resp.status_code == 200
+        sidecar = instance_dir / ".api-missions.json"
+        assert sidecar.exists()
+        records = json.loads(sidecar.read_text())
+        matches = [r for r in records if "Indexed mission" in r.get("text", "")]
+        assert len(matches) == 1
+        assert matches[0]["status"] == "pending"
+        assert matches[0]["project"] == "koan"
+        assert "id" in matches[0]
+
+    def test_add_mission_duplicate_no_double_index(self, app_client, instance_dir):
+        for _ in range(2):
+            app_client.post("/missions/add", data={
+                "mission": "Unique task",
+                "project": "",
+            }, follow_redirects=True)
+        sidecar = instance_dir / ".api-missions.json"
+        if sidecar.exists():
+            records = json.loads(sidecar.read_text())
+            matches = [r for r in records if "Unique task" in r.get("text", "")]
+            assert len(matches) == 1
+
+    def test_cancel_mission_updates_index(self, app_client, instance_dir):
+        app_client.post("/missions/add", data={
+            "mission": "To be cancelled",
+            "project": "",
+        }, follow_redirects=True)
+        sidecar = instance_dir / ".api-missions.json"
+        assert sidecar.exists()
+
+        # Fixture has 2 pending missions; new one appended at position 3 (1-indexed)
+        resp = app_client.post("/api/missions/cancel", json={"position": 3})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+
+        records = json.loads(sidecar.read_text())
+        matches = [r for r in records if "To be cancelled" in r.get("text", "")]
+        assert len(matches) == 1
+        assert matches[0]["status"] == "removed"
+
+
+class TestUsageApi:
+    def test_api_usage_exposes_cache_metrics(self, app_client):
+        fake_summary = {
+            "total_input": 1000,
+            "total_output": 500,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 1200,
+            "cache_hit_rate": 0.48,
+            "count": 3,
+            "by_project": {"koan": {"input_tokens": 1000, "output_tokens": 500, "count": 3}},
+            "by_model": {
+                "claude-sonnet-4-20250514": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "cache_creation_input_tokens": 300,
+                    "cache_read_input_tokens": 1200,
+                    "count": 3,
+                }
+            },
+            "by_mode": {},
+            "by_project_and_mode": {},
+        }
+        fake_daily = [{
+            "date": "2026-03-21",
+            "total_input": 1000,
+            "total_output": 500,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 1200,
+            "cache_hit_rate": 0.48,
+            "count": 3,
+            "cost": 0.12,
+        }]
+
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value={"sonnet": {"input": 3.0, "output": 15.0}}), \
+             patch("app.cost_tracker.estimate_cost", return_value=0.12), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=0.00324), \
+             patch("app.cost_tracker.daily_series", return_value=fake_daily):
+            resp = app_client.get("/api/usage?days=7")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["cache_creation_input_tokens"] == 300
+        assert data["cache_read_input_tokens"] == 1200
+        assert data["cache_hit_rate"] == pytest.approx(0.48)
+        assert data["estimated_cache_savings"] == pytest.approx(0.00324)
+        assert data["series"][0]["cache_read_input_tokens"] == 1200
+        assert "daily" not in data
+
+    def test_api_usage_without_pricing_returns_null_cache_savings(self, app_client):
+        fake_summary = {
+            "total_input": 0,
+            "total_output": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "count": 0,
+            "by_project": {},
+            "by_model": {},
+            "by_mode": {},
+            "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=1")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["has_pricing"] is False
+        assert data["estimated_cache_savings"] is None
+
+    def test_api_usage_includes_by_type(self, app_client):
+        fake_summary = {
+            "total_input": 500,
+            "total_output": 200,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "count": 2,
+            "by_project": {},
+            "by_model": {},
+            "by_type": {
+                "implement": {"input_tokens": 300, "output_tokens": 150, "total_cost_usd": 0.01, "count": 1},
+                "review": {"input_tokens": 200, "output_tokens": 50, "total_cost_usd": 0.005, "count": 1},
+            },
+            "by_project_and_type": {},
+            "by_mode": {},
+            "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=7")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "by_type" in data
+        assert "implement" in data["by_type"]
+        assert "review" in data["by_type"]
+        assert data["by_type"]["implement"]["count"] == 1
+
+    def test_api_usage_always_includes_by_type(self, app_client):
+        fake_summary = {
+            "total_input": 0, "total_output": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 0,
+            "by_project": {}, "by_model": {},
+            "by_type": {"implement": {"count": 1}},
+            "by_project_and_type": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=7")
+
+        data = resp.get_json()
+        assert "by_type" in data
+        assert data["by_type"]["implement"]["count"] == 1
+
+    def test_api_usage_includes_by_mode(self, app_client):
+        fake_summary = {
+            "total_input": 500, "total_output": 200,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 3,
+            "by_project": {}, "by_model": {},
+            "by_type": {}, "by_project_and_type": {},
+            "by_mode": {
+                "implement": {"input_tokens": 300, "output_tokens": 150, "total_cost_usd": 0.01, "count": 1},
+                "deep": {"input_tokens": 200, "output_tokens": 50, "total_cost_usd": 0.005, "count": 1},
+                "unknown": {"input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0, "count": 1},
+            },
+            "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=7")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "by_mode" in data
+        assert "implement" in data["by_mode"]
+        assert "deep" in data["by_mode"]
+        assert data["by_mode"]["implement"]["count"] == 1
+
+    def test_api_usage_project_filter_slices_by_mode(self, app_client):
+        fake_summary = {
+            "total_input": 500, "total_output": 200,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 3,
+            "by_project": {}, "by_model": {},
+            "by_type": {}, "by_project_and_type": {},
+            "by_mode": {
+                "implement": {"input_tokens": 500, "output_tokens": 200, "total_cost_usd": 0.02, "count": 3},
+            },
+            "by_project_and_mode": {
+                "koan": {
+                    "implement": {"input_tokens": 300, "output_tokens": 150, "total_cost_usd": 0.01, "count": 2},
+                },
+                "other": {
+                    "implement": {"input_tokens": 200, "output_tokens": 50, "total_cost_usd": 0.01, "count": 1},
+                },
+            },
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=7&project=koan")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "by_mode" in data
+        assert data["by_mode"]["implement"]["count"] == 2
+        assert data["by_mode"]["implement"]["input_tokens"] == 300
+
+    def test_api_usage_granularity_week_buckets_series(self, app_client):
+        fake_daily = [
+            {"date": "2026-05-18", "total_input": 100, "total_output": 50,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 1, "cost": None},
+            {"date": "2026-05-19", "total_input": 200, "total_output": 80,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 2, "cost": None},
+            {"date": "2026-05-25", "total_input": 300, "total_output": 100,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 1, "cost": None},
+        ]
+        fake_summary = {
+            "total_input": 600, "total_output": 230,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 4,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=fake_daily):
+            resp = app_client.get("/api/usage?days=14&granularity=week")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["granularity"] == "week"
+        # 2026-05-18 and 2026-05-19 are in ISO week 2026-W21;
+        # 2026-05-25 is in ISO week 2026-W22
+        assert len(data["series"]) == 2
+        w21 = next(e for e in data["series"] if "W21" in e["week"])
+        assert w21["total_input"] == 300  # 100 + 200
+        assert w21["count"] == 3
+
+    def test_api_usage_granularity_month_buckets_series(self, app_client):
+        fake_daily = [
+            {"date": "2026-04-30", "total_input": 100, "total_output": 50,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 1, "cost": None},
+            {"date": "2026-05-01", "total_input": 200, "total_output": 80,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 2, "cost": None},
+        ]
+        fake_summary = {
+            "total_input": 300, "total_output": 130,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 3,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=fake_daily):
+            resp = app_client.get("/api/usage?days=30&granularity=month")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["granularity"] == "month"
+        assert len(data["series"]) == 2
+        apr = next(e for e in data["series"] if e["month"] == "2026-04")
+        may = next(e for e in data["series"] if e["month"] == "2026-05")
+        assert apr["total_input"] == 100
+        assert may["total_input"] == 200
+
+    def test_api_usage_stacked_embeds_by_project(self, app_client):
+        fake_daily = [
+            {"date": "2026-05-25", "total_input": 500, "total_output": 200,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 2, "cost": None,
+             "by_project": {
+                 "koan": {"total_input": 300, "total_output": 100, "count": 1},
+                 "other": {"total_input": 200, "total_output": 100, "count": 1},
+             }},
+        ]
+        fake_summary = {
+            "total_input": 500, "total_output": 200,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 2,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=fake_daily):
+            resp = app_client.get("/api/usage?days=7&stacked=true")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "by_project" in data["series"][0]
+        assert "koan" in data["series"][0]["by_project"]
+
+    def test_api_usage_stacked_false_no_by_project_in_series(self, app_client):
+        fake_daily = [
+            {"date": "2026-05-25", "total_input": 100, "total_output": 50,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_hit_rate": 0.0, "count": 1, "cost": None},
+        ]
+        fake_summary = {
+            "total_input": 100, "total_output": 50,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 1,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary), \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=fake_daily):
+            resp = app_client.get("/api/usage?days=7")
+
+        data = resp.get_json()
+        assert "by_project" not in data["series"][0]
+
+    def test_api_usage_offset_shifts_window(self, app_client):
+        """offset=1 with day granularity shifts end date back by days."""
+        fake_summary = {
+            "total_input": 0, "total_output": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 0,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary) as mock_sr, \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp0 = app_client.get("/api/usage?days=7&offset=0")
+            resp1 = app_client.get("/api/usage?days=7&offset=1")
+
+        data0 = resp0.get_json()
+        data1 = resp1.get_json()
+        # offset=1 end date is 7 days before offset=0 end date
+        from datetime import date as _date, timedelta as _td
+        end0 = _date.fromisoformat(data0["end"])
+        end1 = _date.fromisoformat(data1["end"])
+        assert end0 - end1 == _td(days=7)
+        assert data1["offset"] == 1
+
+    def test_api_usage_accepts_90_days(self, app_client):
+        """days=90 is accepted and clamped to 100, not 90."""
+        fake_summary = {
+            "total_input": 0, "total_output": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 0,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary) as mock_sr, \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=90")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["days"] == 90
+        # verify summarize_range was called with the correct start/end span (~90 days)
+        args, _ = mock_sr.call_args
+        start_date, end_date = args[1], args[2]
+        assert (end_date - start_date).days == 89  # 90-day inclusive window
+
+    def test_api_usage_clamps_days_to_100(self, app_client):
+        """days > 100 is clamped to 100."""
+        fake_summary = {
+            "total_input": 0, "total_output": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_hit_rate": 0.0, "count": 0,
+            "by_project": {}, "by_model": {},
+            "by_mode": {}, "by_project_and_mode": {},
+        }
+        with patch("app.cost_tracker.summarize_range", return_value=fake_summary) as mock_sr, \
+             patch("app.cost_tracker.get_pricing_config", return_value=None), \
+             patch("app.cost_tracker.estimate_cache_savings", return_value=None), \
+             patch("app.cost_tracker.daily_series", return_value=[]):
+            resp = app_client.get("/api/usage?days=200")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["days"] == 100
+        # verify summarize_range was called with the correct start/end span (~100 days)
+        args, _ = mock_sr.call_args
+        start_date, end_date = args[1], args[2]
+        assert (end_date - start_date).days == 99  # 100-day inclusive window
 
 
 class TestSignals:
@@ -852,6 +1288,45 @@ class TestProjectFiltering:
         assert dashboard.strip_project_tag_filter("- [project:koan] Fix bug") == "- Fix bug"
         assert dashboard.strip_project_tag_filter("- Fix bug") == "- Fix bug"
 
+    def test_linkify_filter_converts_urls(self):
+        result = dashboard.linkify_filter("Fix https://github.com/org/repo/pull/42 now")
+        assert 'href="https://github.com/org/repo/pull/42"' in result
+        assert 'target="_blank"' in result
+        assert 'rel="noopener noreferrer"' in result
+
+    def test_linkify_filter_no_url(self):
+        result = dashboard.linkify_filter("Fix the bug")
+        assert "<a " not in result
+        assert result == "Fix the bug"
+
+    def test_linkify_filter_escapes_html(self):
+        result = dashboard.linkify_filter("<script>alert(1)</script>")
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+
+    def test_linkify_filter_multiple_urls(self):
+        result = dashboard.linkify_filter("See https://jira.example.com/PROJ-123 and https://github.com/org/repo/issues/5")
+        assert result.count("<a ") == 2
+
+    def test_linkify_shortens_github_issue_url(self):
+        result = dashboard.linkify_filter("Fix https://github.com/org/repo/issues/123 done")
+        assert 'href="https://github.com/org/repo/issues/123"' in result
+        assert ">#123</a>" in result
+
+    def test_linkify_shortens_github_pull_url(self):
+        result = dashboard.linkify_filter("See https://github.com/org/repo/pull/42")
+        assert 'href="https://github.com/org/repo/pull/42"' in result
+        assert ">#42</a>" in result
+
+    def test_linkify_shortens_jira_url(self):
+        result = dashboard.linkify_filter("Fix https://jira.example.com/browse/PROJ-456 now")
+        assert 'href="https://jira.example.com/browse/PROJ-456"' in result
+        assert ">PROJ-456</a>" in result
+
+    def test_linkify_preserves_plain_url(self):
+        result = dashboard.linkify_filter("See https://example.com/docs")
+        assert ">https://example.com/docs</a>" in result
+
 
 # ---------------------------------------------------------------------------
 # Mission queue API endpoints
@@ -1179,3 +1654,671 @@ class TestPlansPage:
             )
         assert len(linked) == 1
         assert "/plan" in linked[0]
+
+    def test_get_project_repo_loads_config_dict(self):
+        """_get_project_repo must load projects.yaml, not pass KOAN_ROOT as config."""
+        fake_cfg = {"defaults": {}, "projects": {
+            "myproj": {"github_url": "https://github.com/owner/repo"}
+        }}
+        with patch("app.projects_config.load_projects_config", return_value=fake_cfg), \
+             patch.object(dashboard, "KOAN_ROOT", Path("/fake/root")):
+            result = dashboard._get_project_repo("myproj")
+        assert result == "owner/repo"
+
+    def test_get_project_repo_returns_none_when_no_config(self):
+        """_get_project_repo returns None when projects.yaml can't be loaded."""
+        with patch("app.projects_config.load_projects_config", return_value=None), \
+             patch.object(dashboard, "KOAN_ROOT", Path("/fake/root")):
+            result = dashboard._get_project_repo("myproj")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Automation rules routes
+# ---------------------------------------------------------------------------
+
+import yaml as _yaml
+
+
+class TestRulesRoutes:
+    """Integration tests for the /api/rules and /rules endpoints."""
+
+    def test_get_rules_empty(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.get("/api/rules")
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+    def test_post_rule_creates_entry(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.post("/api/rules", json={
+                "event": "post_mission",
+                "action": "notify",
+                "params": {"message": "done"},
+            })
+            assert resp.status_code == 201
+            rule = resp.get_json()
+            assert rule["event"] == "post_mission"
+            assert rule["action"] == "notify"
+            assert rule["params"]["message"] == "done"
+
+            # Appears in subsequent GET
+            resp2 = app_client.get("/api/rules")
+            assert resp2.status_code == 200
+            rules = resp2.get_json()
+            assert len(rules) == 1
+            assert rules[0]["id"] == rule["id"]
+
+    def test_post_rule_unknown_event_returns_400(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.post("/api/rules", json={
+                "event": "no_such_event",
+                "action": "notify",
+            })
+        assert resp.status_code == 400
+        assert "error" in resp.get_json()
+
+    def test_post_rule_unknown_action_returns_400(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.post("/api/rules", json={
+                "event": "post_mission",
+                "action": "send_email",
+            })
+        assert resp.status_code == 400
+
+    def test_patch_rule_toggles_enabled(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            create = app_client.post("/api/rules", json={
+                "event": "post_mission",
+                "action": "notify",
+                "params": {"message": "hi"},
+            })
+            rule_id = create.get_json()["id"]
+            assert create.get_json()["enabled"] is True
+
+            patch_resp = app_client.patch(f"/api/rules/{rule_id}", json={"enabled": False})
+            assert patch_resp.status_code == 200
+            assert patch_resp.get_json()["enabled"] is False
+
+    def test_delete_rule_removes_it(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            create = app_client.post("/api/rules", json={
+                "event": "pre_mission",
+                "action": "pause",
+            })
+            rule_id = create.get_json()["id"]
+
+            del_resp = app_client.delete(f"/api/rules/{rule_id}")
+            assert del_resp.status_code == 200
+
+            rules = app_client.get("/api/rules").get_json()
+            assert all(r["id"] != rule_id for r in rules)
+
+    def test_delete_nonexistent_rule_returns_404(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.delete("/api/rules/does_not_exist")
+        assert resp.status_code == 404
+
+    def test_rules_page_renders_without_error(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir), \
+             patch.object(dashboard, "JOURNAL_DIR", instance_dir / "journal"):
+            resp = app_client.get("/rules")
+        assert resp.status_code == 200
+        assert b"Automation Rules" in resp.data
+
+    def test_rules_page_shows_empty_state_when_no_rules(self, app_client, instance_dir):
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir), \
+             patch.object(dashboard, "JOURNAL_DIR", instance_dir / "journal"):
+            resp = app_client.get("/rules")
+        assert resp.status_code == 200
+        assert b"No rules yet" in resp.data
+
+
+class TestApiLogs:
+    """Tests for /api/logs endpoint."""
+
+    def test_api_logs_no_log_dir(self, app_client, tmp_path):
+        """Returns empty lines when $KOAN_ROOT/logs/ doesn't exist."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["lines"] == []
+        assert data["total"] == 0
+
+    def test_api_logs_run_only(self, app_client, tmp_path):
+        """source=run returns lines only from run.log."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text("line1\nline2\nline3\n")
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        texts = [e["text"] for e in data["lines"]]
+        assert texts == ["line1", "line2", "line3"]
+        assert all(e["source"] == "run" for e in data["lines"])
+
+    def test_api_logs_filter(self, app_client, tmp_path):
+        """?q=error returns only lines containing 'error'."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text(
+            "info: all good\nerror: something failed\ninfo: still ok\n"
+        )
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run&q=error")
+        data = resp.get_json()
+        assert data["total"] == 1
+        assert "error" in data["lines"][0]["text"].lower()
+
+    def test_api_logs_limit(self, app_client, tmp_path):
+        """?limit=50 returns at most 50 lines."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        content = "\n".join(f"line{i}" for i in range(300)) + "\n"
+        (logs_dir / "run.log").write_text(content)
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run&limit=50")
+        data = resp.get_json()
+        assert data["total"] == 50
+
+    def test_api_logs_limit_clamped(self, app_client, tmp_path):
+        """limit above 2000 is clamped to 2000."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        content = "\n".join(f"line{i}" for i in range(10)) + "\n"
+        (logs_dir / "run.log").write_text(content)
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=run&limit=99999")
+        assert resp.status_code == 200  # no error
+
+    def test_api_logs_missing_source_file(self, app_client, tmp_path):
+        """Missing awake.log returns empty lines for that source."""
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "run.log").write_text("run line\n")
+        # awake.log intentionally absent
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/logs?source=all")
+        data = resp.get_json()
+        sources = {e["source"] for e in data["lines"]}
+        assert "run" in sources
+        assert "awake" not in sources
+
+
+class TestApiHealth:
+    """Tests for /api/health endpoint."""
+
+    def test_api_health_structure(self, app_client, tmp_path):
+        """Response contains disk, run, and awake keys."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "disk" in data
+        assert "run" in data
+        assert "awake" in data
+
+    def test_api_health_no_pids(self, app_client, tmp_path):
+        """With no PID files, run.alive and awake.alive are False."""
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path):
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["run"]["alive"] is False
+        assert data["awake"]["alive"] is False
+
+    def test_api_health_disk_warn(self, app_client, tmp_path):
+        """disk.status is 'warn' when usage is between 85% and 95%."""
+        total = 100 * 1024 * 1024
+        used = 90 * 1024 * 1024
+        free = total - used
+        mock_usage = shutil.disk_usage.__class__  # just need the namedtuple shape
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("app.dashboard.shutil.disk_usage",
+                   return_value=type("DiskUsage", (), {"total": total, "used": used, "free": free})()):
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["disk"]["status"] == "warn"
+        assert data["disk"]["used_pct"] == 90
+
+    def test_api_health_disk_error(self, app_client, tmp_path):
+        """disk.status is 'error' when usage >= 95%."""
+        total = 100 * 1024 * 1024
+        used = 96 * 1024 * 1024
+        free = total - used
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("app.dashboard.shutil.disk_usage",
+                   return_value=type("DiskUsage", (), {"total": total, "used": used, "free": free})()):
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["disk"]["status"] == "error"
+
+    def test_api_health_disk_ok(self, app_client, tmp_path):
+        """disk.status is 'ok' when usage < 85%."""
+        total = 100 * 1024 * 1024
+        used = 50 * 1024 * 1024
+        free = total - used
+        with patch.object(dashboard, "KOAN_ROOT", tmp_path), \
+             patch("app.dashboard.shutil.disk_usage",
+                   return_value=type("DiskUsage", (), {"total": total, "used": used, "free": free})()):
+            resp = app_client.get("/api/health")
+        data = resp.get_json()
+        assert data["disk"]["status"] == "ok"
+
+
+class TestApiAgentSoul:
+    def test_get_soul(self, app_client, instance_dir):
+        resp = app_client.get("/api/agent/soul")
+        data = resp.get_json()
+        assert data["content"] == "You are Kōan."
+        assert "truncated" not in data
+
+    def test_get_soul_missing(self, app_client, instance_dir):
+        (instance_dir / "soul.md").unlink()
+        resp = app_client.get("/api/agent/soul")
+        data = resp.get_json()
+        assert data["content"] is None
+
+    def test_put_soul(self, app_client, instance_dir):
+        resp = app_client.put(
+            "/api/agent/soul",
+            json={"content": "New soul content."},
+        )
+        assert resp.get_json()["ok"] is True
+        assert (instance_dir / "soul.md").read_text() == "New soul content."
+
+    def test_put_soul_missing_content(self, app_client):
+        resp = app_client.put("/api/agent/soul", json={})
+        assert resp.status_code == 400
+        assert resp.get_json()["ok"] is False
+
+    def test_put_soul_roundtrip(self, app_client, instance_dir):
+        new_text = "# Updated Soul\n\nWith multiple lines."
+        app_client.put("/api/agent/soul", json={"content": new_text})
+        resp = app_client.get("/api/agent/soul")
+        assert resp.get_json()["content"] == new_text
+
+
+class TestConfigPage:
+    def test_config_page_renders(self, app_client):
+        resp = app_client.get("/config")
+        assert resp.status_code == 200
+        assert b"config.yaml" in resp.data
+        assert b"projects.yaml" in resp.data
+        assert b"Restart Service" in resp.data
+
+    def test_config_page_has_tab_navigation(self, app_client):
+        resp = app_client.get("/config")
+        assert b'class="k-tabs"' in resp.data
+        assert b'data-tab="config-yaml"' in resp.data
+        assert b'data-tab="projects-yaml"' in resp.data
+        assert b'id="panel-config-yaml"' in resp.data
+        assert b'id="panel-projects-yaml"' in resp.data
+
+    def test_config_page_has_syntax_highlight_classes(self, app_client):
+        resp = app_client.get("/config")
+        assert b"hl-key" in resp.data
+        assert b"hl-comment" in resp.data
+
+    def test_put_config_valid_yaml(self, app_client, tmp_path):
+        config_path = tmp_path / "instance" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("old: value\n")
+        resp = app_client.put(
+            "/api/config/config",
+            json={"content": "new_key: 42\nlist:\n  - item\n"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert "new_key: 42" in config_path.read_text()
+
+    def test_put_config_invalid_yaml(self, app_client):
+        resp = app_client.put(
+            "/api/config/config",
+            json={"content": "bad: [unclosed\n"},
+        )
+        assert resp.status_code == 422
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "Invalid YAML" in data["error"]
+
+    def test_put_config_missing_content(self, app_client):
+        resp = app_client.put("/api/config/config", json={})
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert data["ok"] is False
+
+    def test_put_config_unknown_target(self, app_client):
+        resp = app_client.put(
+            "/api/config/unknown",
+            json={"content": "x: 1\n"},
+        )
+        assert resp.status_code == 404
+
+    def test_put_projects_valid(self, app_client, tmp_path):
+        projects_path = tmp_path / "projects.yaml"
+        projects_path.write_text("defaults:\n  path: /tmp\n")
+        resp = app_client.put(
+            "/api/config/projects",
+            json={"content": "defaults:\n  path: /new\n"},
+        )
+        assert resp.status_code == 200
+        assert resp.get_json()["ok"] is True
+        assert "/new" in projects_path.read_text()
+
+    def test_put_config_rejects_redacted_values(self, app_client):
+        resp = app_client.put(
+            "/api/config/config",
+            json={"content": "token: <redacted>\nname: ok\n"},
+        )
+        assert resp.status_code == 422
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "redacted" in data["error"].lower()
+
+    def test_put_config_invalid_json_body(self, app_client):
+        resp = app_client.put(
+            "/api/config/config",
+            data="not json",
+            content_type="application/json",
+        )
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "JSON" in data["error"]
+
+    def test_restart_endpoint(self, app_client):
+        with patch("app.restart_manager.request_restart") as mock_restart:
+            resp = app_client.post("/api/config/restart")
+        assert resp.status_code == 200
+        assert resp.get_json()["ok"] is True
+        mock_restart.assert_called_once()
+
+    def test_restart_endpoint_error(self, app_client):
+        with patch("app.restart_manager.request_restart", side_effect=OSError("internal detail")):
+            resp = app_client.post("/api/config/restart")
+        assert resp.status_code == 500
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "internal detail" not in data["error"]
+        assert "restart" in data["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Agent control routes — pause / resume / restart
+# ---------------------------------------------------------------------------
+
+class TestAgentControls:
+    """Test /api/agent/pause, /api/agent/resume, /api/agent/restart."""
+
+    def test_pause_creates_file(self, app_client, tmp_path):
+        resp = app_client.post("/api/agent/pause", json={})
+        data = resp.get_json()
+        assert resp.status_code == 200
+        assert data["ok"] is True
+        assert data["status"] == "paused"
+        assert (tmp_path / ".koan-pause").exists()
+
+    def test_pause_with_duration(self, app_client, tmp_path):
+        fixed_time = 1700000000
+        with patch("app.dashboard.time.time", return_value=fixed_time):
+            resp = app_client.post("/api/agent/pause", json={"duration": "2h"})
+        data = resp.get_json()
+        assert resp.status_code == 200
+        assert data["ok"] is True
+        content = (tmp_path / ".koan-pause").read_text()
+        lines = content.splitlines()
+        assert lines[0] == "manual"
+        assert lines[1] == str(fixed_time + 7200)
+        assert lines[2] == "Dashboard pause (2h)"
+
+    def test_pause_invalid_duration(self, app_client, tmp_path):
+        resp = app_client.post("/api/agent/pause", json={"duration": "xyz"})
+        assert resp.status_code == 422
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "error" in data
+
+    def test_resume_removes_file(self, app_client, tmp_path):
+        (tmp_path / ".koan-pause").write_text("manual\n")
+        resp = app_client.post("/api/agent/resume")
+        data = resp.get_json()
+        assert resp.status_code == 200
+        assert data["ok"] is True
+        assert not (tmp_path / ".koan-pause").exists()
+
+    def test_resume_when_not_paused(self, app_client, tmp_path):
+        assert not (tmp_path / ".koan-pause").exists()
+        resp = app_client.post("/api/agent/resume")
+        assert resp.status_code == 200
+        assert resp.get_json()["ok"] is True
+
+    def test_restart_creates_signal(self, app_client, tmp_path):
+        resp = app_client.post("/api/agent/restart")
+        data = resp.get_json()
+        assert resp.status_code == 200
+        assert data["ok"] is True
+        # writes both per-consumer markers so the restart actually fires.
+        assert (tmp_path / ".koan-restart-run").exists()
+        assert (tmp_path / ".koan-restart-bridge").exists()
+        assert not (tmp_path / ".koan-restart").exists()
+
+    def test_pause_button_hidden_when_paused(self, app_client, tmp_path):
+        (tmp_path / ".koan-pause").write_text("manual\n")
+        resp = app_client.get("/")
+        html = resp.data.decode()
+        assert 'id="ctrl-resume"' in html
+        assert 'id="ctrl-pause"' in html
+        assert 'ctrl-pause-group' in html
+
+    def test_resume_button_hidden_when_running(self, app_client, tmp_path):
+        assert not (tmp_path / ".koan-pause").exists()
+        resp = app_client.get("/")
+        html = resp.data.decode()
+        assert 'ctrl-resume' in html
+        assert 'display:none' in html
+
+
+class TestNicknameApi:
+    def test_get_nickname_default_empty(self, app_client):
+        with patch("app.config._load_config", return_value={}):
+            resp = app_client.get("/api/nickname")
+        assert resp.status_code == 200
+        assert resp.get_json()["nickname"] == ""
+
+    def test_get_nickname_from_config(self, app_client):
+        with patch("app.config._load_config", return_value={"dashboard": {"nickname": "MyServer1"}}):
+            resp = app_client.get("/api/nickname")
+        assert resp.status_code == 200
+        assert resp.get_json()["nickname"] == "MyServer1"
+
+    def test_set_nickname(self, app_client, instance_dir):
+        import yaml
+        config_path = instance_dir / "config.yaml"
+        config_path.write_text("dashboard:\n  enabled: true\n")
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.put("/api/nickname",
+                json={"nickname": "Prod-1"},
+                content_type="application/json")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["nickname"] == "Prod-1"
+        saved = yaml.safe_load(config_path.read_text())
+        assert saved["dashboard"]["nickname"] == "Prod-1"
+
+    def test_set_nickname_truncates_at_50(self, app_client, instance_dir):
+        config_path = instance_dir / "config.yaml"
+        config_path.write_text("")
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.put("/api/nickname",
+                json={"nickname": "x" * 100},
+                content_type="application/json")
+        assert resp.status_code == 200
+        assert len(resp.get_json()["nickname"]) == 50
+
+    def test_set_nickname_clear(self, app_client, instance_dir):
+        import yaml
+        config_path = instance_dir / "config.yaml"
+        config_path.write_text("dashboard:\n  nickname: OldName\n")
+        with patch.object(dashboard, "INSTANCE_DIR", instance_dir):
+            resp = app_client.put("/api/nickname",
+                json={"nickname": ""},
+                content_type="application/json")
+        assert resp.status_code == 200
+        assert resp.get_json()["nickname"] == ""
+        saved = yaml.safe_load(config_path.read_text())
+        assert saved["dashboard"]["nickname"] == ""
+
+    def test_set_nickname_invalid_json(self, app_client):
+        resp = app_client.put("/api/nickname", data="not json", content_type="text/plain")
+        assert resp.status_code == 400
+
+    def test_nickname_in_page_title(self, app_client):
+        with patch("app.config._load_config", return_value={"dashboard": {"nickname": "MyServer"}}):
+            resp = app_client.get("/")
+        assert b"MyServer" in resp.data
+
+    def test_nickname_in_sidebar(self, app_client):
+        with patch("app.config._load_config", return_value={"dashboard": {"nickname": "Lab42"}}):
+            resp = app_client.get("/")
+        assert b"Lab42" in resp.data
+        assert b"instance-nickname" in resp.data
+
+
+class TestRecurringPage:
+    """Tests for /recurring page and /api/recurring endpoints."""
+
+    def test_recurring_page_renders_empty(self, app_client, instance_dir):
+        resp = app_client.get("/recurring")
+        assert resp.status_code == 200
+        assert b"Recurring Tasks" in resp.data
+        assert b"No recurring tasks" in resp.data
+
+    def test_recurring_page_shows_tasks(self, app_client, instance_dir):
+        (instance_dir / "recurring.json").write_text(json.dumps([
+            {"id": "rec_1", "frequency": "daily", "text": "check emails",
+             "project": None, "created": "2026-01-01T00:00:00",
+             "last_run": None, "enabled": True, "at": "09:00"},
+        ]))
+        resp = app_client.get("/recurring")
+        assert resp.status_code == 200
+        assert b"check emails" in resp.data
+        assert b"daily" in resp.data
+
+    def test_api_recurring_list_empty(self, app_client, instance_dir):
+        resp = app_client.get("/api/recurring")
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+    def test_api_recurring_list_returns_tasks(self, app_client, instance_dir):
+        (instance_dir / "recurring.json").write_text(json.dumps([
+            {"id": "rec_1", "frequency": "daily", "text": "task one",
+             "project": None, "created": "2026-01-01T00:00:00",
+             "last_run": None, "enabled": True, "at": None},
+        ]))
+        resp = app_client.get("/api/recurring")
+        data = resp.get_json()
+        assert len(data) == 1
+        assert data[0]["text"] == "task one"
+
+    def test_api_recurring_create_daily(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring",
+            json={"frequency": "daily", "text": "new task", "at": "14:00"})
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["text"] == "new task"
+        assert data["frequency"] == "daily"
+        assert data["at"] == "14:00"
+        assert data["enabled"] is True
+
+    def test_api_recurring_create_every(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring",
+            json={"frequency": "every", "text": "poll status", "interval": "30m"})
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["frequency"] == "every"
+        assert data["interval_seconds"] == 1800
+
+    def test_api_recurring_create_with_days(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring",
+            json={"frequency": "daily", "text": "weekday task", "days": "weekdays"})
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["days"] == "weekdays"
+
+    def test_api_recurring_create_invalid_frequency(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring",
+            json={"frequency": "biweekly", "text": "nope"})
+        assert resp.status_code == 400
+
+    def test_api_recurring_create_empty_text(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring",
+            json={"frequency": "daily", "text": ""})
+        assert resp.status_code == 400
+
+    def test_api_recurring_create_every_no_interval(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring",
+            json={"frequency": "every", "text": "task"})
+        assert resp.status_code == 400
+
+    def test_api_recurring_update(self, app_client, instance_dir):
+        (instance_dir / "recurring.json").write_text(json.dumps([
+            {"id": "rec_1", "frequency": "daily", "text": "old text",
+             "project": None, "created": "2026-01-01T00:00:00",
+             "last_run": None, "enabled": True, "at": None},
+        ]))
+        resp = app_client.patch("/api/recurring/rec_1",
+            json={"text": "updated text", "at": "20:00"})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["text"] == "updated text"
+        assert data["at"] == "20:00"
+
+    def test_api_recurring_toggle(self, app_client, instance_dir):
+        (instance_dir / "recurring.json").write_text(json.dumps([
+            {"id": "rec_1", "frequency": "daily", "text": "task",
+             "project": None, "created": "2026-01-01T00:00:00",
+             "last_run": None, "enabled": True, "at": None},
+        ]))
+        resp = app_client.patch("/api/recurring/rec_1", json={"enabled": False})
+        assert resp.status_code == 200
+        assert resp.get_json()["enabled"] is False
+
+    def test_api_recurring_update_not_found(self, app_client, instance_dir):
+        resp = app_client.patch("/api/recurring/nope", json={"text": "x"})
+        assert resp.status_code == 404
+
+    def test_api_recurring_delete(self, app_client, instance_dir):
+        (instance_dir / "recurring.json").write_text(json.dumps([
+            {"id": "rec_1", "frequency": "daily", "text": "task",
+             "project": None, "created": "2026-01-01T00:00:00",
+             "last_run": None, "enabled": True, "at": None},
+        ]))
+        resp = app_client.delete("/api/recurring/rec_1")
+        assert resp.status_code == 200
+        assert resp.get_json()["ok"] is True
+        remaining = json.loads((instance_dir / "recurring.json").read_text())
+        assert len(remaining) == 0
+
+    def test_api_recurring_delete_not_found(self, app_client, instance_dir):
+        resp = app_client.delete("/api/recurring/nope")
+        assert resp.status_code == 404
+
+    def test_api_recurring_run(self, app_client, instance_dir):
+        (instance_dir / "recurring.json").write_text(json.dumps([
+            {"id": "rec_1", "frequency": "daily", "text": "run me",
+             "project": None, "created": "2026-01-01T00:00:00",
+             "last_run": None, "enabled": True, "at": None},
+        ]))
+        resp = app_client.post("/api/recurring/rec_1/run")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert b"run me" in (instance_dir / "missions.md").read_bytes()
+
+    def test_api_recurring_run_not_found(self, app_client, instance_dir):
+        resp = app_client.post("/api/recurring/nope/run")
+        assert resp.status_code == 404

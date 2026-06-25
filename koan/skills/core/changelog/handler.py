@@ -1,5 +1,6 @@
 """Koan changelog skill — generate release notes from commits and journals."""
 
+import contextlib
 import re
 import subprocess
 from collections import defaultdict
@@ -105,10 +106,8 @@ def _parse_args(args: str) -> Tuple[str, datetime, str]:
     for part in parts:
         if part.startswith("--since="):
             date_str = part[len("--since="):]
-            try:
+            with contextlib.suppress(ValueError):
                 since_date = datetime.strptime(date_str, "%Y-%m-%d")
-            except ValueError:
-                pass
         elif part.startswith("--format="):
             fmt = part[len("--format="):]
             if fmt in ("md", "markdown"):
@@ -123,19 +122,16 @@ def _parse_args(args: str) -> Tuple[str, datetime, str]:
 
 
 def _resolve_project(ctx, project_name: str) -> Optional[str]:
-    """Resolve project to a filesystem path."""
-    from app.utils import get_known_projects
+    """Resolve project name or alias to a filesystem path."""
+    from app.utils import get_known_projects, resolve_project_from_list
 
     projects = get_known_projects()
     if not projects:
         return None
 
     if project_name:
-        # Find matching project (case-insensitive)
-        for name, path in projects:
-            if name.lower() == project_name.lower():
-                return path
-        return None
+        _, path = resolve_project_from_list(projects, project_name)
+        return path
 
     # No project specified — use first project if only one
     if len(projects) == 1:
@@ -279,8 +275,7 @@ def _format_markdown(
     if journal_entries:
         lines.append("### Context (from journal)")
         lines.append("")
-        for entry in journal_entries[:10]:
-            lines.append(f"- {_truncate(entry, 120)}")
+        lines.extend(f"- {_truncate(entry, 120)}" for entry in journal_entries[:10])
         lines.append("")
 
     total = sum(len(items) for items in sections.values())
@@ -316,7 +311,6 @@ def _format_telegram(
 
     if journal_entries:
         lines.append("Context:")
-        for entry in journal_entries[:5]:
-            lines.append(f"  {_truncate(entry, 80)}")
+        lines.extend(f"  {_truncate(entry, 80)}" for entry in journal_entries[:5])
 
     return "\n".join(lines)

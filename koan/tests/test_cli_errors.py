@@ -1,5 +1,7 @@
 """Tests for app.cli_errors — CLI error classification."""
 
+import json
+
 import pytest
 
 from app.cli_errors import ErrorCategory, classify_cli_error
@@ -84,10 +86,40 @@ class TestClassifyCliError:
         "HTTP 429 Too Many Requests",
         "usage limit reached",
         "retry-after: 3600",
+        # Credit/billing limit errors (4-hour credit window)
+        "Your credit balance is too low to access the Anthropic API.",
+        "your credit balance is empty",
+        "Error: out of credits",
+        "credits exhausted",
+        "insufficient credits to complete request",
+        "billing limit reached",
+        "usage cap exceeded",
     ])
     def test_quota_errors(self, stderr):
         result = classify_cli_error(1, stderr=stderr)
         assert result == ErrorCategory.QUOTA, f"Expected QUOTA for: {stderr}"
+
+    def test_hit_your_limit_is_quota(self):
+        """Claude Code CLI 'hit your limit' message should classify as QUOTA."""
+        result = classify_cli_error(
+            1, stderr="You've hit your limit · resets 6pm (UTC)")
+        assert result == ErrorCategory.QUOTA
+
+    def test_session_limit_stdout_is_quota(self):
+        result = classify_cli_error(
+            1,
+            stdout="You've hit your session limit · resets 3am (UTC)",
+            provider_name="claude",
+        )
+        assert result == ErrorCategory.QUOTA
+
+    def test_structured_rate_limit_stdout_is_quota(self):
+        payload = (
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+            '"resetsAt":1779937200,"rateLimitType":"five_hour"}}'
+        )
+        result = classify_cli_error(1, stdout=payload, provider_name="claude")
+        assert result == ErrorCategory.QUOTA
 
     # -- Unknown errors ---------------------------------------------------------
 
@@ -157,3 +189,157 @@ class TestClassifyCliError:
         stderr = "Error: Invalid API key provided. Check your ANTHROPIC_API_KEY."
         result = classify_cli_error(1, stderr=stderr)
         assert result == ErrorCategory.TERMINAL
+
+    # -- Auth errors (logged-out Claude) ----------------------------------------
+
+    @pytest.mark.parametrize("stderr", [
+        'Please run /login · API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}',
+        "OAuth token has expired. Please obtain a new token or refresh your existing token.",
+        "Please run /login",
+        "Error: not authenticated",
+        "Please log in to continue",
+        "please obtain a new token",
+        "refresh your existing token",
+    ])
+    def test_auth_errors(self, stderr):
+        result = classify_cli_error(1, stderr=stderr)
+        assert result == ErrorCategory.AUTH, f"Expected AUTH for: {stderr}"
+
+    def test_auth_takes_priority_over_terminal(self):
+        """Auth errors with 401/unauthorized text should be AUTH, not TERMINAL."""
+        stderr = (
+            'Please run /login · API Error: 401 '
+            '{"type":"error","error":{"type":"authentication_error",'
+            '"message":"OAuth token has expired."}}'
+        )
+        result = classify_cli_error(1, stderr=stderr)
+        assert result == ErrorCategory.AUTH
+
+    def test_real_claude_logged_out(self):
+        """Real-world logged-out error from the issue report."""
+        stderr = (
+            'Please run /login · API Error: 401 '
+            '{"type":"error","error":{"type":"authentication_error",'
+            '"message":"OAuth token has expired. Please obtain a new token '
+            'or refresh your existing token."},'
+            '"request_id":"req_011CZSUUxgv7cvbLAuhJY4ux"}'
+        )
+        result = classify_cli_error(1, stderr=stderr)
+        assert result == ErrorCategory.AUTH
+
+    def test_codex_jsonl_unauthorized_is_auth(self):
+        stdout = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({
+                "type": "error",
+                "message": (
+                    'unexpected status 401 Unauthorized: {"detail":"Unauthorized"}'
+                ),
+            }),
+            json.dumps({"type": "turn.failed"}),
+        ])
+        result = classify_cli_error(1, stdout=stdout, provider_name="codex")
+        assert result == ErrorCategory.AUTH
+
+    def test_codex_refresh_token_reuse_is_auth(self):
+        stderr = (
+            "Error: Your access token could not be refreshed because your "
+            "refresh token was already used. Please log out and sign in again."
+        )
+        result = classify_cli_error(1, stderr=stderr, provider_name="codex")
+        assert result == ErrorCategory.AUTH
+
+    # -- Provider auth detector resilience ---------------------------------------
+
+    def test_unknown_provider_name_does_not_raise(self):
+        """An unknown provider name must classify without crashing.
+
+        _detect_auth_for_provider resolves via get_provider_by_name, which
+        raises KeyError on unknown names; that must degrade to a normal
+        classification, not propagate.
+        """
+        result = classify_cli_error(
+            1, stderr="Error: something generic", provider_name="does-not-exist"
+        )
+        assert isinstance(result, ErrorCategory)
+        assert result != ErrorCategory.AUTH
+
+    def test_provider_auth_detector_exception_is_swallowed(self):
+        """A bug in a provider's detect_auth_failure must not crash the caller."""
+        from unittest.mock import patch
+
+        class _Boom:
+            def detect_auth_failure(self, **_kwargs):
+                raise RuntimeError("detector bug")
+
+        with patch("app.provider.get_provider_by_name", return_value=_Boom()):
+            result = classify_cli_error(
+                1, stderr="Error: generic failure", provider_name="codex"
+            )
+        # Detector blew up → no AUTH from it, and no exception propagated.
+        assert isinstance(result, ErrorCategory)
+        assert result != ErrorCategory.AUTH
+
+    # -- False positive: loose quota patterns in stdout --------------------------
+
+    def test_no_false_positive_rate_limit_in_stdout(self):
+        """Loose patterns like 'rate limit' in stdout must NOT trigger QUOTA.
+
+        When Claude discusses API rate limiting in its response (stdout),
+        classify_cli_error should not confuse that with actual quota exhaustion.
+        Only strict patterns (e.g. 'out of extra usage') should match in stdout.
+        """
+        stdout = (
+            "Here's the plan for implementing rate limiting:\n"
+            "1. Add rate limit middleware to the API gateway\n"
+            "2. Configure per-endpoint rate limit thresholds\n"
+            "3. Return HTTP 429 with Retry-After header when limit exceeded"
+        )
+        result = classify_cli_error(1, stdout=stdout, stderr="Error: process crashed")
+        assert result != ErrorCategory.QUOTA, (
+            "Loose quota patterns in stdout caused false QUOTA classification"
+        )
+
+    def test_no_false_positive_usage_limit_in_stdout(self):
+        """'usage limit' in Claude's response should not trigger QUOTA."""
+        stdout = "You should set a usage limit on the API key to prevent abuse."
+        result = classify_cli_error(1, stdout=stdout, stderr="segfault")
+        assert result != ErrorCategory.QUOTA
+
+    def test_no_false_positive_too_many_requests_in_stdout(self):
+        """'too many requests' in Claude's code output should not trigger QUOTA."""
+        stdout = 'raise HTTPException(status_code=429, detail="too many requests")'
+        result = classify_cli_error(1, stdout=stdout, stderr="killed by signal")
+        assert result != ErrorCategory.QUOTA
+
+    def test_codex_ignores_command_aggregated_output_quota_words(self):
+        stdout = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "aggregated_output": (
+                    "can_view_billing_credit_usage = true\n"
+                    "TrialExpiredAt = true\n"
+                    "default_shared_server_limit = 10\n"
+                ),
+            },
+        })
+        result = classify_cli_error(
+            1,
+            stdout=stdout,
+            stderr="process failed",
+            provider_name="codex",
+        )
+        assert result != ErrorCategory.QUOTA
+
+    def test_strict_patterns_still_match_in_stdout(self):
+        """Strict patterns like 'out of extra usage' should match even in stdout."""
+        stdout = "Error: out of extra usage quota for this billing period"
+        result = classify_cli_error(1, stdout=stdout)
+        assert result == ErrorCategory.QUOTA
+
+    def test_loose_patterns_match_in_stderr(self):
+        """Loose patterns should still match when they appear in stderr."""
+        result = classify_cli_error(1, stderr="rate limit exceeded")
+        assert result == ErrorCategory.QUOTA

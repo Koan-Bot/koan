@@ -13,14 +13,55 @@ Usage from Python:
     send_telegram("Mission completed: security audit")
 """
 
+import logging
 import os
 import subprocess
 import sys
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+log = logging.getLogger(__name__)
+
 from app.utils import load_dotenv
+
+# Thread-local reply context for group chat threading.
+# Set by the bridge main loop before dispatching a message handler;
+# read by send_telegram() to include reply_to_message_id in the API call.
+# Each thread has its own value, so the main loop and worker threads
+# don't interfere with each other.
+_reply_local = threading.local()
+
+
+def set_reply_context(message_id: int):
+    """Set the reply-to message ID for the current thread."""
+    _reply_local.reply_to = message_id
+
+
+def clear_reply_context():
+    """Clear the reply context for the current thread."""
+    _reply_local.reply_to = 0
+
+
+def get_reply_context() -> int:
+    """Get the reply-to message ID for the current thread."""
+    return getattr(_reply_local, "reply_to", 0)
+
+
+class NotificationPriority(Enum):
+    """Four-level notification priority system.
+
+    Priority ranks (higher = more important):
+        urgent=3  — critical failures, quota exhausted
+        action=2  — mission complete, command responses (default)
+        warning=1 — quota low, focus validation
+        info=0    — progress updates, reflections
+    """
+    INFO = 0
+    WARNING = 1
+    ACTION = 2
+    URGENT = 3
 
 
 # mtime-based file read cache for format_and_send context files.
@@ -29,13 +70,102 @@ from app.utils import load_dotenv
 _file_cache: Dict[str, Tuple[str, float]] = {}
 _file_cache_lock = threading.Lock()
 
+# Sentinel returned when a notification is suppressed by min_priority filtering.
+# Truthy so fire-and-forget callers (`if send_telegram(...)`) still treat it as "ok",
+# but distinguishable from True for callers that need to know delivery vs suppression.
+NOTIFICATION_SUPPRESSED = "suppressed"
+
+# Valid priority names for config parsing (lowercase)
+_PRIORITY_NAME_MAP = {
+    "info": NotificationPriority.INFO,
+    "warning": NotificationPriority.WARNING,
+    "action": NotificationPriority.ACTION,
+    "urgent": NotificationPriority.URGENT,
+}
+
+
+def _get_min_priority() -> NotificationPriority:
+    """Load min_priority from config at call time.
+
+    Reads notifications.min_priority from instance/config.yaml.
+    Defaults to ACTION if missing or invalid.
+
+    Returns:
+        NotificationPriority threshold — messages below this rank are suppressed.
+    """
+    try:
+        from app.utils import load_config
+        config = load_config()
+        notifications = config.get("notifications", {})
+        if not isinstance(notifications, dict):
+            return NotificationPriority.ACTION
+        raw = notifications.get("min_priority", "action")
+        if isinstance(raw, str):
+            key = raw.strip().lower()
+            result = _PRIORITY_NAME_MAP.get(key)
+            if result is not None:
+                return result
+            log.warning("Invalid min_priority value '%s', defaulting to 'action'.", raw)
+    except Exception as e:
+        log.warning("Could not load min_priority from config: %s", e)
+    return NotificationPriority.ACTION
+
+
+def _write_suppressed_to_journal(text: str, priority: NotificationPriority):
+    """Write a suppressed notification to the daily journal.
+
+    Used when a message's priority is below min_priority. Messages are preserved
+    in the journal under a "notifications" project entry so nothing is lost.
+
+    Args:
+        text: The notification text that was suppressed
+        priority: The priority level of the suppressed message
+    """
+    try:
+        from datetime import datetime as _dt
+        from app.utils import load_dotenv as _load_dotenv
+        import os as _os
+
+        _load_dotenv()
+        koan_root = _os.environ.get("KOAN_ROOT", "")
+        if not koan_root:
+            return
+
+        from app.journal import append_to_journal
+        instance_dir = Path(koan_root) / "instance"
+        timestamp = _dt.now().strftime("%H:%M:%S")
+        entry = (
+            f"\n### [{timestamp}] Suppressed ({priority.name.lower()})\n\n"
+            f"{text.strip()}\n"
+        )
+        append_to_journal(instance_dir, "notifications", entry)
+    except Exception as e:
+        log.warning("Failed to write suppressed message to journal: %s", e)
+
+
+# Rotating "thinking" phrases. Providers that render status text (Slack) cycle
+# through these; providers with a generic indicator (Telegram, Matrix) ignore
+# the text. Cosmetic UI strings — not LLM prompts.
+THINKING_PHRASES = (
+    "Thinking…",
+    "Reading the code…",
+    "Working on it…",
+    "Putting it together…",
+)
+
 
 class TypingIndicator:
-    """Context manager that sends typing indicators at regular intervals.
+    """Context manager that sends typing / "thinking" indicators periodically.
 
-    Telegram's typing indicator expires after ~5 seconds. This keeps
-    re-sending it every `interval` seconds in a background thread until
-    the context exits.
+    Telegram's typing indicator expires after ~5 seconds, so this re-sends it
+    every `interval` seconds in a background thread until the context exits.
+    For providers with a sticky, text-bearing status (Slack's assistant
+    status), it rotates through `THINKING_PHRASES` and clears the status on
+    exit.
+
+    The reply context (which thread to target) is captured from the *entering*
+    thread, because the background loop thread has no thread-local reply
+    context of its own.
 
     Usage:
         with TypingIndicator():
@@ -46,9 +176,12 @@ class TypingIndicator:
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._reply_to: int = 0
+        self._phrase_idx: int = 0
 
     def __enter__(self):
-        send_typing()  # Send immediately
+        self._reply_to = get_reply_context()
+        self._tick()  # Send immediately
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -57,19 +190,35 @@ class TypingIndicator:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
+        stop_typing(self._reply_to)
         return False
+
+    def _tick(self):
+        phrase = THINKING_PHRASES[self._phrase_idx % len(THINKING_PHRASES)]
+        self._phrase_idx += 1
+        send_typing(reply_to=self._reply_to, status=phrase)
 
     def _loop(self):
         while not self._stop_event.wait(self._interval):
-            send_typing()
+            self._tick()
 
 
-def send_typing() -> bool:
-    """Send a typing indicator via the active messaging provider."""
+def send_typing(reply_to: int = 0, status: str = "") -> bool:
+    """Send a typing / "thinking" indicator via the active messaging provider."""
     try:
         from app.messaging import get_messaging_provider
         provider = get_messaging_provider()
-        return provider.send_typing()
+        return provider.send_typing(reply_to_message_id=reply_to, status=status)
+    except SystemExit:
+        return False
+
+
+def stop_typing(reply_to: int = 0) -> bool:
+    """Clear a persistent "thinking" indicator via the active provider."""
+    try:
+        from app.messaging import get_messaging_provider
+        provider = get_messaging_provider()
+        return provider.stop_typing(reply_to_message_id=reply_to)
     except SystemExit:
         return False
 
@@ -107,7 +256,7 @@ def _send_raw_bypass_flood(text: str) -> bool:
         return _direct_send(text)
 
 
-def _direct_send(text: str) -> bool:
+def _direct_send(text: str, reply_to: int = 0) -> bool:
     """Direct Telegram API send (standalone fallback when provider unavailable).
 
     Retries each chunk up to 3 times with exponential backoff (1s/2s/4s)
@@ -142,10 +291,11 @@ def _direct_send(text: str) -> bool:
     total = len(chunks)
     sent = 0
     failed = 0
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        chunk_reply = reply_to if i == 0 else 0
         try:
             if retry_with_backoff(
-                lambda c=chunk, pm=parse_mode: _direct_send_chunk(api_base, chat_id, c, pm),
+                lambda c=chunk, pm=parse_mode, rt=chunk_reply: _direct_send_chunk(api_base, chat_id, c, pm, rt),
                 retryable=(requests.RequestException, ValueError),
                 label="telegram direct send",
             ):
@@ -169,13 +319,15 @@ def _direct_send(text: str) -> bool:
 
 
 def _direct_send_chunk(api_base: str, chat_id: str, chunk: str,
-                       parse_mode: str = None) -> bool:
+                       parse_mode: str = None, reply_to: int = 0) -> bool:
     """Send a single message chunk via Telegram API. Raises on network error."""
     import requests
 
     payload = {"chat_id": chat_id, "text": chunk}
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": reply_to}
     resp = requests.post(
         f"{api_base}/sendMessage",
         json=payload,
@@ -189,21 +341,66 @@ def _direct_send_chunk(api_base: str, chat_id: str, chunk: str,
     return True
 
 
-def send_telegram(text: str) -> bool:
+def _apply_priority_emoji(text: str, priority: NotificationPriority) -> str:
+    """Prepend priority emoji to text for urgent and warning messages.
+
+    Idempotent: does not prepend if text already starts with the emoji.
+    action and info levels get no prefix.
+
+    Args:
+        text: Message text
+        priority: Notification priority level
+
+    Returns:
+        Text with emoji prepended if appropriate
+    """
+    _PRIORITY_EMOJIS = {
+        NotificationPriority.URGENT: "🚨",
+        NotificationPriority.WARNING: "⚠️",
+    }
+    emoji = _PRIORITY_EMOJIS.get(priority)
+    if emoji and not text.startswith(emoji):
+        return f"{emoji} {text}"
+    return text
+
+
+def send_telegram(text: str,
+                  priority: NotificationPriority = NotificationPriority.ACTION) -> bool:
     """Send a message via the active messaging provider (with flood protection).
 
     Retry logic is handled at the HTTP request level inside the provider's
     _send_raw() and notify's _direct_send(), so transient network failures
     are retried transparently (up to 3 attempts with 1s/2s/4s backoff).
 
-    Returns True on success (suppression counts as success).
+    Messages with priority below the configured min_priority are suppressed from
+    Telegram and written to the daily journal instead (nothing is lost).
+
+    Args:
+        text: Message text to send
+        priority: Notification priority level (default: ACTION)
+
+    Returns:
+        True if the message was delivered successfully.
+        NOTIFICATION_SUPPRESSED if the message was silently dropped by min_priority.
+        False if sending failed.
     """
+    # Check priority filter before sending
+    min_priority = _get_min_priority()
+    if priority.value < min_priority.value:
+        _write_suppressed_to_journal(text, priority)
+        return NOTIFICATION_SUPPRESSED
+
+    # Prepend priority emoji for urgent and warning messages (idempotent)
+    text = _apply_priority_emoji(text, priority)
+
+    reply_to = get_reply_context()
+
     try:
         from app.messaging import get_messaging_provider
         provider = get_messaging_provider()
-        return provider.send_message(text)
+        return provider.send_message(text, reply_to_message_id=reply_to)
     except SystemExit:
-        return _direct_send(text)
+        return _direct_send(text, reply_to=reply_to)
 
 
 def _get_file_mtime(path: Path) -> float:
@@ -244,7 +441,8 @@ def invalidate_file_cache():
 
 
 def format_and_send(raw_message: str, instance_dir: str = None,
-                     project_name: str = "") -> bool:
+                     project_name: str = "",
+                     priority: NotificationPriority = NotificationPriority.ACTION) -> bool:
     """Format a message through Claude with Kōan's personality, then send to Telegram.
 
     Every message sent to Telegram should go through this function to ensure
@@ -254,6 +452,7 @@ def format_and_send(raw_message: str, instance_dir: str = None,
         raw_message: The raw/technical message to format
         instance_dir: Path to instance directory (auto-detected from KOAN_ROOT if None)
         project_name: Optional project name for scoped memory context
+        priority: Notification priority level (default: ACTION)
 
     Returns:
         True if message was sent successfully
@@ -270,7 +469,7 @@ def format_and_send(raw_message: str, instance_dir: str = None,
             instance_dir = str(Path(koan_root) / "instance")
         else:
             # Can't format without instance dir — send raw with basic cleanup
-            return send_telegram(fallback_format(raw_message))
+            return send_telegram(fallback_format(raw_message), priority=priority)
 
     instance_path = Path(instance_dir)
     try:
@@ -319,16 +518,16 @@ def format_and_send(raw_message: str, instance_dir: str = None,
                 print(f"[notify] GitHub ref expansion failed: {e}",
                       file=sys.stderr)
 
-        return send_telegram(formatted)
+        return send_telegram(formatted, priority=priority)
     except (OSError, subprocess.SubprocessError, ValueError) as e:
         print(f"[notify] Format error, sending fallback: {e}", file=sys.stderr)
-        return send_telegram(fallback_format(raw_message))
+        return send_telegram(fallback_format(raw_message), priority=priority)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} [--format] <message>", file=sys.stderr)
-        print(f"  --format: Format through Claude before sending", file=sys.stderr)
+        print("  --format: Format through Claude before sending", file=sys.stderr)
         sys.exit(1)
 
     args = sys.argv[1:]

@@ -39,7 +39,7 @@ class TestStatusDispatch:
         from skills.core.status.handler import handle
         ctx = _make_ctx("status", instance, tmp_path)
         result = handle(ctx)
-        assert "Kōan Status" in result
+        assert "◉ Kōan Status" in result
 
     def test_dispatch_to_ping(self, tmp_path):
         instance = tmp_path / "instance"
@@ -73,8 +73,10 @@ class TestHandleStatus:
         from skills.core.status.handler import _handle_status
         ctx = _make_ctx("status", instance, tmp_path)
         result = _handle_status(ctx)
-        assert "Working" in result
+        assert "Active" in result
         assert "Paused" not in result
+        assert result.startswith("```\n")
+        assert result.endswith("\n```")
 
     def test_paused_mode_generic(self, tmp_path):
         """Pause file without reason = generic pause."""
@@ -117,6 +119,66 @@ class TestHandleStatus:
         result = _handle_status(ctx)
         assert "Stopping" in result
 
+    def test_paused_shows_in_progress_mission(self, tmp_path):
+        """When paused with in-progress mission, status shows what's finishing."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        (tmp_path / ".koan-pause").touch()
+        missions = instance / "missions.md"
+        missions.write_text(
+            "# Missions\n\n"
+            "## Pending\n\n"
+            "## In Progress\n\n"
+            "- [project:koan] /rebase https://github.com/org/repo/pull/42\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        result = _handle_status(ctx)
+        assert "Paused" in result
+        assert "Finishing" in result
+        assert "/rebase" in result
+        assert "[koan]" in result
+
+    def test_paused_no_in_progress_no_finishing_line(self, tmp_path):
+        """When paused with no in-progress missions, no Finishing line."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        (tmp_path / ".koan-pause").touch()
+        missions = instance / "missions.md"
+        missions.write_text(
+            "# Missions\n\n"
+            "## Pending\n\n"
+            "- some task\n\n"
+            "## In Progress\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        result = _handle_status(ctx)
+        assert "Paused" in result
+        assert "Finishing" not in result
+
+    def test_stopping_shows_in_progress_mission(self, tmp_path):
+        """When stopping with in-progress mission, status shows what's finishing."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        (tmp_path / ".koan-stop").touch()
+        missions = instance / "missions.md"
+        missions.write_text(
+            "# Missions\n\n"
+            "## Pending\n\n"
+            "## In Progress\n\n"
+            "- [project:webapp] /review PR #99\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        result = _handle_status(ctx)
+        assert "Stopping" in result
+        assert "Finishing" in result
+        assert "/review" in result
+
     def test_stop_takes_precedence_over_pause(self, tmp_path):
         """If both stop and pause exist, stop wins."""
         instance = tmp_path / "instance"
@@ -157,6 +219,7 @@ class TestHandleStatus:
         from skills.core.status.handler import _handle_status
         ctx = _make_ctx("status", instance, tmp_path)
         result = _handle_status(ctx)
+        assert "◎ Missions" in result
         assert "Pending: 2" in result
         assert "In progress: 1" in result
         # Project tags should be stripped from display
@@ -170,7 +233,7 @@ class TestHandleStatus:
         from skills.core.status.handler import _handle_status
         ctx = _make_ctx("status", instance, tmp_path)
         result = _handle_status(ctx)
-        assert "Kōan Status" in result
+        assert "◉ Kōan Status" in result
 
     def test_empty_missions(self, tmp_path):
         """missions.md with only Done items shows no pending/in-progress."""
@@ -189,6 +252,92 @@ class TestHandleStatus:
         result = _handle_status(ctx)
         assert "Pending" not in result
         assert "In progress" not in result
+
+    def test_active_shows_queue_count(self, tmp_path):
+        """Active status shows pending mission count."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        missions = instance / "missions.md"
+        missions.write_text(
+            "# Missions\n\n"
+            "## Pending\n\n"
+            "- task one\n"
+            "- task two\n"
+            "- task three\n\n"
+            "## In Progress\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        result = _handle_status(ctx)
+        assert "Active — 3 in queue" in result
+
+    def test_active_shows_queue_empty_when_no_pending(self, tmp_path):
+        """Active status shows 'queue empty' when no pending missions."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        missions = instance / "missions.md"
+        missions.write_text(
+            "# Missions\n\n"
+            "## Pending\n\n"
+            "## In Progress\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        result = _handle_status(ctx)
+        assert "Active — queue empty" in result
+
+    def test_paused_shows_queue_count(self, tmp_path):
+        """Paused status shows pending mission count."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        (tmp_path / ".koan-pause").touch()
+        missions = instance / "missions.md"
+        missions.write_text(
+            "# Missions\n\n"
+            "## Pending\n\n"
+            "- task one\n"
+            "- task two\n\n"
+            "## In Progress\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        result = _handle_status(ctx)
+        assert "Paused — 2 in queue" in result
+
+    def test_active_shows_workers_when_parallel(self, tmp_path):
+        """Active status shows worker count when max_parallel_sessions > 1."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_parallel_workers", return_value=3):
+            result = _handle_status(ctx)
+        assert "3 workers" in result
+
+    def test_active_hides_workers_when_single(self, tmp_path):
+        """Active status hides worker count when max_parallel_sessions == 1."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_parallel_workers", return_value=1):
+            result = _handle_status(ctx)
+        assert "1 workers" not in result
+        assert "│ 1 worker" not in result
+
+    def test_paused_shows_workers_when_parallel(self, tmp_path):
+        """Paused status also shows worker count when parallel enabled."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        (tmp_path / ".koan-pause").touch()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_parallel_workers", return_value=2):
+            result = _handle_status(ctx)
+        assert "2 workers" in result
 
     def test_multi_project_missions(self, tmp_path):
         """Missions from different projects are grouped separately."""
@@ -254,6 +403,79 @@ class TestHandleStatus:
 # _truncate()
 # ---------------------------------------------------------------------------
 
+class TestCountPendingMissions:
+    """Test the _count_pending_missions() helper."""
+
+    def test_no_file(self, tmp_path):
+        from skills.core.status.handler import _count_pending_missions
+        assert _count_pending_missions(tmp_path / "missing.md") == 0
+
+    def test_no_pending(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text("## Pending\n\n## In Progress\n\n- task\n\n## Done\n")
+        from skills.core.status.handler import _count_pending_missions
+        assert _count_pending_missions(f) == 0
+
+    def test_counts_pending(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text(
+            "## Pending\n\n- task one\n- task two\n- task three\n\n"
+            "## In Progress\n\n- current\n\n## Done\n"
+        )
+        from skills.core.status.handler import _count_pending_missions
+        assert _count_pending_missions(f) == 3
+
+
+class TestGetInProgressMissions:
+    """Test the _get_in_progress_missions() helper."""
+
+    def test_no_file(self, tmp_path):
+        from skills.core.status.handler import _get_in_progress_missions
+        assert _get_in_progress_missions(tmp_path / "missing.md") == ""
+
+    def test_no_in_progress(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text("## Pending\n\n- task\n\n## In Progress\n\n## Done\n")
+        from skills.core.status.handler import _get_in_progress_missions
+        assert _get_in_progress_missions(f) == ""
+
+    def test_single_mission_with_project(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text("## In Progress\n\n- [project:koan] /rebase PR #5\n\n## Done\n")
+        from skills.core.status.handler import _get_in_progress_missions
+        result = _get_in_progress_missions(f)
+        assert "/rebase PR #5" in result
+        assert "[koan]" in result
+
+    def test_single_mission_without_project(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text("## In Progress\n\n- fix the bug\n\n## Done\n")
+        from skills.core.status.handler import _get_in_progress_missions
+        result = _get_in_progress_missions(f)
+        assert "fix the bug" in result
+        assert "[" not in result
+
+    def test_multiple_missions(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text(
+            "## In Progress\n\n"
+            "- [project:a] task one\n"
+            "- [project:b] task two\n\n"
+            "## Done\n"
+        )
+        from skills.core.status.handler import _get_in_progress_missions
+        result = _get_in_progress_missions(f)
+        assert "task one" in result
+        assert "task two" in result
+
+    def test_long_mission_truncated(self, tmp_path):
+        f = tmp_path / "missions.md"
+        f.write_text(f"## In Progress\n\n- {'x' * 80}\n\n## Done\n")
+        from skills.core.status.handler import _get_in_progress_missions
+        result = _get_in_progress_missions(f)
+        assert "…" in result
+
+
 class TestTruncate:
     """Test the _truncate() helper."""
 
@@ -287,6 +509,53 @@ class TestTruncate:
     def test_empty_string(self):
         from skills.core.status.handler import _truncate
         assert _truncate("") == ""
+
+
+# ---------------------------------------------------------------------------
+# _get_server_ip()
+# ---------------------------------------------------------------------------
+
+class TestGetServerIp:
+    """Test the _get_server_ip() helper."""
+
+    def test_returns_ip_string(self):
+        from skills.core.status.handler import _get_server_ip
+        result = _get_server_ip()
+        # Should return a dotted IP or "unknown"
+        assert isinstance(result, str)
+        if result != "unknown":
+            parts = result.split(".")
+            assert len(parts) == 4
+
+    def test_returns_unknown_on_failure(self):
+        from skills.core.status.handler import _get_server_ip
+        with patch("socket.socket") as mock_socket:
+            mock_socket.return_value.__enter__ = MagicMock(
+                side_effect=OSError("no network")
+            )
+            result = _get_server_ip()
+        assert result == "unknown"
+
+    def test_ip_shown_in_status(self, tmp_path):
+        """Server IP appears in /status output."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_server_ip", return_value="192.168.1.42"):
+            result = _handle_status(ctx)
+        assert "🌐 IP: 192.168.1.42" in result
+        assert "│" in result
+
+    def test_ip_hidden_when_unknown(self, tmp_path):
+        """When IP can't be determined, no IP line shown."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_server_ip", return_value="unknown"):
+            result = _handle_status(ctx)
+        assert "IP:" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -517,10 +786,11 @@ class TestHandleUsage:
 class TestNeedsOllama:
     """Test the _needs_ollama() provider detection helper."""
 
-    def test_local_provider_needs_ollama(self):
+    def test_removed_local_provider_does_not_need_ollama(self):
+        """The removed 'local' provider name no longer triggers ollama."""
         from skills.core.status.handler import _needs_ollama
         with patch("app.provider.get_provider_name", return_value="local"):
-            assert _needs_ollama() is True
+            assert _needs_ollama() is False
 
     def test_ollama_provider_needs_ollama(self):
         from skills.core.status.handler import _needs_ollama
@@ -560,7 +830,7 @@ class TestHandlePingOllama:
             return {"run": 1234, "awake": 5678, "ollama": 9999}.get(name)
 
         with patch("app.pid_manager.check_pidfile", side_effect=mock_check), \
-             patch("app.provider.get_provider_name", return_value="local"):
+             patch("app.provider.get_provider_name", return_value="ollama"):
             result = _handle_ping(ctx)
 
         assert "Ollama: alive (PID 9999)" in result
@@ -576,7 +846,7 @@ class TestHandlePingOllama:
             return {"run": 1234, "awake": 5678}.get(name)
 
         with patch("app.pid_manager.check_pidfile", side_effect=mock_check), \
-             patch("app.provider.get_provider_name", return_value="local"):
+             patch("app.provider.get_provider_name", return_value="ollama"):
             result = _handle_ping(ctx)
 
         assert "Ollama: not running" in result
@@ -613,7 +883,7 @@ class TestHandlePingOllama:
             return {"run": 100, "awake": 200, "ollama": 300}.get(name)
 
         with patch("app.pid_manager.check_pidfile", side_effect=mock_check), \
-             patch("app.provider.get_provider_name", return_value="local"):
+             patch("app.provider.get_provider_name", return_value="ollama"):
             result = _handle_ping(ctx)
 
         assert result.count("✅") == 3
@@ -627,7 +897,7 @@ class TestHandlePingOllama:
         ctx = _make_ctx("ping", tmp_path, tmp_path)
 
         with patch("app.pid_manager.check_pidfile", return_value=None), \
-             patch("app.provider.get_provider_name", return_value="local"):
+             patch("app.provider.get_provider_name", return_value="ollama"):
             result = _handle_ping(ctx)
 
         assert result.count("❌") == 3
@@ -648,7 +918,7 @@ class TestHandleStatusOllama:
         from skills.core.status.handler import _handle_status
         ctx = _make_ctx("status", instance, tmp_path)
 
-        with patch("app.provider.get_provider_name", return_value="local"), \
+        with patch("app.provider.get_provider_name", return_value="ollama"), \
              patch("app.pid_manager.check_pidfile", return_value=4242):
             result = _handle_status(ctx)
 
@@ -661,7 +931,7 @@ class TestHandleStatusOllama:
         from skills.core.status.handler import _handle_status
         ctx = _make_ctx("status", instance, tmp_path)
 
-        with patch("app.provider.get_provider_name", return_value="local"), \
+        with patch("app.provider.get_provider_name", return_value="ollama"), \
              patch("app.pid_manager.check_pidfile", return_value=None):
             result = _handle_status(ctx)
 
@@ -726,3 +996,191 @@ class TestHandleStatusCache:
         ctx = _make_ctx("status", instance, tmp_path)
         result = _handle_status(ctx)
         assert "Cache" not in result
+
+
+# ---------------------------------------------------------------------------
+# Usage staleness check
+# ---------------------------------------------------------------------------
+
+class TestCheckUsageStaleness:
+    """Test _check_usage_staleness() health check."""
+
+    def test_no_usage_file(self, tmp_path):
+        """Missing usage.md warns about 75% default."""
+        from skills.core.status.handler import _check_usage_staleness
+        result = _check_usage_staleness(tmp_path)
+        assert "no data" in result
+        assert "75%" in result
+
+    def test_fresh_usage_file(self, tmp_path):
+        """Recently updated usage.md shows minutes."""
+        usage = tmp_path / "usage.md"
+        usage.write_text("Session (5hr) : 25% (reset in 3h)")
+        from skills.core.status.handler import _check_usage_staleness
+        result = _check_usage_staleness(tmp_path)
+        assert "m old" in result
+        assert "⚠️" not in result
+
+    def test_stale_usage_file(self, tmp_path):
+        """usage.md older than 6h triggers warning with fallback note."""
+        import os
+        usage = tmp_path / "usage.md"
+        usage.write_text("Session (5hr) : 25% (reset in 3h)")
+        # Set mtime to 8 hours ago
+        old_time = __import__("time").time() - 8 * 3600
+        os.utime(usage, (old_time, old_time))
+        from skills.core.status.handler import _check_usage_staleness
+        result = _check_usage_staleness(tmp_path)
+        assert "⚠️" in result
+        assert "stale" in result
+        assert "75% fallback" in result
+
+    def test_moderately_old_usage_file(self, tmp_path):
+        """usage.md between 1h and 6h shows hours without warning."""
+        import os
+        usage = tmp_path / "usage.md"
+        usage.write_text("Session (5hr) : 25% (reset in 3h)")
+        old_time = __import__("time").time() - 3 * 3600
+        os.utime(usage, (old_time, old_time))
+        from skills.core.status.handler import _check_usage_staleness
+        result = _check_usage_staleness(tmp_path)
+        assert "h old" in result
+        assert "⚠️" not in result
+
+
+# ---------------------------------------------------------------------------
+# GitHub notification queue depth check
+# ---------------------------------------------------------------------------
+
+class TestCheckGithubNotifications:
+    """Test _check_github_notifications() health check."""
+
+    def test_zero_notifications(self):
+        """Empty notification list shows 0 unread."""
+        from skills.core.status.handler import _check_github_notifications
+        with patch("app.github.api", return_value="[]"):
+            result = _check_github_notifications()
+        assert result == "📬 GitHub: 0 unread"
+
+    def test_some_notifications(self):
+        """Small number of notifications shows count."""
+        import json
+        from skills.core.status.handler import _check_github_notifications
+        fake = json.dumps([{"id": str(i)} for i in range(5)])
+        with patch("app.github.api", return_value=fake):
+            result = _check_github_notifications()
+        assert result == "📬 GitHub: 5 unread"
+
+    def test_many_notifications_no_warning(self):
+        """20+ unread notifications shows mailbox icon, not warning."""
+        import json
+        from skills.core.status.handler import _check_github_notifications
+        fake = json.dumps([{"id": str(i)} for i in range(25)])
+        with patch("app.github.api", return_value=fake):
+            result = _check_github_notifications()
+        assert "📬" in result
+        assert "⚠️" not in result
+        assert "25 unread" in result
+
+    def test_overflow_notifications(self):
+        """100+ unread shows overflow indicator with mailbox icon."""
+        import json
+        from skills.core.status.handler import _check_github_notifications
+        fake = json.dumps([{"id": str(i)} for i in range(100)])
+        with patch("app.github.api", return_value=fake):
+            result = _check_github_notifications()
+        assert "📬" in result
+        assert "100+" in result
+
+    def test_api_failure_returns_none(self):
+        """API errors produce None (item is silently omitted)."""
+        from skills.core.status.handler import _check_github_notifications
+        with patch("app.github.api", side_effect=RuntimeError("auth failed")):
+            result = _check_github_notifications()
+        assert result is None
+
+    def test_empty_response(self):
+        """Empty string response = 0 unread."""
+        from skills.core.status.handler import _check_github_notifications
+        with patch("app.github.api", return_value=""):
+            result = _check_github_notifications()
+        assert "0 unread" in result
+
+
+# ---------------------------------------------------------------------------
+# _get_version()
+# ---------------------------------------------------------------------------
+
+class TestGetVersion:
+    """Test the _get_version() helper."""
+
+    def test_exact_tag(self):
+        """On exact tag, returns just the tag name."""
+        from skills.core.status.handler import _get_version
+        mock_result = MagicMock(returncode=0, stdout="v0.73\n")
+        with patch("subprocess.run", return_value=mock_result):
+            assert _get_version() == "v0.73"
+
+    def test_ahead_of_tag(self):
+        """Ahead of tag, returns tag@sha +N format."""
+        from skills.core.status.handler import _get_version
+        mock_result = MagicMock(returncode=0, stdout="v0.73-17-g7754a635\n")
+        with patch("subprocess.run", return_value=mock_result):
+            assert _get_version() == "v0.73@7754a635 +17"
+
+    def test_git_failure_returns_empty(self):
+        """git describe failure returns empty string."""
+        from skills.core.status.handler import _get_version
+        mock_result = MagicMock(returncode=128, stdout="")
+        with patch("subprocess.run", return_value=mock_result):
+            assert _get_version() == ""
+
+    def test_exception_returns_empty(self):
+        """Subprocess exception returns empty string."""
+        from skills.core.status.handler import _get_version
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert _get_version() == ""
+
+    def test_version_and_branch_in_status_header(self, tmp_path):
+        """Version and branch appear in Kōan Status header."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_version", return_value="v0.73"), \
+             patch("skills.core.status.handler._get_branch", return_value="main"):
+            result = _handle_status(ctx)
+        assert "◉ Kōan Status (main - v0.73)" in result
+
+    def test_version_only_no_branch(self, tmp_path):
+        """Version without branch omits branch prefix."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_version", return_value="v0.73"), \
+             patch("skills.core.status.handler._get_branch", return_value=""):
+            result = _handle_status(ctx)
+        assert "◉ Kōan Status (v0.73)" in result
+
+    def test_branch_only_no_version(self, tmp_path):
+        """Branch without version shows branch alone."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_version", return_value=""), \
+             patch("skills.core.status.handler._get_branch", return_value="main"):
+            result = _handle_status(ctx)
+        assert "◉ Kōan Status (main)" in result
+
+    def test_no_version_no_branch_no_parens(self, tmp_path):
+        """Empty version and branch = no parentheses in header."""
+        instance = tmp_path / "instance"
+        instance.mkdir()
+        from skills.core.status.handler import _handle_status
+        ctx = _make_ctx("status", instance, tmp_path)
+        with patch("skills.core.status.handler._get_version", return_value=""), \
+             patch("skills.core.status.handler._get_branch", return_value=""):
+            result = _handle_status(ctx)
+        assert "◉ Kōan Status\n" in result

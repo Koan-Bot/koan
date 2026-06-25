@@ -1,6 +1,8 @@
 """Tests for github_notifications.py — notification fetching, parsing, reactions."""
 
 import json
+import logging
+import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -9,23 +11,35 @@ import pytest
 
 from app.github import SSOAuthRequired
 from app.github_notifications import (
+    SSO_ESCALATION_THRESHOLD,
     FetchResult,
+    NotificationTracker,
+    _FETCH_FAILURE_THRESHOLD,
+    _default_tracker,
     _processed_comments,
     _reactions_endpoint,
     _search_comments_for_mention,
     add_reaction,
     api_url_to_web_url,
     check_already_processed,
+    check_sso_escalation,
     check_user_permission,
+    reset_consecutive_sso_state,
     extract_comment_metadata,
     fetch_unread_notifications,
+    find_all_mentions_in_thread,
     find_mention_in_thread,
     get_comment_from_notification,
+    search_all_comments_for_mentions,
+    get_consecutive_sso_failures,
+    get_fetch_failure_count,
     get_sso_failure_count,
     is_notification_stale,
     is_self_mention,
     parse_mention_command,
+    reset_fetch_failure_count,
     reset_sso_failure_count,
+    update_consecutive_sso_failures,
 )
 
 
@@ -72,12 +86,47 @@ class TestParseMentionCommand:
     def test_mention_with_surrounding_text(self):
         body = "Hey can you please @bot rebase this PR? Thanks!"
         result = parse_mention_command(body, "bot")
-        assert result == ("rebase", "this PR? Thanks!")
+        assert result is not None
+        assert result[0] == "rebase"
+        # Surrounding text from the comment is captured as context
+        assert "this PR? Thanks!" in result[1]
+        assert "Hey can you please" in result[1]
 
     def test_multiple_mentions_first_wins(self):
         body = "@bot rebase\n@bot review"
         result = parse_mention_command(body, "bot")
-        assert result == ("rebase", "")
+        assert result is not None
+        assert result[0] == "rebase"
+        # Second mention becomes part of the context
+        assert "@bot review" in result[1]
+
+    def test_context_from_text_before_mention(self):
+        """Text before the @mention should be captured as context."""
+        body = (
+            "Let's add a config option for this.\n"
+            "It should be enabled by default.\n\n"
+            "@bot rebase"
+        )
+        result = parse_mention_command(body, "bot")
+        assert result is not None
+        assert result[0] == "rebase"
+        assert "config option" in result[1]
+        assert "enabled by default" in result[1]
+
+    def test_command_with_slash_prefix(self):
+        """Users often type @bot /command (Telegram habit) — slash must be stripped."""
+        result = parse_mention_command("@bot /squash", "bot")
+        assert result == ("squash", "")
+
+    def test_command_with_slash_prefix_and_url(self):
+        result = parse_mention_command(
+            "@koan /squash https://github.com/owner/repo/pull/42", "koan"
+        )
+        assert result == ("squash", "https://github.com/owner/repo/pull/42")
+
+    def test_command_with_slash_prefix_and_context(self):
+        result = parse_mention_command("@bot /plan fix the login page", "bot")
+        assert result == ("plan", "fix the login page")
 
 
 class TestApiUrlToWebUrl:
@@ -115,15 +164,83 @@ class TestFetchUnreadNotifications:
 
     @patch("app.github_notifications.api")
     def test_filters_by_known_repos(self, mock_api):
+        """Non-mention reasons are filtered by known_repos; mentions bypass."""
         notifications = [
-            {"reason": "mention", "repository": {"full_name": "owner/repo"}},
-            {"reason": "mention", "repository": {"full_name": "other/repo"}},
+            {"reason": "comment", "repository": {"full_name": "owner/repo"}},
+            {"reason": "comment", "repository": {"full_name": "other/repo"}},
         ]
         mock_api.return_value = json.dumps(notifications)
 
         result = fetch_unread_notifications(known_repos={"owner/repo"})
         assert len(result.actionable) == 1
         assert result.actionable[0]["repository"]["full_name"] == "owner/repo"
+
+    @patch("app.github_notifications.api")
+    def test_mention_filtered_by_known_repos(self, mock_api):
+        """All reasons including direct @mentions are filtered by known_repos.
+
+        When a GitHub account is shared by multiple instances, each instance
+        must only process notifications for its own registered projects.
+        """
+        notifications = [
+            {"reason": "mention", "repository": {"full_name": "unknown/repo"}},
+            {"reason": "comment", "repository": {"full_name": "unknown/repo"}},
+            {"reason": "mention", "repository": {"full_name": "owner/repo"}},
+        ]
+        mock_api.return_value = json.dumps(notifications)
+
+        result = fetch_unread_notifications(known_repos={"owner/repo"})
+        assert len(result.actionable) == 1
+        assert result.actionable[0]["repository"]["full_name"] == "owner/repo"
+        # Verify skipped mentions are tracked in skipped_repos
+        assert "unknown/repo" in result.skipped_repos
+        # Verify skipped_mention_repos tracks mention-specific skips with counts
+        assert "unknown/repo" in result.skipped_mention_repos
+        assert result.skipped_mention_repos["unknown/repo"] == 1
+
+    @patch("app.github_notifications.api")
+    def test_skipped_mention_repos_counts_multiple(self, mock_api):
+        """Multiple @mentions from the same unregistered repo are counted."""
+        notifications = [
+            {"reason": "mention", "repository": {"full_name": "other/repo"}},
+            {"reason": "mention", "repository": {"full_name": "other/repo"}},
+            {"reason": "comment", "repository": {"full_name": "other/repo"}},
+            {"reason": "team_mention", "repository": {"full_name": "third/repo"}},
+        ]
+        mock_api.return_value = json.dumps(notifications)
+
+        result = fetch_unread_notifications(known_repos={"owner/repo"})
+        assert result.skipped_mention_repos == {"other/repo": 2, "third/repo": 1}
+        assert len(result.skipped_repos) == 4
+
+    @patch("app.github_notifications.api")
+    def test_skipped_notifications_collects_full_objects(self, mock_api):
+        """skipped_notifications contains full notification dicts for draining."""
+        notifs = [
+            {"id": "1", "reason": "mention", "repository": {"full_name": "foreign/repo"}},
+            {"id": "2", "reason": "ci_activity", "repository": {"full_name": "foreign/repo"}},
+            {"id": "3", "reason": "mention", "repository": {"full_name": "owner/repo"}},
+        ]
+        mock_api.return_value = json.dumps(notifs)
+
+        result = fetch_unread_notifications(known_repos={"owner/repo"})
+        assert len(result.skipped_notifications) == 2
+        assert result.skipped_notifications[0]["id"] == "1"
+        assert result.skipped_notifications[1]["id"] == "2"
+        # The known-repo notification should not be skipped
+        assert len(result.actionable) == 1
+
+    @patch("app.github_notifications.api")
+    def test_skipped_notifications_empty_without_known_repos(self, mock_api):
+        """Without known_repos filter, no notifications are skipped."""
+        notifs = [
+            {"id": "1", "reason": "mention", "repository": {"full_name": "any/repo"}},
+        ]
+        mock_api.return_value = json.dumps(notifs)
+
+        result = fetch_unread_notifications(known_repos=None)
+        assert result.skipped_notifications == []
+        assert len(result.actionable) == 1
 
     @patch("app.github_notifications.api")
     def test_handles_api_error(self, mock_api):
@@ -237,23 +354,41 @@ class TestFetchUnreadNotifications:
             {"reason": "review_requested", "repository": {"full_name": "o/r"}},
             {"reason": "subscribed", "repository": {"full_name": "o/r"}},
             {"reason": "team_mention", "repository": {"full_name": "o/r"}},
-            {"reason": "ci_activity", "repository": {"full_name": "o/r"}},
             {"reason": "assign", "repository": {"full_name": "o/r"}},
+            {"reason": "ci_activity", "repository": {"full_name": "o/r"}},
+            {"reason": "state_change", "repository": {"full_name": "o/r"}},
         ]
         mock_api.return_value = json.dumps(notifications)
 
         result = fetch_unread_notifications()
-        assert len(result.actionable) == 6
-        assert len(result.drain) == 2  # ci_activity, assign
+        assert len(result.actionable) == 7
+        assert len(result.drain) == 2  # ci_activity, state_change
         actionable_reasons = {n["reason"] for n in result.actionable}
         assert actionable_reasons == {
             "mention", "author", "comment",
-            "review_requested", "subscribed", "team_mention",
+            "review_requested", "subscribed", "team_mention", "assign",
         }
 
     @patch("app.github_notifications.api")
-    def test_unknown_repo_skipped_entirely(self, mock_api):
-        """Notifications from unknown repos appear in neither actionable nor drain."""
+    def test_unknown_repo_non_mention_skipped(self, mock_api):
+        """Non-mention notifications from unknown repos are skipped entirely."""
+        notifications = [
+            {"reason": "ci_activity", "repository": {"full_name": "unknown/repo"}},
+            {"reason": "author", "repository": {"full_name": "unknown/repo"}},
+        ]
+        mock_api.return_value = json.dumps(notifications)
+
+        result = fetch_unread_notifications(known_repos={"owner/repo"})
+        assert result.actionable == []
+        assert result.drain == []
+
+    @patch("app.github_notifications.api")
+    def test_unknown_repo_mention_also_filtered(self, mock_api):
+        """Mention notifications from unknown repos are filtered out too.
+
+        When a GitHub account is shared by multiple instances, all notifications
+        (including direct @mentions) must be filtered by known repos.
+        """
         notifications = [
             {"reason": "mention", "repository": {"full_name": "unknown/repo"}},
             {"reason": "ci_activity", "repository": {"full_name": "unknown/repo"}},
@@ -374,6 +509,28 @@ class TestCheckAlreadyProcessed:
         mock_api.side_effect = RuntimeError("fail")
         assert check_already_processed("999", "bot", "owner", "repo") is False
 
+    @patch("app.github_notifications.api")
+    def test_api_error_logs_warning(self, mock_api, caplog):
+        """API errors must be logged so dedup failures are visible."""
+        mock_api.side_effect = RuntimeError("connection reset")
+        with caplog.at_level(logging.WARNING, logger="app.github_notifications"):
+            check_already_processed("999", "bot", "owner", "repo")
+        assert any("999" in r.message for r in caplog.records
+                    if r.levelno >= logging.WARNING)
+
+    @patch("app.github_notifications.api")
+    def test_timeout_caught_not_raised(self, mock_api):
+        """TimeoutExpired must be caught, not propagate to caller."""
+        mock_api.side_effect = subprocess.TimeoutExpired(cmd="gh", timeout=30)
+        # Must not raise — should return False
+        assert check_already_processed("timeout1", "bot", "owner", "repo") is False
+
+    @patch("app.github_notifications.api")
+    def test_os_error_caught_not_raised(self, mock_api):
+        """OSError must be caught, not propagate to caller."""
+        mock_api.side_effect = OSError("network unreachable")
+        assert check_already_processed("os1", "bot", "owner", "repo") is False
+
 
 class TestAddReaction:
     def setup_method(self):
@@ -390,8 +547,23 @@ class TestAddReaction:
         mock_api.side_effect = RuntimeError("fail")
         assert add_reaction("owner", "repo", "123") is False
 
+    @patch("app.github_notifications.api")
+    def test_failure_still_marks_processed(self, mock_api):
+        """Even when reaction API fails, comment must be in _processed_comments.
+
+        The caller has already persisted the mission — the reaction is just
+        an acknowledgment. Without in-memory marking, the next poll cycle
+        treats the comment as unprocessed and creates a duplicate mission.
+        """
+        mock_api.side_effect = RuntimeError("API error")
+        add_reaction("owner", "repo", "dup1")
+        assert "dup1" in _processed_comments
+
 
 class TestCheckUserPermission:
+    def setup_method(self):
+        _default_tracker.permission_cache.clear()
+
     @patch("app.github_notifications.api")
     def test_wildcard_with_write_access(self, mock_api):
         mock_api.return_value = json.dumps({"permission": "write"})
@@ -417,6 +589,48 @@ class TestCheckUserPermission:
         """Explicit user in allowlist returns True without any GitHub API call."""
         assert check_user_permission("o", "r", "bob", ["alice", "bob"]) is True
         mock_api.assert_not_called()
+
+    @patch("app.github_notifications.api")
+    def test_wildcard_caches_result(self, mock_api):
+        """Second call with same owner/repo/user hits cache and skips API."""
+        mock_api.return_value = json.dumps({"permission": "write"})
+        assert check_user_permission("o", "r", "alice", ["*"]) is True
+        assert check_user_permission("o", "r", "alice", ["*"]) is True
+        mock_api.assert_called_once()
+
+    @patch("app.github_notifications.api")
+    def test_wildcard_cache_respects_different_keys(self, mock_api):
+        """Different owner/repo/user combinations each trigger a separate API call."""
+        mock_api.side_effect = [
+            json.dumps({"permission": "write"}),
+            json.dumps({"permission": "read"}),
+        ]
+        assert check_user_permission("o1", "r1", "alice", ["*"]) is True
+        assert check_user_permission("o2", "r2", "alice", ["*"]) is False
+        assert mock_api.call_count == 2
+
+    @patch("app.github_notifications.api")
+    def test_wildcard_cache_expires_after_ttl(self, mock_api):
+        """Cached entry expires after TTL and triggers a fresh API call."""
+        mock_api.return_value = json.dumps({"permission": "write"})
+        with patch("app.response_cache.time.monotonic", return_value=0.0):
+            assert check_user_permission("o", "r", "alice", ["*"]) is True
+            assert mock_api.call_count == 1
+        # Advance past default TTL (300s) + 1s margin
+        with patch("app.response_cache.time.monotonic", return_value=301.0):
+            assert check_user_permission("o", "r", "alice", ["*"]) is True
+            assert mock_api.call_count == 2
+
+    @patch("app.github_notifications.api")
+    def test_wildcard_cache_does_not_cache_errors(self, mock_api):
+        """Failed permission checks (API errors) are not cached."""
+        mock_api.side_effect = RuntimeError("API down")
+        assert check_user_permission("o", "r", "alice", ["*"]) is False
+        # Second call should retry the API
+        mock_api.side_effect = None
+        mock_api.return_value = json.dumps({"permission": "write"})
+        assert check_user_permission("o", "r", "alice", ["*"]) is True
+        assert mock_api.call_count == 2
 
 
 class TestIsNotificationStale:
@@ -526,6 +740,15 @@ class TestCheckAlreadyProcessedWithUrl:
     def setup_method(self):
         _processed_comments.clear()
 
+    @pytest.fixture(autouse=True)
+    def _no_persistent_tracker(self, monkeypatch):
+        """These tests verify reactions-endpoint selection, which is
+        independent of the persistent comment tracker. Clear KOAN_ROOT so a
+        comment id already recorded on disk (the tracker file is shared across
+        runs) can't short-circuit check_already_processed before the API call.
+        """
+        monkeypatch.delenv("KOAN_ROOT", raising=False)
+
     @patch("app.github_notifications.api")
     def test_pr_review_comment_uses_correct_endpoint(self, mock_api):
         """PR review comments should use pulls/comments endpoint."""
@@ -537,7 +760,8 @@ class TestCheckAlreadyProcessedWithUrl:
                                           comment_api_url=url)
         assert result is True
         mock_api.assert_called_once_with(
-            "repos/owner/repo/pulls/comments/42/reactions"
+            "repos/owner/repo/pulls/comments/42/reactions",
+            timeout=30,
         )
 
     @patch("app.github_notifications.api")
@@ -551,7 +775,8 @@ class TestCheckAlreadyProcessedWithUrl:
                                           comment_api_url=url)
         assert result is True
         mock_api.assert_called_once_with(
-            "repos/owner/repo/issues/comments/99/reactions"
+            "repos/owner/repo/issues/comments/99/reactions",
+            timeout=30,
         )
 
     @patch("app.github_notifications.api")
@@ -561,7 +786,8 @@ class TestCheckAlreadyProcessedWithUrl:
 
         check_already_processed("50", "bot", "owner", "repo")
         mock_api.assert_called_once_with(
-            "repos/owner/repo/issues/comments/50/reactions"
+            "repos/owner/repo/issues/comments/50/reactions",
+            timeout=30,
         )
 
 
@@ -583,6 +809,7 @@ class TestAddReactionWithUrl:
             "repos/owner/repo/pulls/comments/77/reactions",
             method="POST",
             extra_args=["-f", "content=+1"],
+            timeout=30,
         )
 
     @patch("app.github_notifications.api")
@@ -597,6 +824,7 @@ class TestAddReactionWithUrl:
             "repos/o/r/issues/comments/88/reactions",
             method="POST",
             extra_args=["-f", "content=eyes"],
+            timeout=30,
         )
 
     @patch("app.github_notifications.api")
@@ -608,6 +836,7 @@ class TestAddReactionWithUrl:
             "repos/owner/repo/issues/comments/33/reactions",
             method="POST",
             extra_args=["-f", "content=+1"],
+            timeout=30,
         )
 
 
@@ -691,7 +920,7 @@ class TestFindMentionInThread:
             },
         }
 
-    @patch("app.github_notifications.check_already_processed", return_value=False)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
     @patch("app.github_notifications.api")
     def test_finds_unprocessed_mention(self, mock_api, mock_processed, notification):
         """Should return the first unprocessed @mention by a non-bot user."""
@@ -707,7 +936,7 @@ class TestFindMentionInThread:
         assert result is not None
         assert result["id"] == 200
 
-    @patch("app.github_notifications.check_already_processed", return_value=True)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=True)
     @patch("app.github_notifications.api")
     def test_skips_already_processed_mention(self, mock_api, mock_processed, notification):
         """Should skip mentions that already have a bot reaction."""
@@ -760,7 +989,7 @@ class TestFindMentionInThread:
         result = find_mention_in_thread(notif, "Koan-Bot")
         assert result is None
 
-    @patch("app.github_notifications.check_already_processed", return_value=False)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
     @patch("app.github_notifications.api")
     def test_case_insensitive_mention_matching(self, mock_api, mock_processed, notification):
         """Should match @mentions case-insensitively."""
@@ -798,7 +1027,7 @@ class TestFindMentionInThread:
         call_args = mock_api.call_args[0][0]
         assert "repos/owner/repo/issues/42/comments" in call_args
 
-    @patch("app.github_notifications.check_already_processed", return_value=False)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
     @patch("app.github_notifications.api")
     def test_searches_pr_review_comments(self, mock_api, mock_processed, notification):
         """Should search PR review comments when issue comments have no @mention."""
@@ -820,7 +1049,7 @@ class TestFindMentionInThread:
         assert "issues/208/comments" in calls[0]
         assert "pulls/208/comments" in calls[1]
 
-    @patch("app.github_notifications.check_already_processed", return_value=False)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
     @patch("app.github_notifications.api")
     def test_issue_comments_checked_before_review_comments(self, mock_api, mock_processed, notification):
         """Should prefer issue comment @mention over PR review comment @mention."""
@@ -862,7 +1091,7 @@ class TestFindMentionInThread:
 class TestSearchCommentsForMention:
     """Tests for _search_comments_for_mention helper."""
 
-    @patch("app.github_notifications.check_already_processed", return_value=False)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
     def test_finds_mention(self, mock_processed):
         comments = [
             {"id": 1, "url": "u/1", "body": "@bot rebase", "user": {"login": "alice"}},
@@ -878,7 +1107,7 @@ class TestSearchCommentsForMention:
         result = _search_comments_for_mention(comments, "bot", "owner", "repo")
         assert result is None
 
-    @patch("app.github_notifications.check_already_processed", return_value=True)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=True)
     def test_skips_processed_comments(self, mock_processed):
         comments = [
             {"id": 1, "url": "u/1", "body": "@bot rebase", "user": {"login": "alice"}},
@@ -897,13 +1126,126 @@ class TestSearchCommentsForMention:
         result = _search_comments_for_mention([], "bot", "owner", "repo")
         assert result is None
 
-    @patch("app.github_notifications.check_already_processed", return_value=False)
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
     def test_case_insensitive(self, mock_processed):
         comments = [
             {"id": 1, "url": "u/1", "body": "@BOT rebase", "user": {"login": "alice"}},
         ]
         result = _search_comments_for_mention(comments, "bot", "owner", "repo")
         assert result is not None
+
+
+class TestSearchAllCommentsForMentions:
+    """Tests for search_all_comments_for_mentions — returns ALL matches, not just first."""
+
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
+    def test_returns_all_mentions(self, mock_processed):
+        comments = [
+            {"id": 1, "url": "u/1", "body": "@bot review", "user": {"login": "alice"}},
+            {"id": 2, "url": "u/2", "body": "no mention here", "user": {"login": "bob"}},
+            {"id": 3, "url": "u/3", "body": "@bot rebase", "user": {"login": "alice"}},
+        ]
+        result = search_all_comments_for_mentions(comments, "bot", "owner", "repo")
+        assert len(result) == 2
+        assert result[0]["id"] == 1
+        assert result[1]["id"] == 3
+
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
+    def test_skips_bot_own_comments(self, mock_processed):
+        comments = [
+            {"id": 1, "url": "u/1", "body": "@bot review", "user": {"login": "bot"}},
+            {"id": 2, "url": "u/2", "body": "@bot rebase", "user": {"login": "alice"}},
+        ]
+        result = search_all_comments_for_mentions(comments, "bot", "owner", "repo")
+        assert len(result) == 1
+        assert result[0]["id"] == 2
+
+    def test_empty_list(self):
+        result = search_all_comments_for_mentions([], "bot", "owner", "repo")
+        assert result == []
+
+
+class TestFindAllMentionsInThread:
+    """Tests for find_all_mentions_in_thread — full thread search returning all mentions."""
+
+    @patch("app.github_notifications.api")
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
+    def test_finds_all_mentions_sorted_by_time(self, mock_processed, mock_api):
+        notification = {
+            "subject": {
+                "url": "https://api.github.com/repos/owner/repo/pulls/42",
+            },
+        }
+        issue_comments = json.dumps([
+            {"id": 2, "url": "u/2", "body": "@bot rebase",
+             "user": {"login": "alice"}, "created_at": "2026-06-18T10:01:00Z"},
+            {"id": 1, "url": "u/1", "body": "@bot review",
+             "user": {"login": "alice"}, "created_at": "2026-06-18T10:00:00Z"},
+        ])
+        pr_comments = json.dumps([])
+        mock_api.side_effect = [issue_comments, pr_comments]
+
+        result = find_all_mentions_in_thread(notification, "bot")
+
+        assert len(result) == 2
+        assert result[0]["id"] == 1
+        assert result[1]["id"] == 2
+
+    @patch("app.github_notifications.api")
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
+    def test_deduplicates_across_endpoints(self, mock_processed, mock_api):
+        notification = {
+            "subject": {
+                "url": "https://api.github.com/repos/owner/repo/pulls/42",
+            },
+        }
+        comment = {"id": 1, "url": "u/1", "body": "@bot review",
+                   "user": {"login": "alice"}, "created_at": "2026-06-18T10:00:00Z"}
+        mock_api.side_effect = [json.dumps([comment]), json.dumps([comment])]
+
+        result = find_all_mentions_in_thread(notification, "bot")
+        assert len(result) == 1
+
+    def test_returns_empty_for_no_subject_url(self):
+        notification = {"subject": {}}
+        result = find_all_mentions_in_thread(notification, "bot")
+        assert result == []
+
+    @patch("app.github_notifications.api")
+    @patch.object(NotificationTracker, "check_already_processed", return_value=False)
+    def test_warns_on_truncated_comment_list(self, mock_processed, mock_api, caplog):
+        notification = {
+            "subject": {
+                "url": "https://api.github.com/repos/owner/repo/issues/10",
+            },
+        }
+        comments = [
+            {"id": i, "url": f"u/{i}", "body": "@bot review",
+             "user": {"login": "alice"}, "created_at": f"2026-06-18T10:{i:02d}:00Z"}
+            for i in range(100)
+        ]
+        mock_api.return_value = json.dumps(comments)
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            find_all_mentions_in_thread(notification, "bot")
+
+        assert any("Truncated comment list" in r.message for r in caplog.records)
+
+    @patch("app.github_notifications.api", side_effect=RuntimeError("timeout"))
+    def test_warns_when_all_endpoints_fail(self, mock_api, caplog):
+        notification = {
+            "subject": {
+                "url": "https://api.github.com/repos/owner/repo/pulls/5",
+            },
+        }
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = find_all_mentions_in_thread(notification, "bot")
+
+        assert result == []
+        assert any("all endpoints failed" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -913,9 +1255,11 @@ class TestSearchCommentsForMention:
 class TestSSOFailureTracking:
     def setup_method(self):
         reset_sso_failure_count()
+        reset_consecutive_sso_state()
 
     def teardown_method(self):
         reset_sso_failure_count()
+        reset_consecutive_sso_state()
 
     @patch("app.github_notifications.api")
     def test_get_comment_sso_failure_records_count(self, mock_api):
@@ -972,3 +1316,273 @@ class TestSSOFailureTracking:
         })
         check_already_processed("123", "bot", "org", "repo")
         assert get_sso_failure_count() == 2
+
+
+class TestConsecutiveFetchFailures:
+    """Tests for fetch failure escalation: debug → warning after threshold."""
+
+    def setup_method(self):
+        reset_fetch_failure_count()
+
+    def teardown_method(self):
+        reset_fetch_failure_count()
+
+    @patch("app.github_notifications.api")
+    def test_single_failure_stays_debug(self, mock_api, caplog):
+        """Below threshold, failures log at debug only."""
+        mock_api.side_effect = RuntimeError("timeout")
+        with caplog.at_level(logging.DEBUG, logger="app.github_notifications"):
+            fetch_unread_notifications()
+
+        assert get_fetch_failure_count() == 1
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @patch("app.github_notifications.api")
+    def test_threshold_triggers_warning(self, mock_api, caplog):
+        """After _FETCH_FAILURE_THRESHOLD consecutive failures, log at WARNING."""
+        mock_api.side_effect = RuntimeError("network error")
+        with caplog.at_level(logging.DEBUG, logger="app.github_notifications"):
+            for _ in range(_FETCH_FAILURE_THRESHOLD):
+                fetch_unread_notifications()
+
+        assert get_fetch_failure_count() == _FETCH_FAILURE_THRESHOLD
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "consecutive fetch failures" in warnings[0].message
+
+    @patch("app.github_notifications._send_fetch_failure_alert")
+    @patch("app.github_notifications.api")
+    def test_outbox_alert_sent_once(self, mock_api, mock_alert):
+        """Outbox alert fires once at threshold, not on subsequent failures."""
+        mock_api.side_effect = RuntimeError("down")
+        for _ in range(_FETCH_FAILURE_THRESHOLD + 2):
+            fetch_unread_notifications()
+
+        assert mock_alert.call_count == 1
+
+    @patch("app.github_notifications._send_fetch_failure_alert")
+    @patch("app.github_notifications.api")
+    def test_success_resets_counter(self, mock_api, mock_alert):
+        """A successful fetch resets the failure counter."""
+        # Accumulate failures just below threshold
+        mock_api.side_effect = RuntimeError("err")
+        for _ in range(_FETCH_FAILURE_THRESHOLD - 1):
+            fetch_unread_notifications()
+        assert get_fetch_failure_count() == _FETCH_FAILURE_THRESHOLD - 1
+
+        # Successful fetch resets
+        mock_api.side_effect = None
+        mock_api.return_value = json.dumps([])
+        fetch_unread_notifications()
+        assert get_fetch_failure_count() == 0
+        mock_alert.assert_not_called()
+
+    @patch("app.github_notifications._send_fetch_failure_alert")
+    @patch("app.github_notifications.api")
+    def test_recovery_after_alert_allows_new_alert(self, mock_api, mock_alert):
+        """After recovery and new failure streak, a new alert can fire."""
+        # First streak: hit threshold
+        mock_api.side_effect = RuntimeError("err")
+        for _ in range(_FETCH_FAILURE_THRESHOLD):
+            fetch_unread_notifications()
+        assert mock_alert.call_count == 1
+
+        # Recover
+        mock_api.side_effect = None
+        mock_api.return_value = json.dumps([])
+        fetch_unread_notifications()
+
+        # Second streak
+        mock_api.side_effect = RuntimeError("err again")
+        for _ in range(_FETCH_FAILURE_THRESHOLD):
+            fetch_unread_notifications()
+        assert mock_alert.call_count == 2
+
+    @patch("app.github_notifications.api")
+    def test_empty_response_counts_as_failure(self, mock_api):
+        """Empty API response increments the failure counter."""
+        mock_api.return_value = ""
+        fetch_unread_notifications()
+        assert get_fetch_failure_count() == 1
+
+    @patch("app.github_notifications.api")
+    def test_invalid_json_counts_as_failure(self, mock_api):
+        """Invalid JSON increments the failure counter."""
+        mock_api.return_value = "not json"
+        fetch_unread_notifications()
+        assert get_fetch_failure_count() == 1
+
+    @patch("app.github_notifications.api")
+    def test_unexpected_type_counts_as_failure(self, mock_api):
+        """Non-list JSON response increments the failure counter."""
+        mock_api.return_value = json.dumps({"error": "bad"})
+        fetch_unread_notifications()
+        assert get_fetch_failure_count() == 1
+
+    @patch("app.github_notifications.api")
+    def test_send_fetch_failure_alert_writes_outbox(self, mock_api, tmp_path):
+        """_send_fetch_failure_alert writes to outbox.md."""
+        instance_dir = tmp_path / "instance"
+        instance_dir.mkdir()
+        outbox = instance_dir / "outbox.md"
+        outbox.write_text("")
+
+        with patch.dict(os.environ, {"KOAN_ROOT": str(tmp_path)}):
+            from app.github_notifications import _send_fetch_failure_alert
+            result = _send_fetch_failure_alert(3, "network error")
+
+        assert result is True
+        content = outbox.read_text()
+        assert "failed 3 times" in content
+        assert "network error" in content
+
+    @patch("app.github_notifications.api")
+    def test_send_fetch_failure_alert_returns_false_on_error(self, mock_api, tmp_path):
+        """_send_fetch_failure_alert returns False when outbox write fails."""
+        with patch.dict(os.environ, {"KOAN_ROOT": str(tmp_path)}):
+            from app.github_notifications import _send_fetch_failure_alert
+            # instance/ dir doesn't exist — early return False
+            result = _send_fetch_failure_alert(3, "network error")
+        assert result is False
+
+    @patch("app.github_notifications.api")
+    def test_alert_retries_after_outbox_write_failure(self, mock_api):
+        """If outbox write fails, flag should NOT be stuck True — next
+        threshold hit must retry the alert."""
+        mock_api.side_effect = RuntimeError("down")
+
+        # Patch _send_fetch_failure_alert to simulate outbox write failure
+        # then success on second call
+        with patch(
+            "app.github_notifications._send_fetch_failure_alert",
+            side_effect=[False, True],
+        ) as mock_alert:
+            # First streak hits threshold — alert "fails" (returns False)
+            for _ in range(_FETCH_FAILURE_THRESHOLD):
+                fetch_unread_notifications()
+            assert mock_alert.call_count == 1
+
+            # Next failure should retry alert since previous one failed
+            fetch_unread_notifications()
+            assert mock_alert.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Consecutive SSO failure tracking and escalation
+# ---------------------------------------------------------------------------
+
+class TestConsecutiveSSOFailures:
+    def setup_method(self):
+        reset_sso_failure_count()
+        reset_consecutive_sso_state()
+
+    def teardown_method(self):
+        reset_sso_failure_count()
+        reset_consecutive_sso_state()
+
+    def test_consecutive_counter_accumulates_across_cycles(self):
+        from app.github_notifications import _record_sso_failure
+
+        # Cycle 1: 2 failures
+        _record_sso_failure("a")
+        _record_sso_failure("b")
+        update_consecutive_sso_failures()
+        assert get_consecutive_sso_failures() == 2
+
+        # Cycle 2: reset per-cycle, add 1 more failure
+        reset_sso_failure_count()
+        _record_sso_failure("c")
+        update_consecutive_sso_failures()
+        assert get_consecutive_sso_failures() == 3
+
+    def test_clean_cycle_resets_consecutive_counter(self):
+        from app.github_notifications import _record_sso_failure
+
+        # Build up failures
+        _record_sso_failure("a")
+        _record_sso_failure("b")
+        update_consecutive_sso_failures()
+        assert get_consecutive_sso_failures() == 2
+
+        # Clean cycle
+        reset_sso_failure_count()
+        update_consecutive_sso_failures()
+        assert get_consecutive_sso_failures() == 0
+
+    def test_escalation_below_threshold_returns_false(self, monkeypatch):
+        from app.github_notifications import _record_sso_failure
+        monkeypatch.setenv("KOAN_ROOT", "/tmp/test-koan")
+
+        # Only 2 failures, below threshold of 5
+        _record_sso_failure("a")
+        _record_sso_failure("b")
+        update_consecutive_sso_failures()
+        assert check_sso_escalation() is False
+
+    def test_escalation_at_threshold_writes_outbox(self, monkeypatch):
+        from app.github_notifications import _record_sso_failure
+        monkeypatch.setenv("KOAN_ROOT", "/tmp/test-koan")
+
+        # Accumulate SSO_ESCALATION_THRESHOLD failures
+        for i in range(SSO_ESCALATION_THRESHOLD):
+            _record_sso_failure(f"fail-{i}")
+        update_consecutive_sso_failures()
+
+        with patch("app.utils.append_to_outbox") as mock_outbox:
+            result = check_sso_escalation()
+            assert result is True
+            mock_outbox.assert_called_once()
+            msg = mock_outbox.call_args[0][1]
+            assert "SSO" in msg
+            assert "gh auth refresh" in msg
+            assert str(SSO_ESCALATION_THRESHOLD) in msg
+
+    def test_escalation_fires_only_once_per_streak(self, monkeypatch):
+        from app.github_notifications import _record_sso_failure
+        monkeypatch.setenv("KOAN_ROOT", "/tmp/test-koan")
+
+        for i in range(SSO_ESCALATION_THRESHOLD):
+            _record_sso_failure(f"fail-{i}")
+        update_consecutive_sso_failures()
+
+        with patch("app.utils.append_to_outbox") as mock_outbox:
+            assert check_sso_escalation() is True
+            assert check_sso_escalation() is False  # second call suppressed
+            assert mock_outbox.call_count == 1
+
+    def test_escalation_rearms_after_clean_cycle(self, monkeypatch):
+        from app.github_notifications import _record_sso_failure
+        monkeypatch.setenv("KOAN_ROOT", "/tmp/test-koan")
+
+        # First streak
+        for i in range(SSO_ESCALATION_THRESHOLD):
+            _record_sso_failure(f"fail-{i}")
+        update_consecutive_sso_failures()
+
+        with patch("app.utils.append_to_outbox"):
+            check_sso_escalation()
+
+        # Clean cycle resets everything
+        reset_sso_failure_count()
+        update_consecutive_sso_failures()
+
+        # New streak
+        for i in range(SSO_ESCALATION_THRESHOLD):
+            reset_sso_failure_count()
+            _record_sso_failure(f"fail2-{i}")
+            update_consecutive_sso_failures()
+
+        with patch("app.utils.append_to_outbox") as mock_outbox:
+            assert check_sso_escalation() is True
+            mock_outbox.assert_called_once()
+
+    def test_no_escalation_without_koan_root(self, monkeypatch):
+        from app.github_notifications import _record_sso_failure
+        monkeypatch.delenv("KOAN_ROOT", raising=False)
+
+        for i in range(SSO_ESCALATION_THRESHOLD):
+            _record_sso_failure(f"fail-{i}")
+        update_consecutive_sso_failures()
+
+        # KOAN_ROOT not set — should return False gracefully
+        assert check_sso_escalation() is False

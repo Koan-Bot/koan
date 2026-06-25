@@ -15,9 +15,14 @@ from app.recurring import (
     format_recurring_list,
     is_due,
     check_and_inject,
+    force_run,
     parse_at_time,
     parse_interval,
     format_interval,
+    parse_days,
+    toggle_recurring,
+    set_days,
+    _matches_day,
     FREQUENCIES,
 )
 
@@ -108,8 +113,9 @@ class TestRemoveRecurring:
 
     def test_remove_by_number(self, tmp_path):
         f = self._setup(tmp_path)
+        # Sorted display order: 1=hourly(check PRs), 2=daily(check emails), 3=weekly(security audit)
         removed = remove_recurring(f, "1")
-        assert "check emails" in removed
+        assert "check PRs" in removed
         assert len(load_recurring(f)) == 2
 
     def test_remove_by_keyword(self, tmp_path):
@@ -158,7 +164,7 @@ class TestListRecurring:
         result = list_recurring(f)
         assert [m["frequency"] for m in result] == ["hourly", "daily", "weekly"]
 
-    def test_excludes_disabled(self, tmp_path):
+    def test_includes_disabled_by_default(self, tmp_path):
         f = tmp_path / "recurring.json"
         missions = [
             {"id": "1", "frequency": "daily", "text": "active", "enabled": True},
@@ -166,6 +172,16 @@ class TestListRecurring:
         ]
         save_recurring(f, missions)
         result = list_recurring(f)
+        assert len(result) == 2
+
+    def test_excludes_disabled_when_requested(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        missions = [
+            {"id": "1", "frequency": "daily", "text": "active", "enabled": True},
+            {"id": "2", "frequency": "daily", "text": "disabled", "enabled": False},
+        ]
+        save_recurring(f, missions)
+        result = list_recurring(f, include_disabled=False)
         assert len(result) == 1
         assert result[0]["text"] == "active"
 
@@ -722,3 +738,258 @@ class TestRecurringSchedulerCLI:
             cwd=str(Path(__file__).parent.parent),
         )
         assert result.returncode == 0
+
+
+# --- parse_days ---
+
+class TestParseDays:
+    def test_weekdays(self):
+        assert parse_days("weekdays") == "weekdays"
+
+    def test_weekends(self):
+        assert parse_days("weekends") == "weekends"
+
+    def test_specific_days(self):
+        assert parse_days("mon,wed,fri") == "mon,wed,fri"
+
+    def test_case_insensitive(self):
+        assert parse_days("MON,FRI") == "mon,fri"
+
+    def test_with_spaces(self):
+        assert parse_days("  mon , wed , fri  ") == "mon,wed,fri"
+
+    def test_invalid_day(self):
+        with pytest.raises(ValueError, match="Invalid day"):
+            parse_days("monday")
+
+    def test_mixed_valid_invalid(self):
+        with pytest.raises(ValueError, match="Invalid day"):
+            parse_days("mon,xyz")
+
+
+# --- _matches_day ---
+
+class TestMatchesDay:
+    def test_no_filter(self):
+        assert _matches_day(None, datetime(2026, 4, 14)) is True  # Monday
+
+    def test_weekdays_on_monday(self):
+        assert _matches_day("weekdays", datetime(2026, 4, 13)) is True  # Monday
+
+    def test_weekdays_on_saturday(self):
+        assert _matches_day("weekdays", datetime(2026, 4, 11)) is False  # Saturday
+
+    def test_weekends_on_saturday(self):
+        assert _matches_day("weekends", datetime(2026, 4, 11)) is True  # Saturday
+
+    def test_weekends_on_monday(self):
+        assert _matches_day("weekends", datetime(2026, 4, 13)) is False  # Monday
+
+    def test_specific_days_match(self):
+        assert _matches_day("mon,wed,fri", datetime(2026, 4, 13)) is True  # Monday
+
+    def test_specific_days_no_match(self):
+        assert _matches_day("tue,thu", datetime(2026, 4, 13)) is False  # Monday
+
+
+# --- toggle_recurring ---
+
+class TestToggleRecurring:
+    def test_disable_by_number(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "task one")
+        toggle_recurring(f, "1", enabled=False)
+        missions = load_recurring(f)
+        assert missions[0]["enabled"] is False
+
+    def test_enable_by_number(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        save_recurring(f, [{"id": "1", "frequency": "daily", "text": "paused", "enabled": False}])
+        toggle_recurring(f, "1", enabled=True)
+        missions = load_recurring(f)
+        assert missions[0]["enabled"] is True
+
+    def test_toggle_by_keyword(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "check emails")
+        add_recurring(f, "hourly", "health check")
+        toggle_recurring(f, "emails", enabled=False)
+        missions = load_recurring(f)
+        disabled = [m for m in missions if not m["enabled"]]
+        assert len(disabled) == 1
+        assert "emails" in disabled[0]["text"]
+
+    def test_toggle_invalid_number(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "task")
+        with pytest.raises(ValueError, match="Invalid number"):
+            toggle_recurring(f, "99", enabled=False)
+
+    def test_toggle_no_match(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "task")
+        with pytest.raises(ValueError, match="No recurring mission matching"):
+            toggle_recurring(f, "nonexistent", enabled=False)
+
+
+# --- set_days ---
+
+class TestSetDays:
+    def test_set_weekdays(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "work task")
+        set_days(f, "1", "weekdays")
+        missions = load_recurring(f)
+        assert missions[0]["days"] == "weekdays"
+
+    def test_set_specific_days(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "work task")
+        set_days(f, "1", "mon,wed,fri")
+        missions = load_recurring(f)
+        assert missions[0]["days"] == "mon,wed,fri"
+
+    def test_clear_days(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        save_recurring(f, [{"id": "1", "frequency": "daily", "text": "task", "days": "weekdays"}])
+        set_days(f, "1", None)
+        missions = load_recurring(f)
+        assert missions[0]["days"] is None
+
+    def test_set_by_keyword(self, tmp_path):
+        f = tmp_path / "recurring.json"
+        add_recurring(f, "daily", "check emails")
+        set_days(f, "emails", "weekdays")
+        missions = load_recurring(f)
+        assert missions[0]["days"] == "weekdays"
+
+
+# --- is_due with days filter ---
+
+class TestIsDueWithDays:
+    def test_skips_on_wrong_day(self):
+        mission = {"frequency": "daily", "enabled": True, "last_run": None, "days": "weekdays"}
+        saturday = datetime(2026, 4, 11, 10, 0)  # Saturday
+        assert is_due(mission, saturday) is False
+
+    def test_fires_on_matching_day(self):
+        mission = {"frequency": "daily", "enabled": True, "last_run": None, "days": "weekdays"}
+        monday = datetime(2026, 4, 13, 10, 0)  # Monday
+        assert is_due(mission, monday) is True
+
+    def test_every_with_days_filter(self):
+        last = datetime(2026, 4, 11, 9, 0)  # Saturday 9:00
+        mission = {
+            "frequency": "every", "enabled": True,
+            "interval_seconds": 300, "days": "weekdays",
+            "last_run": last.isoformat(),
+        }
+        saturday_later = datetime(2026, 4, 11, 10, 0)  # Saturday 10:00
+        assert is_due(mission, saturday_later) is False
+        monday = datetime(2026, 4, 13, 10, 0)  # Monday
+        assert is_due(mission, monday) is True
+
+
+# --- force_run ---
+
+
+class TestForceRun:
+    def _setup_missions(self, tmp_path):
+        missions_path = tmp_path / "missions.md"
+        missions_path.write_text(
+            "# Missions\n\n## Pending\n\n## In Progress\n\n## Done\n\n"
+        )
+        return missions_path
+
+    def test_force_run_single_by_number(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "task 1")
+        add_recurring(recurring_path, "daily", "task 2")
+
+        now = datetime(2026, 2, 3, 10, 0)
+        result = force_run(recurring_path, missions_path, identifier="1", now=now)
+
+        assert len(result) == 1
+        assert "task 1" in result[0]
+        missions_content = missions_path.read_text()
+        assert "task 1" in missions_content
+        assert "task 2" not in missions_content
+
+    def test_force_run_single_by_keyword(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "check emails")
+
+        now = datetime(2026, 2, 3, 10, 0)
+        result = force_run(recurring_path, missions_path, identifier="check", now=now)
+
+        assert len(result) == 1
+        assert "check emails" in result[0]
+
+    def test_force_run_all_enabled(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "task 1")
+        add_recurring(recurring_path, "daily", "task 2")
+
+        now = datetime(2026, 2, 3, 10, 0)
+        result = force_run(recurring_path, missions_path, identifier=None, now=now)
+
+        assert len(result) == 2
+        missions_content = missions_path.read_text()
+        assert "task 1" in missions_content
+        assert "task 2" in missions_content
+
+    def test_force_run_skips_disabled(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "task 1")
+        add_recurring(recurring_path, "daily", "task 2")
+        toggle_recurring(recurring_path, "1", enabled=False)
+
+        now = datetime(2026, 2, 3, 10, 0)
+        result = force_run(recurring_path, missions_path, identifier=None, now=now)
+
+        # Only task 2 should be injected (task 1 is disabled)
+        assert len(result) == 1
+        assert "task 2" in result[0]
+
+    def test_force_run_ignores_disabled_when_specific(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "task 1")
+        toggle_recurring(recurring_path, "1", enabled=False)
+
+        now = datetime(2026, 2, 3, 10, 0)
+        result = force_run(recurring_path, missions_path, identifier="1", now=now)
+
+        # Task 1 should be injected even though it's disabled
+        assert len(result) == 1
+        assert "task 1" in result[0]
+
+    def test_force_run_updates_last_run(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "task 1")
+
+        now = datetime(2026, 2, 3, 10, 0)
+        force_run(recurring_path, missions_path, identifier="1", now=now)
+
+        missions = load_recurring(recurring_path)
+        assert missions[0]["last_run"] == "2026-02-03T10:00:00"
+
+    def test_force_run_empty_list(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+
+        with pytest.raises(ValueError, match="No recurring missions"):
+            force_run(recurring_path, missions_path, identifier="1")
+
+    def test_force_run_invalid_identifier(self, tmp_path):
+        missions_path = self._setup_missions(tmp_path)
+        recurring_path = tmp_path / "recurring.json"
+        add_recurring(recurring_path, "daily", "task 1")
+
+        with pytest.raises(ValueError):
+            force_run(recurring_path, missions_path, identifier="nonexistent")

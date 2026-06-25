@@ -38,6 +38,10 @@ def record_usage(
     cache_creation_input_tokens: int = 0,
     cache_read_input_tokens: int = 0,
     cost_usd: float = 0.0,
+    mission_type: str = "",
+    duration_seconds: int = 0,
+    provider: str = "",
+    last_action: str = "",
 ) -> bool:
     """Append a usage event to today's JSONL file.
 
@@ -52,6 +56,15 @@ def record_usage(
         cache_creation_input_tokens: Tokens written to prompt cache.
         cache_read_input_tokens: Tokens read from prompt cache.
         cost_usd: Actual cost reported by the API.
+        mission_type: Granular mission category (e.g. "rebase", "implement").
+            Omitted from records when empty; absent records should be treated
+            as "unknown" by downstream readers.
+        duration_seconds: Total mission duration in seconds. Informational —
+            authoritative duration aggregation comes from session_outcomes.json.
+            Omitted from records when zero.
+        provider: CLI provider name (e.g. "claude", "copilot"). Omitted when empty.
+        last_action: Last tool action from JSONL session data (e.g. "Edit").
+            Omitted when empty.
 
     Returns:
         True if the record was written successfully.
@@ -71,13 +84,22 @@ def record_usage(
         "mode": mode,
         "mission": mission,
     }
-    # Only include cache/cost fields when non-zero to keep old entries compact
+    # Only include optional fields when non-empty/non-zero to keep old entries compact.
+    # Readers must treat absent mission_type as "unknown".
+    if mission_type:
+        entry["mission_type"] = mission_type
     if cache_creation_input_tokens:
         entry["cache_creation_input_tokens"] = cache_creation_input_tokens
     if cache_read_input_tokens:
         entry["cache_read_input_tokens"] = cache_read_input_tokens
     if cost_usd:
         entry["cost_usd"] = round(cost_usd, 6)
+    if duration_seconds:
+        entry["duration_seconds"] = duration_seconds
+    if provider:
+        entry["provider"] = provider
+    if last_action:
+        entry["last_action"] = last_action
 
     line = json.dumps(entry, separators=(",", ":")) + "\n"
 
@@ -166,6 +188,72 @@ def summarize_by_model(instance_dir: Path, days: int = 7) -> dict:
     return summary["by_model"]
 
 
+def summarize_by_type(instance_dir: Path, days: int = 7) -> dict:
+    """Get per-mission-type token breakdown for the last N days.
+
+    Returns:
+        Dict mapping mission type to {input_tokens, output_tokens, total_cost_usd, count}.
+        Records without a mission_type field are grouped under "unknown".
+    """
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+    summary = summarize_range(instance_dir, start, end)
+    return summary["by_type"]
+
+
+def summarize_by_project_and_type(instance_dir: Path, days: int = 7) -> dict:
+    """Get nested project → mission-type token breakdown for the last N days.
+
+    Returns:
+        Dict mapping project name to {type: {input_tokens, output_tokens,
+        total_cost_usd, count}}.
+    """
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+    summary = summarize_range(instance_dir, start, end)
+    return summary["by_project_and_type"]
+
+
+def summarize_by_mode(instance_dir: Path, days: int = 7) -> dict:
+    """Get per-autonomous-mode token breakdown for the last N days.
+
+    Returns:
+        Dict mapping mode name to {input_tokens, output_tokens, total_cost_usd, count}.
+        Entries without a mode field or with an empty mode are grouped under "unknown".
+    """
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+    summary = summarize_range(instance_dir, start, end)
+    return summary["by_mode"]
+
+
+def summarize_by_project_and_mode(instance_dir: Path, days: int = 7) -> dict:
+    """Get nested project → autonomous-mode token breakdown for the last N days.
+
+    Returns:
+        Dict mapping project name to {mode: {input_tokens, output_tokens,
+        total_cost_usd, count}}.
+    """
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+    summary = summarize_range(instance_dir, start, end)
+    return summary["by_project_and_mode"]
+
+
+def summarize_week(instance_dir: Path) -> dict:
+    """Summarize usage for the last 7 days."""
+    end = date.today()
+    start = end - timedelta(days=6)
+    return summarize_range(instance_dir, start, end)
+
+
+def summarize_month(instance_dir: Path) -> dict:
+    """Summarize usage for the last 30 days."""
+    end = date.today()
+    start = end - timedelta(days=29)
+    return summarize_range(instance_dir, start, end)
+
+
 def _aggregate(entries: list) -> dict:
     """Aggregate a list of usage entries into a summary.
 
@@ -173,7 +261,9 @@ def _aggregate(entries: list) -> dict:
         Dict with keys: total_input, total_output, count,
         cache_creation_input_tokens, cache_read_input_tokens,
         cache_hit_rate, total_cost_usd,
-        by_project (dict), by_model (dict).
+        by_project (dict), by_model (dict), by_type (dict),
+        by_project_and_type (dict), by_mode (dict),
+        by_project_and_mode (dict).
     """
     result = {
         "total_input": 0,
@@ -184,7 +274,13 @@ def _aggregate(entries: list) -> dict:
         "total_cost_usd": 0.0,
         "by_project": {},
         "by_model": {},
+        "by_type": {},
+        "by_project_and_type": {},
+        "by_mode": {},
+        "by_project_and_mode": {},
     }
+
+    _classify = None
 
     for entry in entries:
         inp = entry.get("input_tokens", 0)
@@ -204,27 +300,158 @@ def _aggregate(entries: list) -> dict:
 
         # By project
         if project not in result["by_project"]:
-            result["by_project"][project] = {"input_tokens": 0, "output_tokens": 0, "count": 0}
+            result["by_project"][project] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "total_cost_usd": 0.0,
+                "count": 0,
+            }
         result["by_project"][project]["input_tokens"] += inp
         result["by_project"][project]["output_tokens"] += out
+        result["by_project"][project]["cache_creation_input_tokens"] += cache_create
+        result["by_project"][project]["cache_read_input_tokens"] += cache_read
+        result["by_project"][project]["total_cost_usd"] += cost
         result["by_project"][project]["count"] += 1
 
         # By model
         if model not in result["by_model"]:
-            result["by_model"][model] = {"input_tokens": 0, "output_tokens": 0, "count": 0}
+            result["by_model"][model] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "total_cost_usd": 0.0,
+                "count": 0,
+            }
         result["by_model"][model]["input_tokens"] += inp
         result["by_model"][model]["output_tokens"] += out
+        result["by_model"][model]["cache_creation_input_tokens"] += cache_create
+        result["by_model"][model]["cache_read_input_tokens"] += cache_read
+        result["by_model"][model]["total_cost_usd"] += cost
         result["by_model"][model]["count"] += 1
 
-    # Compute cache hit rate: cache_read / (cache_read + non-cached input)
-    total_cache_input = result["cache_read_input_tokens"] + result["cache_creation_input_tokens"]
-    total_all_input = result["total_input"] + total_cache_input
-    if total_all_input > 0 and total_cache_input > 0:
-        result["cache_hit_rate"] = result["cache_read_input_tokens"] / total_all_input
-    else:
-        result["cache_hit_rate"] = 0.0
+        # By mission type — reclassify old records that predate the field
+        mission_type = entry.get("mission_type", "")
+        if not mission_type:
+            if _classify is None:
+                from app.session_tracker import classify_mission_type
+                _classify = classify_mission_type
+            mission_type = _classify(entry.get("mission", ""))
+        if mission_type not in result["by_type"]:
+            result["by_type"][mission_type] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_cost_usd": 0.0,
+                "count": 0,
+            }
+        result["by_type"][mission_type]["input_tokens"] += inp
+        result["by_type"][mission_type]["output_tokens"] += out
+        result["by_type"][mission_type]["total_cost_usd"] += cost
+        result["by_type"][mission_type]["count"] += 1
+
+        # By project and type (nested)
+        if project not in result["by_project_and_type"]:
+            result["by_project_and_type"][project] = {}
+        if mission_type not in result["by_project_and_type"][project]:
+            result["by_project_and_type"][project][mission_type] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_cost_usd": 0.0,
+                "count": 0,
+            }
+        result["by_project_and_type"][project][mission_type]["input_tokens"] += inp
+        result["by_project_and_type"][project][mission_type]["output_tokens"] += out
+        result["by_project_and_type"][project][mission_type]["total_cost_usd"] += cost
+        result["by_project_and_type"][project][mission_type]["count"] += 1
+
+        # By autonomous mode — empty string and missing key both map to "unknown"
+        mode = entry.get("mode") or "unknown"
+        if mode not in result["by_mode"]:
+            result["by_mode"][mode] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_cost_usd": 0.0,
+                "count": 0,
+            }
+        result["by_mode"][mode]["input_tokens"] += inp
+        result["by_mode"][mode]["output_tokens"] += out
+        result["by_mode"][mode]["total_cost_usd"] += cost
+        result["by_mode"][mode]["count"] += 1
+
+        # By project and mode (nested)
+        if project not in result["by_project_and_mode"]:
+            result["by_project_and_mode"][project] = {}
+        if mode not in result["by_project_and_mode"][project]:
+            result["by_project_and_mode"][project][mode] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_cost_usd": 0.0,
+                "count": 0,
+            }
+        result["by_project_and_mode"][project][mode]["input_tokens"] += inp
+        result["by_project_and_mode"][project][mode]["output_tokens"] += out
+        result["by_project_and_mode"][project][mode]["total_cost_usd"] += cost
+        result["by_project_and_mode"][project][mode]["count"] += 1
+
+    # Compute cache hit rate using centralized formula
+    from app.token_parser import compute_cache_hit_rate
+
+    result["cache_hit_rate"] = compute_cache_hit_rate(
+        result["total_input"],
+        result["cache_read_input_tokens"],
+        result["cache_creation_input_tokens"],
+    )
 
     return result
+
+
+def estimate_cache_savings(summary: dict, pricing: Optional[dict] = None) -> Optional[float]:
+    """Estimate dollar savings from prompt cache reads.
+
+    Uses by-model cache read token counts and configured input-token pricing.
+    Anthropic prompt cache reads are billed at ~10% of regular input cost,
+    so savings are approximated as 90% of normal input price for cache-read tokens.
+
+    Args:
+        summary: Aggregated summary dict from _aggregate/summarize_*.
+        pricing: Optional pricing table from config.
+
+    Returns:
+        Estimated savings in USD, or None when pricing is unavailable.
+    """
+    if not pricing:
+        return None
+
+    by_model = summary.get("by_model", {}) if isinstance(summary, dict) else {}
+    if not isinstance(by_model, dict) or not by_model:
+        return 0.0
+
+    savings = 0.0
+    for model_id, model_data in by_model.items():
+        if not isinstance(model_data, dict):
+            continue
+
+        cache_read = model_data.get("cache_read_input_tokens", 0) or 0
+        if cache_read <= 0:
+            continue
+
+        model_price = None
+        model_lower = str(model_id).lower()
+        for key in pricing:
+            if str(key).lower() in model_lower:
+                model_price = pricing[key]
+                break
+
+        if not isinstance(model_price, dict):
+            continue
+
+        input_price = model_price.get("input", 0) or 0
+        # Approximation: read is billed at 10% => 90% saved vs uncached input.
+        savings += (cache_read / 1_000_000) * float(input_price) * 0.9
+
+    return round(savings, 6)
 
 
 def estimate_cost(tokens: dict, pricing: Optional[dict] = None) -> Optional[float]:
@@ -260,11 +487,100 @@ def estimate_cost(tokens: dict, pricing: Optional[dict] = None) -> Optional[floa
     return inp_cost + out_cost
 
 
+def top_missions(
+    instance_dir: Path,
+    start: date,
+    end: date,
+    project: Optional[str] = None,
+    limit: int = 100,
+) -> list:
+    """Return top missions sorted by total tokens descending.
+
+    Args:
+        instance_dir: Path to instance directory.
+        start: Start date (inclusive).
+        end: End date (inclusive).
+        project: Optional project name filter.
+        limit: Maximum number of entries to return (1-200).
+
+    Returns:
+        List of dicts: ts, project, model, mode, mission_type, mission,
+        input_tokens, output_tokens, cache_read_input_tokens, cost_usd,
+        total_tokens. Mission text truncated to 120 chars.
+    """
+    usage_dir = Path(instance_dir) / "usage"
+    pricing = get_pricing_config()
+    entries = _read_jsonl_range(usage_dir, start, end)
+
+    if project:
+        entries = [e for e in entries if e.get("project") == project]
+
+    _classify = None
+    result = []
+    for entry in entries:
+        inp = entry.get("input_tokens", 0)
+        out = entry.get("output_tokens", 0)
+        cache_read = entry.get("cache_read_input_tokens", 0)
+
+        cost = entry.get("cost_usd")
+        if cost is None:
+            if pricing:
+                est = estimate_cost(
+                    {
+                        "model": entry.get("model", "unknown"),
+                        "input_tokens": inp,
+                        "output_tokens": out,
+                    },
+                    pricing,
+                )
+                cost = est
+            else:
+                cost = None
+
+        mission_type = entry.get("mission_type", "")
+        if not mission_type:
+            if _classify is None:
+                from app.session_tracker import classify_mission_type
+                _classify = classify_mission_type
+            mission_type = _classify(entry.get("mission", ""))
+
+        raw_mission = entry.get("mission", "")
+        mission_text = raw_mission.replace("\n", " ").replace("\r", " ")
+        if len(mission_text) > 300:
+            mission_text = mission_text[:300] + "..."
+
+        item = {
+            "ts": entry.get("ts", ""),
+            "project": entry.get("project", "_global"),
+            "model": entry.get("model", "unknown"),
+            "mode": entry.get("mode", ""),
+            "mission_type": mission_type,
+            "mission": mission_text,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_read_input_tokens": cache_read,
+            "cost_usd": cost,
+            "total_tokens": inp + out,
+        }
+        dur = entry.get("duration_seconds", 0)
+        if dur:
+            item["duration_seconds"] = dur
+        la = entry.get("last_action", "")
+        if la:
+            item["last_action"] = la
+        result.append(item)
+
+    result.sort(key=lambda x: x["total_tokens"], reverse=True)
+    limit = max(1, min(limit, 200))
+    return result[:limit]
+
+
 def daily_series(
     instance_dir: Path,
     start: date,
     end: date,
     project: Optional[str] = None,
+    include_by_project: bool = False,
 ) -> list:
     """Return per-day token breakdown for a date range.
 
@@ -273,10 +589,13 @@ def daily_series(
         start: Start date (inclusive).
         end: End date (inclusive).
         project: Optional project name to filter by.
+        include_by_project: If True, embed per-project breakdown in each entry.
 
     Returns:
-        List of dicts, one per day: {date, total_input, total_output, count, cost}.
+        List of dicts, one per day: {date, total_input, total_output, count, cost,
+        cache_read_input_tokens, cache_creation_input_tokens, cache_hit_rate}.
         cost is a float (USD) when pricing is configured, otherwise None.
+        When include_by_project=True, each entry also has a by_project dict.
     """
     usage_dir = Path(instance_dir) / "usage"
     pricing = get_pricing_config()
@@ -303,15 +622,89 @@ def daily_series(
                     total_cost += c
             cost = total_cost
 
-        result.append({
+        entry = {
             "date": current.isoformat(),
             "total_input": day_summary["total_input"],
             "total_output": day_summary["total_output"],
+            "cache_creation_input_tokens": day_summary["cache_creation_input_tokens"],
+            "cache_read_input_tokens": day_summary["cache_read_input_tokens"],
+            "cache_hit_rate": day_summary["cache_hit_rate"],
             "count": day_summary["count"],
             "cost": cost,
-        })
+        }
+        if include_by_project:
+            from app.token_parser import compute_cache_hit_rate
+
+            entry["by_project"] = {
+                proj: {
+                    "total_input": pdata["input_tokens"],
+                    "total_output": pdata["output_tokens"],
+                    "cache_creation_input_tokens": pdata["cache_creation_input_tokens"],
+                    "cache_read_input_tokens": pdata["cache_read_input_tokens"],
+                    "cache_hit_rate": compute_cache_hit_rate(
+                        pdata["input_tokens"],
+                        pdata["cache_read_input_tokens"],
+                        pdata["cache_creation_input_tokens"],
+                    ),
+                    "count": pdata["count"],
+                }
+                for proj, pdata in day_summary["by_project"].items()
+            }
+        result.append(entry)
         current += timedelta(days=1)
     return result
+
+
+def format_cache_summary(instance_dir: Path, days: int = 1) -> str:
+    """Return a one-line human-readable cache performance summary.
+
+    Args:
+        instance_dir: Path to instance directory.
+        days: Number of days to aggregate (default: today only).
+
+    Returns:
+        A string like "Cache: 45% hit rate (12.3k read / 8.1k created)"
+        or empty string if no cache data.
+    """
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+    summary = summarize_range(instance_dir, start, end)
+    cache_read = summary.get("cache_read_input_tokens", 0)
+    cache_create = summary.get("cache_creation_input_tokens", 0)
+    if not cache_read and not cache_create:
+        return ""
+    hit_rate = summary.get("cache_hit_rate", 0.0)
+    return (
+        f"Cache: {hit_rate:.0%} hit rate "
+        f"({_format_tokens(cache_read)} read / {_format_tokens(cache_create)} created)"
+    )
+
+
+def format_mission_cache_line(
+    cache_read: int, cache_create: int, input_tokens: int
+) -> str:
+    """Format a compact cache line for a single mission.
+
+    Returns empty string if no cache activity.
+    """
+    if not cache_read and not cache_create:
+        return ""
+    from app.token_parser import compute_cache_hit_rate
+
+    hit_rate = compute_cache_hit_rate(input_tokens, cache_read, cache_create)
+    return (
+        f"Cache: {hit_rate:.0%} hit "
+        f"({_format_tokens(cache_read)} read / {_format_tokens(cache_create)} created)"
+    )
+
+
+def _format_tokens(n: int) -> str:
+    """Format token count in human-friendly way."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
 
 
 def get_pricing_config(config: Optional[dict] = None) -> Optional[dict]:

@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title_suffix %} — Agent{% endblock %}
+{% block page_title %}Agent{% endblock %}
+{% block content %}
+<p style="color: var(--text-muted); margin-bottom: 1.5rem;">Introspection of the agent's internal state.</p>
+
+<!-- Soul -->
+<div class="card" id="section-soul">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0;">
+        <h2 style="margin:0; cursor:pointer;" id="soul-toggle">
+            <span id="soul-chevron" style="display:inline-block;transition:transform 0.2s;">▶</span> Soul
+        </h2>
+        <div style="display:flex; gap:0.5rem;" id="soul-actions">
+            <button class="btn-secondary" style="font-size:0.8rem;height:28px;padding:0 0.75rem;" id="soul-edit">Edit</button>
+            <button class="btn-secondary" style="font-size:0.8rem;height:28px;padding:0 0.75rem;" id="soul-reload">Reload</button>
+        </div>
+    </div>
+    <div id="soul-body" style="display:none; margin-top:0.75rem;">
+        <div id="soul-content" style="color: var(--text-muted);">Loading…</div>
+        <div id="soul-editor" style="display:none;">
+            <textarea id="soul-textarea" style="width:100%;min-height:300px;font-family:var(--font-mono);font-size:0.82rem;resize:vertical;"></textarea>
+            <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
+                <button id="soul-save" style="font-size:0.8rem;height:28px;padding:0 0.75rem;">Save</button>
+                <button class="btn-secondary" id="soul-cancel" style="font-size:0.8rem;height:28px;padding:0 0.75rem;">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Memory -->
+<div class="card" id="section-memory">
+    <h2 style="margin-bottom:0.75rem;">Memory</h2>
+    <div id="memory-content" style="color: var(--text-muted);">Loading…</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    /* ------------------------------------------------------------------ */
+    /* Soul                                                                  */
+    /* ------------------------------------------------------------------ */
+    let _soulExpanded = false;
+    let _soulRaw = '';
+
+    function toggleSoul() {
+        _soulExpanded = !_soulExpanded;
+        document.getElementById('soul-body').style.display = _soulExpanded ? 'block' : 'none';
+        document.getElementById('soul-chevron').style.transform = _soulExpanded ? 'rotate(90deg)' : '';
+    }
+
+    function loadSoul() {
+        document.getElementById('soul-content').textContent = 'Loading…';
+        fetch('/api/agent/soul')
+            .then(r => r.json())
+            .then(data => {
+                const el = document.getElementById('soul-content');
+                if (data.content === null) {
+                    el.innerHTML = '<span style="color:var(--text-muted)">No soul.md found. Copy from <code>instance.example/soul.md</code>.</span>';
+                    return;
+                }
+                _soulRaw = data.content;
+                el.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(data.content) + '</pre>';
+            })
+            .catch(() => { document.getElementById('soul-content').textContent = 'Error loading soul.'; });
+    }
+
+    function enterSoulEdit() {
+        document.getElementById('soul-textarea').value = _soulRaw;
+        document.getElementById('soul-content').style.display = 'none';
+        document.getElementById('soul-editor').style.display = 'block';
+        document.getElementById('soul-edit').style.display = 'none';
+        if (!_soulExpanded) toggleSoul();
+    }
+
+    function exitSoulEdit() {
+        document.getElementById('soul-editor').style.display = 'none';
+        document.getElementById('soul-content').style.display = 'block';
+        document.getElementById('soul-edit').style.display = '';
+    }
+
+    function saveSoul() {
+        const btn = document.getElementById('soul-save');
+        btn.disabled = true;
+        btn.textContent = 'Saving…';
+        const content = document.getElementById('soul-textarea').value;
+        fetch('/api/agent/soul', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({content})
+        })
+            .then(r => r.json())
+            .then(data => {
+                if (data.ok) {
+                    _soulRaw = content;
+                    document.getElementById('soul-content').innerHTML =
+                        '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(content) + '</pre>';
+                    exitSoulEdit();
+                } else {
+                    alert('Save failed: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(() => alert('Save failed — network error.'))
+            .finally(() => { btn.disabled = false; btn.textContent = 'Save'; });
+    }
+
+    document.getElementById('soul-toggle').addEventListener('click', toggleSoul);
+    document.getElementById('soul-reload').addEventListener('click', loadSoul);
+    document.getElementById('soul-edit').addEventListener('click', enterSoulEdit);
+    document.getElementById('soul-cancel').addEventListener('click', exitSoulEdit);
+    document.getElementById('soul-save').addEventListener('click', saveSoul);
+    loadSoul();
+
+    /* ------------------------------------------------------------------ */
+    /* Memory                                                               */
+    /* ------------------------------------------------------------------ */
+    function loadMemory() {
+        const el = document.getElementById('memory-content');
+        el.textContent = 'Loading…';
+        fetch('/api/agent/memory')
+            .then(r => r.json())
+            .then(data => {
+                if (!data.summary && data.global.length === 0 && Object.keys(data.projects).length === 0) {
+                    el.innerHTML = '<span style="color:var(--text-muted)">No memory files yet.</span>';
+                    return;
+                }
+                el.innerHTML = '';
+
+                // Summary
+                if (data.summary) {
+                    el.appendChild(buildFileAccordion('Summary (memory/summary.md)', data.summary));
+                }
+
+                // Global files
+                if (data.global.length > 0) {
+                    const section = document.createElement('div');
+                    section.style.marginTop = '0.75rem';
+                    const header = document.createElement('div');
+                    header.className = 'journal-project';
+                    header.textContent = 'Global Files';
+                    section.appendChild(header);
+                    data.global.forEach(f => section.appendChild(buildFileAccordion(f.name, f)));
+                    el.appendChild(section);
+                }
+
+                // Per-project files
+                const projNames = Object.keys(data.projects);
+                if (projNames.length > 0) {
+                    const section = document.createElement('div');
+                    section.style.marginTop = '0.75rem';
+                    projNames.forEach(proj => {
+                        const projHeader = document.createElement('div');
+                        projHeader.className = 'journal-date';
+                        projHeader.textContent = proj;
+                        section.appendChild(projHeader);
+                        data.projects[proj].forEach(f => section.appendChild(buildFileAccordion(f.name, f)));
+                    });
+                    el.appendChild(section);
+                }
+            })
+            .catch(() => { el.textContent = 'Error loading memory.'; });
+    }
+
+    function buildFileAccordion(label, fileData) {
+        const wrapper = document.createElement('details');
+        wrapper.style.marginBottom = '0.4rem';
+
+        const summary = document.createElement('summary');
+        summary.style.cursor = 'pointer';
+        summary.style.fontWeight = '500';
+        summary.textContent = label;
+        if (fileData.truncated) {
+            const badge = document.createElement('span');
+            badge.className = 'badge badge-orange';
+            badge.style.marginLeft = '0.5rem';
+            badge.textContent = `truncated (${fileData.total_chars.toLocaleString()} chars)`;
+            summary.appendChild(badge);
+        }
+        wrapper.appendChild(summary);
+
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'white-space:pre-wrap;margin:0.5rem 0 0 1rem;font-size:0.82rem;';
+        pre.textContent = fileData.content || '(empty)';
+        wrapper.appendChild(pre);
+
+        return wrapper;
+    }
+
+    loadMemory();
+
+    /* ------------------------------------------------------------------ */
+    /* Shared utilities                                                     */
+    /* ------------------------------------------------------------------ */
+    function escHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+})();
+</script>
+{% endblock %}

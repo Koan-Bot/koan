@@ -5,8 +5,9 @@ from app.github_skill_helpers import (
     extract_github_url,
     format_project_not_found_error,
     format_success_message,
-    queue_github_mission,
+    queue_github_mission_once,
     resolve_project_for_repo,
+    resolve_project_via_pr,
 )
 
 
@@ -48,8 +49,15 @@ def handle(ctx):
 
     project_path, project_name = resolve_project_for_repo(repo, owner=owner)
     if not project_path:
+        project_path, project_name = resolve_project_via_pr(owner, repo, pr_number)
+    if not project_path:
         return format_project_not_found_error(repo, owner=owner)
 
-    queue_github_mission(ctx, "recreate", pr_url, project_name)
+    duplicate = queue_github_mission_once(
+        ctx, "recreate", pr_url, project_name,
+        type_label="PR", number=pr_number, owner=owner, repo=repo,
+    )
+    if duplicate:
+        return duplicate
 
     return f"Recreate queued for {format_success_message('PR', pr_number, owner, repo)}"

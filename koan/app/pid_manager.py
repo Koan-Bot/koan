@@ -19,6 +19,7 @@ Usage from Python:
     release_pidfile(lock, koan_root, "awake")
 """
 
+import contextlib
 import fcntl
 import os
 import shutil
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Optional, IO
 
 from app.signals import (
+    CYCLE_FILE,
     PAUSE_FILE,
     PROJECT_FILE,
     STATUS_FILE,
@@ -161,6 +163,9 @@ def acquire_pidfile(koan_root: Path, process_name: str) -> IO:
         msg += ". Aborting."
         print(msg, file=sys.stderr)
         sys.exit(1)
+    except BaseException:
+        fh.close()
+        raise
 
     # Lock acquired — write our PID
     fh.seek(0)
@@ -253,7 +258,7 @@ def check_pidfile(koan_root: Path, process_name: str) -> Optional[int]:
     return None
 
 
-PROCESS_NAMES = ("run", "awake", "ollama", "dashboard")
+PROCESS_NAMES = ("run", "awake", "ollama", "dashboard", "api")
 
 # Process startup verification timeouts
 DEFAULT_VERIFY_TIMEOUT = 3.0
@@ -334,8 +339,8 @@ def start_runner(
 
     Returns (success: bool, message: str).
     """
-    # Clear stop and pause signals so run.py starts fresh
-    for signal_file in (STOP_FILE, PAUSE_FILE):
+    # Clear stop, pause, and cycle signals so run.py starts fresh
+    for signal_file in (STOP_FILE, PAUSE_FILE, CYCLE_FILE):
         (koan_root / signal_file).unlink(missing_ok=True)
 
     return _launch_python_process(
@@ -405,6 +410,24 @@ def start_dashboard(koan_root: Path, verify_timeout: float = DEFAULT_VERIFY_TIME
     return _launch_python_process(koan_root, "app/dashboard.py", "dashboard", verify_timeout)
 
 
+def start_api(koan_root: Path, verify_timeout: float = DEFAULT_VERIFY_TIMEOUT) -> tuple:
+    """Start the REST API server (api/server.py) as a detached subprocess.
+
+    Only launched when ``api.enabled: true`` in config.yaml.
+    Returns (success: bool, message: str).
+    """
+    return _launch_python_process(koan_root, "app/api/server.py", "api", verify_timeout)
+
+
+def _is_api_enabled() -> bool:
+    """Check if REST API is enabled in config.yaml."""
+    try:
+        from app.config import is_api_enabled
+        return is_api_enabled()
+    except (ImportError, OSError, ValueError):
+        return False
+
+
 def _is_dashboard_enabled() -> bool:
     """Check if dashboard is enabled in config.yaml."""
     try:
@@ -422,11 +445,14 @@ def get_status_processes(koan_root: Path) -> tuple:
     """
     provider = _detect_provider(koan_root)
     dashboard = _is_dashboard_enabled()
+    api = _is_api_enabled()
     names = list(PROCESS_NAMES)
     if not _needs_ollama(provider):
         names.remove("ollama")
     if not dashboard:
         names.remove("dashboard")
+    if not api:
+        names.remove("api")
     return tuple(names)
 
 
@@ -443,10 +469,8 @@ def _read_runner_state(koan_root: Path) -> dict:
 
     status_file = koan_root / STATUS_FILE
     if status_file.exists():
-        try:
+        with contextlib.suppress(OSError):
             state["status"] = status_file.read_text().strip()
-        except OSError:
-            pass
 
     pause_file = koan_root / PAUSE_FILE
     if pause_file.exists():
@@ -460,10 +484,8 @@ def _read_runner_state(koan_root: Path) -> dict:
 
     project_file = koan_root / PROJECT_FILE
     if project_file.exists():
-        try:
+        with contextlib.suppress(OSError):
             state["project"] = project_file.read_text().strip()
-        except OSError:
-            pass
 
     return state
 
@@ -541,7 +563,7 @@ def _detect_provider(koan_root: Path) -> str:
     """Detect the configured CLI provider.
 
     Uses the provider package resolution (env var > config.yaml > default).
-    Returns provider name: "claude", "copilot", "local", "ollama",
+    Returns provider name: "claude", "cline", "copilot", "ollama",
     or "ollama-launch".
     """
     try:
@@ -554,7 +576,7 @@ def _detect_provider(koan_root: Path) -> str:
 
 def _needs_ollama(provider: str) -> bool:
     """Return True if the provider requires ollama serve."""
-    return provider in ("local", "ollama")
+    return provider == "ollama"
 
 
 def _show_startup_banner(koan_root: Path, provider: str) -> None:
@@ -564,25 +586,28 @@ def _show_startup_banner(koan_root: Path, provider: str) -> None:
     if banner fails to display.
     """
     try:
-        from app.banners import print_startup_banner
+        from app.banners import print_hero_banner
         from app.startup_info import gather_startup_info
         info = gather_startup_info(koan_root)
         info["provider"] = provider
-        print_startup_banner(info)
+        print_hero_banner(info)
     except Exception as e:
         # Banner is cosmetic — log but don't block startup
         print(f"Warning: Failed to display startup banner: {e}", file=sys.stderr)
 
 
-def start_all(koan_root: Path, provider: str = None) -> dict:
+def start_all(koan_root: Path, provider: str = None, show_banner: bool = True) -> dict:
     """Start the full Kōan stack for the configured provider.
 
     Auto-detects the provider if not specified.
     - claude/copilot/ollama-launch: starts awake + run (2 processes)
-    - local/ollama: starts ollama + awake + run (3 processes)
+    - ollama: starts ollama + awake + run (3 processes)
 
     Note: ollama-launch does not need a separate ollama serve process
     because ``ollama launch claude`` handles server lifecycle internally.
+
+    ``show_banner`` lets the interactive launcher (``make koan``) suppress the
+    startup banner it has already rendered itself, avoiding a double banner.
 
     Returns dict mapping component name to (success, message).
     """
@@ -590,7 +615,8 @@ def start_all(koan_root: Path, provider: str = None) -> dict:
         provider = _detect_provider(koan_root)
 
     # Display startup banner before launching processes
-    _show_startup_banner(koan_root, provider)
+    if show_banner:
+        _show_startup_banner(koan_root, provider)
 
     results = {}
 
@@ -614,6 +640,11 @@ def start_all(koan_root: Path, provider: str = None) -> dict:
         ok, msg = start_dashboard(koan_root)
         results["dashboard"] = (ok, msg)
 
+    # 5. Start REST API if enabled
+    if _is_api_enabled():
+        ok, msg = start_api(koan_root)
+        results["api"] = (ok, msg)
+
     return results
 
 
@@ -621,9 +652,16 @@ def start_stack(koan_root: Path) -> dict:
     """Start the full ollama stack: ollama serve + awake + run.
 
     Kept for backward compatibility with `make ollama`.
-    Delegates to start_all() with provider="local".
+    Delegates to start_all() with the "ollama" sentinel so ollama serve starts.
+
+    Note: with the `local` provider removed, no built-in provider talks to this
+    standalone `ollama serve` (`ollama-launch` manages its own server via
+    ``ollama launch claude``). `make ollama` is now only useful when you point a
+    custom Claude-CLI endpoint at the bare Ollama server yourself; otherwise the
+    agent resolves its provider independently. The path is preserved
+    intentionally and may be deprecated in a follow-up.
     """
-    return start_all(koan_root, provider="local")
+    return start_all(koan_root, provider="ollama")
 
 
 def _wait_for_exit(pid: int, timeout: float) -> bool:
@@ -688,6 +726,15 @@ def stop_processes(koan_root: Path, timeout: float = 5.0) -> dict:
     stop_file = koan_root / STOP_FILE
     atomic_write(stop_file, "STOP")
 
+    # Notify Telegram before killing processes
+    any_running = any(check_pidfile(koan_root, n) for n in PROCESS_NAMES)
+    if any_running:
+        try:
+            from app.notify import send_telegram
+            send_telegram("🛑 Shutting down — operator requested stop.")
+        except Exception as e:
+            print(f"[pid_manager] stop notification failed: {e}", file=sys.stderr)
+
     # Bootout any launchd-managed services first to prevent respawn
     for name in PROCESS_NAMES:
         _bootout_launchd_service(name)
@@ -710,10 +757,8 @@ def stop_processes(koan_root: Path, timeout: float = 5.0) -> dict:
             results[name] = "stopped"
         else:
             # Force kill
-            try:
+            with contextlib.suppress(OSError, ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
             # Wait briefly for SIGKILL to take effect
             _wait_for_exit(pid, 1.0)
             results[name] = "force_killed"
@@ -723,6 +768,31 @@ def stop_processes(koan_root: Path, timeout: float = 5.0) -> dict:
         pidfile.unlink(missing_ok=True)
 
     return results
+
+
+def stop_process(koan_root: Path, name: str, timeout: float = 5.0) -> str:
+    """Stop a single named Kōan process (SIGTERM, then SIGKILL on timeout).
+
+    Returns "stopped", "not_running", or "force_killed". Used by the terminal
+    dashboard's web-dashboard toggle to bring just that process down.
+    """
+    _bootout_launchd_service(name)
+    pid = check_pidfile(koan_root, name)
+    if not pid:
+        return "not_running"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return "not_running"
+    if _wait_for_exit(pid, timeout):
+        result = "stopped"
+    else:
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        _wait_for_exit(pid, 1.0)
+        result = "force_killed"
+    _pidfile_path(koan_root, name).unlink(missing_ok=True)
+    return result
 
 
 def _print_stack_results(results: dict) -> int:

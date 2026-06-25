@@ -13,17 +13,34 @@ Issue-centric workflow:
 CLI:
     python3 -m app.plan_runner --project-path <path> --idea "Add dark mode"
     python3 -m app.plan_runner --project-path <path> --issue-url <url>
+    python3 -m app.plan_runner --project-path <path> --issue-url <url> --base-branch main
 """
 
-import json
 import re
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional, Tuple
 
-from app.github import run_gh, issue_create, api, fetch_issue_with_comments
-from app.github_url_parser import parse_github_url, parse_issue_url
+from app.issue_tracker import (
+    UnresolvedJiraProjectError,
+    add_comment,
+    create_issue,
+    fetch_issue,
+    find_existing_plan_issue,
+    project_name_for_path,
+    resolve_issue_ref,
+    tracker_is_configured,
+    tracker_provider,
+    tracker_supports_labels,
+)
 from app.prompts import load_prompt_or_skill
+from app.tracker_comment_format import (
+    build_plan_comment_failure,
+    build_plan_comment_success,
+    jira_readable_markdown,
+)
+from app.url_skill_args import merge_context_with_base_branch
 
 # Label used to tag plan issues for searchability
 _PLAN_LABEL = "plan"
@@ -36,6 +53,10 @@ def run_plan(
     notify_fn=None,
     skill_dir: Optional[Path] = None,
     context: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    project_name: str = "",
+    instance_dir: str = "",
+    iterations: int = 1,
 ) -> Tuple[bool, str]:
     """Execute the plan pipeline.
 
@@ -53,13 +74,23 @@ def run_plan(
         from app.notify import send_telegram
         notify_fn = send_telegram
 
+    # Heartbeat so the liveness watchdog in run.py knows we're alive
+    # before Claude CLI starts streaming.
+    print("[plan] Starting plan runner", flush=True)
+
     if issue_url:
         return _run_issue_plan(
             project_path, issue_url, notify_fn, skill_dir, context=context,
+            base_branch=base_branch,
+            project_name=project_name, instance_dir=instance_dir,
+            iterations=iterations,
         )
     elif idea:
         return _run_new_plan(
             project_path, idea, notify_fn, skill_dir, context=context,
+            base_branch=base_branch,
+            project_name=project_name, instance_dir=instance_dir,
+            iterations=iterations,
         )
     else:
         return False, "No idea or issue URL provided."
@@ -71,30 +102,38 @@ def _run_new_plan(
     notify_fn,
     skill_dir: Optional[Path],
     context: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    project_name: str = "",
+    instance_dir: str = "",
+    iterations: int = 1,
 ) -> Tuple[bool, str]:
     """Generate a plan for a new idea, reusing an existing issue if found."""
     notify_fn(f"\U0001f9e0 Planning: {idea[:100]}{'...' if len(idea) > 100 else ''}")
+    print(f"[plan] New plan for: {idea[:80]}", flush=True)
 
-    # Check for an existing plan issue before generating
-    owner, repo = _get_repo_info(project_path)
-    if owner and repo:
-        existing = _search_existing_issue(owner, repo, idea)
-        if existing:
-            issue_number, issue_title = existing
-            issue_url = (
-                f"https://github.com/{owner}/{repo}/issues/{issue_number}"
-            )
-            notify_fn(
-                f"\U0001f504 Found existing issue #{issue_number}: "
-                f"{issue_title[:60]} — iterating"
-            )
-            return _run_issue_plan(
-                project_path, issue_url, notify_fn, skill_dir, context=context,
-            )
+    project_name = project_name or project_name_for_path(project_path)
 
+    existing = find_existing_plan_issue(project_name, project_path, idea)
+    if existing:
+        notify_fn(
+            f"\U0001f504 Found existing {existing.provider} issue "
+            f"{existing.label} — iterating"
+        )
+        return _run_issue_plan(
+            project_path, existing.url, notify_fn, skill_dir, context=context,
+            base_branch=base_branch,
+            project_name=project_name, instance_dir=instance_dir,
+            iterations=iterations,
+        )
+
+    effective_context = merge_context_with_base_branch(context, base_branch)
+
+    print("[plan] Invoking Claude for plan generation", flush=True)
     try:
         plan = _generate_plan(
-            project_path, idea, context=context or "", skill_dir=skill_dir,
+            project_path, idea, context=effective_context, skill_dir=skill_dir,
+            project_name=project_name, instance_dir=instance_dir,
+            iterations=iterations, notify_fn=notify_fn,
         )
     except Exception as e:
         return False, f"Plan generation failed: {str(e)[:300]}"
@@ -102,31 +141,39 @@ def _run_new_plan(
     if not plan:
         return False, "Claude returned an empty plan."
 
-    if not owner or not repo:
-        notify_fn(f"Plan (no GitHub repo found, showing inline):\n\n{plan[:3500]}")
-        return True, "Plan generated (no GitHub repo, sent inline)."
-
     title = _extract_title(plan)
-    # Strip the title line from the plan body (it's now the issue title)
     plan_body = _strip_title_line(plan)
-    issue_body = f"{plan_body}\n\n---\n*Generated by Kōan /plan*"
+    from app.pr_footer import build_koan_footer
+    issue_body = f"{plan_body}\n\n---\n{build_koan_footer()}"
 
+    if not tracker_is_configured(project_name, project_path):
+        notify_fn(f"✅ Plan generated inline:\n\n{plan[:3000]}")
+        return True, "Plan generated inline (no issue tracker configured)."
+
+    provider = tracker_provider(project_name, project_path)
+    if provider == "jira":
+        issue_body = (
+            f"{jira_readable_markdown(plan_body)}\n\n"
+            "Generated by Koan."
+        ).strip()
+
+    labels = [_PLAN_LABEL] if tracker_supports_labels(project_name, project_path) else None
     try:
-        result_url = issue_create(
-            title, issue_body, labels=[_PLAN_LABEL], cwd=project_path
+        result_url = create_issue(
+            project_name, project_path, title, issue_body, labels=labels,
         )
-    except (RuntimeError, OSError) as e:
-        # Label may not exist — retry without label
+    except (RuntimeError, OSError):
+        # GitHub labels may not exist; Jira ignores them. Retry without labels.
         try:
-            result_url = issue_create(title, issue_body, cwd=project_path)
+            result_url = create_issue(project_name, project_path, title, issue_body)
         except (RuntimeError, OSError) as e2:
             notify_fn(
-                f"\u26a0\ufe0f Plan ready but issue creation failed "
+                f"⚠️ Plan ready but tracker issue creation failed "
                 f"({e2}):\n\n{plan[:3000]}"
             )
             return True, f"Plan generated but issue creation failed: {e2}"
 
-    notify_fn(f"\u2705 Plan created: {result_url}")
+    notify_fn(f"✅ Plan created: {result_url}")
     return True, f"Plan created: {result_url}"
 
 
@@ -136,61 +183,109 @@ def _run_issue_plan(
     notify_fn,
     skill_dir: Optional[Path],
     context: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    project_name: str = "",
+    instance_dir: str = "",
+    iterations: int = 1,
 ) -> Tuple[bool, str]:
     """Read an existing issue/PR + comments, generate updated plan, post comment."""
-    try:
-        # Accept both issue and PR URLs — GitHub's issues API works for PRs too.
-        owner, repo, _url_type, issue_number = parse_github_url(issue_url)
-    except ValueError:
-        return False, f"Invalid GitHub URL: {issue_url}"
+    project_name = project_name or project_name_for_path(project_path)
 
-    notify_fn(f"\U0001f4d6 Reading issue #{issue_number} ({owner}/{repo})...")
-
+    # Resolve the reference first (no network) for a useful heartbeat and to
+    # validate the URL; the tracker then handles fetch/comment generically.
     try:
-        title, body, comments = _fetch_issue_context(owner, repo, issue_number)
+        ref = resolve_issue_ref(
+            issue_url, project_name=project_name, project_path=project_path,
+        )
+    except UnresolvedJiraProjectError as e:
+        msg = str(e)
+        notify_fn(f"❌ {msg}")
+        return False, msg
     except Exception as e:
         return False, f"Failed to fetch issue: {str(e)[:300]}"
 
-    # Build full issue context for the iteration prompt
-    context_parts = [f"## Original Issue #{issue_number}: {title}\n\n{body}"]
-    if comments:
-        context_parts.append(f"\n\n## Discussion Comments\n\n{comments}")
-    else:
-        context_parts.append("\n\n*No comments yet on this issue.*")
-    if context:
-        context_parts.append(f"\n\n## User Instructions\n\n{context}")
-    issue_context = "\n".join(context_parts)
+    notify_fn(f"\U0001f4d6 Reading {ref.provider} issue {ref.label}...")
+    print(f"[plan] Fetching tracker issue {issue_url}", flush=True)
 
     try:
+        content = fetch_issue(
+            issue_url, project_name=project_name, project_path=project_path,
+        )
+    except UnresolvedJiraProjectError as e:
+        msg = str(e)
+        notify_fn(f"❌ {msg}")
+        return False, msg
+    except Exception as e:
+        return False, f"Failed to fetch issue: {str(e)[:300]}"
+
+    title = content.title
+    body = content.body
+    comments_text = _format_comments(content.comments)
+    label = content.ref.label
+
+    print("[plan] Issue fetched, building prompt", flush=True)
+    # Build full issue context for the iteration prompt
+    context_parts = [f"## Original Issue {label}: {title}\n\n{body}"]
+    if comments_text:
+        context_parts.append(f"\n\n## Discussion Comments\n\n{comments_text}")
+    else:
+        context_parts.append("\n\n*No comments yet on this issue.*")
+    effective_context = merge_context_with_base_branch(context, base_branch)
+    if effective_context:
+        context_parts.append(f"\n\n## User Instructions\n\n{effective_context}")
+    issue_context = "\n".join(context_parts)
+
+    print("[plan] Invoking Claude for plan generation", flush=True)
+    try:
         plan = _generate_iteration_plan(
-            project_path, issue_context, skill_dir=skill_dir
+            project_path, issue_context, skill_dir=skill_dir,
+            project_name=project_name, instance_dir=instance_dir,
+            iterations=iterations, notify_fn=notify_fn,
         )
     except Exception as e:
-        return False, f"Plan generation failed: {str(e)[:300]}"
+        reason = f"Plan generation failed: {str(e)[:300]}"
+        if ref.provider == "jira":
+            with suppress(Exception):
+                add_comment(
+                    issue_url,
+                    build_plan_comment_failure("jira", reason),
+                    project_name=project_name,
+                    project_path=project_path,
+                )
+        return False, reason
 
     if not plan:
-        return False, "Claude returned an empty plan."
+        reason = "Claude returned an empty plan."
+        if ref.provider == "jira":
+            with suppress(Exception):
+                add_comment(
+                    issue_url,
+                    build_plan_comment_failure("jira", reason),
+                    project_name=project_name,
+                    project_path=project_path,
+                )
+        return False, reason
 
-    # Post as a comment on the issue
     iteration_title = _extract_title(plan)
     plan_body = _strip_title_line(plan)
-    comment_body = (
-        f"## {iteration_title}\n\n{plan_body}\n\n---\n"
-        f"*Generated by Kōan /plan — iteration on existing issue*"
+    comment_body = build_plan_comment_success(
+        ref.provider, iteration_title, plan_body,
     )
 
     try:
-        _comment_on_issue(owner, repo, issue_number, comment_body)
+        add_comment(
+            issue_url, comment_body,
+            project_name=project_name,
+            project_path=project_path,
+        )
     except Exception as e:
         notify_fn(f"Plan ready but comment failed ({e}):\n\n{plan[:3000]}")
         return True, f"Plan generated but comment failed: {e}"
 
-    issue_label = f"#{issue_number}"
     if title:
-        issue_label = f"#{issue_number} ({title[:60]})"
-    result_url = f"https://github.com/{owner}/{repo}/issues/{issue_number}"
-    notify_fn(f"\u2705 Plan posted as comment on {issue_label}: {result_url}")
-    return True, f"Plan posted on {issue_label}: {result_url}"
+        label = f"{label} ({title[:60]})"
+    notify_fn(f"✅ Plan posted as comment on {label}: {issue_url}")
+    return True, f"Plan posted on {label}: {issue_url}"
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +298,7 @@ _REVIEW_SKIP_PHASES = 2   # skip if fewer than this many phases
 _REVIEW_SKIP_LINES = 20   # skip if plan body is shorter than this
 
 
-def _is_simple_plan(plan_text: str) -> bool:
+def is_simple_plan(plan_text: str) -> bool:
     """Return True if the plan is trivially simple and doesn't need review.
 
     Skips review for single-phase plans with fewer than _REVIEW_SKIP_LINES
@@ -216,7 +311,7 @@ def _is_simple_plan(plan_text: str) -> bool:
     return line_count < _REVIEW_SKIP_LINES
 
 
-def _review_plan(plan_text: str, project_path: str, skill_dir) -> Tuple[bool, str]:
+def review_plan(plan_text: str, project_path: str, skill_dir) -> Tuple[bool, str]:
     """Run a lightweight subagent to review plan quality.
 
     Args:
@@ -245,6 +340,7 @@ def _review_plan(plan_text: str, project_path: str, skill_dir) -> Tuple[bool, st
             model_key="lightweight",
             max_turns=3,
             timeout=120,
+            max_turns_source=None,
         )
     except Exception as e:
         print(f"[plan_runner] Review subagent failed: {e} — skipping review", file=sys.stderr)
@@ -272,6 +368,160 @@ def _review_plan(plan_text: str, project_path: str, skill_dir) -> Tuple[bool, st
     return True, ""
 
 
+def improve_plan(
+    plan_text: str, issues_text: str, project_path: str, skill_dir
+) -> str:
+    """Run a codebase-grounded subagent to fix plan quality issues.
+
+    The improver explores the codebase to resolve ambiguities identified by
+    the reviewer (missing file paths, vague descriptions, etc.) and returns
+    a corrected plan. Uses mission model (not lightweight) because it needs
+    full reasoning to fix structural plan issues, not just spot-check reviews.
+
+    Args:
+        plan_text: The plan that failed review.
+        issues_text: Bullet list of issues from the reviewer.
+        project_path: Project directory (for codebase exploration).
+        skill_dir: Skill directory for loading the improve prompt.
+
+    Returns:
+        Improved plan text, or original plan_text on failure.
+    """
+    from app.cli_provider import run_command
+
+    try:
+        prompt = load_prompt_or_skill(
+            skill_dir, "plan-improve", PLAN=plan_text, ISSUES=issues_text
+        )
+    except Exception as e:
+        print(f"[plan_runner] Improve prompt load failed: {e}", file=sys.stderr)
+        return plan_text
+
+    try:
+        output = run_command(
+            prompt, project_path,
+            allowed_tools=["Read", "Glob", "Grep"],
+            model_key="mission",
+            max_turns=5,
+            timeout=180,
+            max_turns_source=None,
+        )
+    except Exception as e:
+        print(f"[plan_runner] Improve subagent failed: {e}", file=sys.stderr)
+        return plan_text
+
+    if not output or not output.strip():
+        print("[plan_runner] Improve subagent returned empty — keeping original", file=sys.stderr)
+        return plan_text
+
+    return output.strip()
+
+
+def _critic_loop(
+    plan_text: str,
+    project_path: str,
+    idea: str,
+    context: str,
+    skill_dir,
+    iterations: int,
+    notify_fn=None,
+    is_iteration: bool = False,
+    issue_context: str = "",
+    project_name: str = "",
+    instance_dir: str = "",
+) -> str:
+    """Refine a plan through N-1 rounds of critique + regeneration.
+
+    Turn 1 is the initial generation (already done by caller).
+    Turns 2..N each run: critic -> regenerate with feedback.
+    """
+    from app.cli_provider import run_command
+    from app.config import get_skill_timeout
+    from app.skill_memory import build_memory_block_for_skill
+
+    current_plan = plan_text
+    _noop_notify = lambda msg: None
+    notify = notify_fn or _noop_notify
+
+    notify(f"\U0001f504 Planning... (turn 1/{iterations})")
+
+    for turn in range(2, iterations + 1):
+        print(f"[plan_runner] Critic turn {turn}/{iterations}: invoking critic", file=sys.stderr)
+        try:
+            critic_prompt = load_prompt_or_skill(
+                skill_dir, "plan-critic",
+                PLAN=current_plan,
+                IDEA=idea or issue_context[:500],
+            )
+        except Exception as e:
+            print(f"[plan_runner] Critic prompt load failed: {e}", file=sys.stderr)
+            break
+
+        try:
+            critique = run_command(
+                critic_prompt, project_path,
+                allowed_tools=["Read", "Glob", "Grep"],
+                model_key="lightweight",
+                max_turns=3,
+                timeout=min(120, get_skill_timeout()),
+            )
+        except Exception as e:
+            print(f"[plan_runner] Critic failed: {e} — keeping current plan", file=sys.stderr)
+            notify(f"⚠️ Critic round {turn} failed — posting best plan so far")
+            break
+
+        if not critique or not critique.strip():
+            print(f"[plan_runner] Critic turn {turn}: empty response — treating as failure", file=sys.stderr)
+            notify(f"⚠️ Critic round {turn} returned empty — posting best plan so far")
+            break
+
+        if "NO_GAPS_FOUND" in critique:
+            print(f"[plan_runner] Critic turn {turn}: no gaps found — done early", file=sys.stderr)
+            break
+
+        print(f"[plan_runner] Critic turn {turn}: gaps found, regenerating", file=sys.stderr)
+
+        feedback_section = f"\n\n## Critic Feedback (turn {turn})\n\n{critique}"
+        try:
+            project_memory = build_memory_block_for_skill(
+                project_path,
+                issue_context if is_iteration else idea,
+                project_name=project_name,
+                instance_dir=instance_dir,
+            )
+            if is_iteration:
+                new_plan = _run_claude_plan(
+                    load_prompt_or_skill(
+                        skill_dir, "plan-iterate",
+                        ISSUE_CONTEXT=issue_context + feedback_section,
+                        PROJECT_MEMORY=project_memory,
+                    ),
+                    project_path,
+                )
+            else:
+                feedback_context = (context or "") + feedback_section
+                new_plan = _run_claude_plan(
+                    load_prompt_or_skill(
+                        skill_dir, "plan", IDEA=idea, CONTEXT=feedback_context,
+                        PROJECT_MEMORY=project_memory,
+                    ),
+                    project_path,
+                )
+        except Exception as e:
+            print(f"[plan_runner] Regeneration failed: {e} — keeping current plan", file=sys.stderr)
+            notify(f"⚠️ Regeneration round {turn} failed — posting best plan so far")
+            break
+
+        if new_plan:
+            current_plan = new_plan
+        else:
+            print("[plan_runner] Regeneration returned empty — keeping current plan", file=sys.stderr)
+
+        notify(f"\U0001f504 Planning... (turn {turn}/{iterations})")
+
+    return current_plan
+
+
 def _review_loop(
     plan_text: str,
     project_path: str,
@@ -281,6 +531,8 @@ def _review_loop(
     max_rounds: int = 3,
     is_iteration: bool = False,
     issue_context: str = "",
+    project_name: str = "",
+    instance_dir: str = "",
 ) -> str:
     """Iteratively review and re-generate a plan until approved or rounds exhausted.
 
@@ -299,12 +551,15 @@ def _review_loop(
     """
     current_plan = plan_text
     prev_issues: Optional[str] = None
+    final_round = 0
 
     for round_num in range(1, max_rounds + 1):
-        approved, issues = _review_plan(current_plan, project_path, skill_dir)
+        approved, issues = review_plan(current_plan, project_path, skill_dir)
+        final_round = round_num
 
         if approved:
             print(f"[plan_runner] Review round {round_num}: APPROVED", file=sys.stderr)
+            _record_plan_metric(project_path, True, round_num, "", project_name)
             return current_plan
 
         print(f"[plan_runner] Review round {round_num}: ISSUES_FOUND", file=sys.stderr)
@@ -316,6 +571,9 @@ def _review_loop(
                 f"[plan_runner] Max review rounds ({max_rounds}) exhausted — "
                 "posting best version with warning",
                 file=sys.stderr,
+            )
+            _record_plan_metric(
+                project_path, False, round_num, issues or "", project_name,
             )
             return current_plan + _review_warning_note(issues, max_rounds)
 
@@ -331,23 +589,42 @@ def _review_loop(
         # Re-generate with reviewer feedback appended
         feedback_context = (context or "") + f"\n\n## Review Feedback\n\n{issues}"
         try:
+            from app.skill_memory import build_memory_block_for_skill
             if is_iteration:
+                project_memory = build_memory_block_for_skill(
+                    project_path,
+                    issue_context,
+                    project_name=project_name,
+                    instance_dir=instance_dir,
+                )
                 new_plan = _run_claude_plan(
                     load_prompt_or_skill(
                         skill_dir, "plan-iterate",
                         ISSUE_CONTEXT=issue_context + f"\n\n## Review Feedback\n\n{issues}",
+                        PROJECT_MEMORY=project_memory,
                     ),
                     project_path,
                 )
             else:
+                project_memory = build_memory_block_for_skill(
+                    project_path,
+                    idea,
+                    project_name=project_name,
+                    instance_dir=instance_dir,
+                )
                 new_plan = _run_claude_plan(
                     load_prompt_or_skill(
                         skill_dir, "plan", IDEA=idea, CONTEXT=feedback_context,
+                        PROJECT_MEMORY=project_memory,
                     ),
                     project_path,
                 )
         except Exception as e:
             print(f"[plan_runner] Re-generation failed: {e} — keeping previous plan", file=sys.stderr)
+            _record_plan_metric(
+                project_path, False, final_round, "re-generation failed",
+                project_name,
+            )
             return current_plan
 
         if new_plan:
@@ -355,7 +632,28 @@ def _review_loop(
         else:
             print("[plan_runner] Re-generation returned empty — keeping previous plan", file=sys.stderr)
 
+    _record_plan_metric(
+        project_path, False, final_round, "loop exhausted", project_name,
+    )
     return current_plan
+
+
+def _record_plan_metric(
+    project_path: str,
+    approved: bool,
+    rounds: int,
+    issues_summary: str,
+    project_name: str = "",
+) -> None:
+    """Record a plan-review metric (fire-and-forget)."""
+    try:
+        import os
+        instance_dir = os.path.join(os.environ.get("KOAN_ROOT", ""), "instance")
+        project_name = project_name or project_name_for_path(project_path)
+        from app.skill_metrics import record_plan_metric
+        record_plan_metric(instance_dir, project_name, approved, rounds, issues_summary)
+    except Exception as e:
+        print(f"[plan_runner] Failed to record plan metric: {e}", file=sys.stderr)
 
 
 def _review_warning_note(issues: str, max_rounds: int) -> str:
@@ -363,42 +661,91 @@ def _review_warning_note(issues: str, max_rounds: int) -> str:
     return (
         f"\n\n> ⚠️ Plan review flagged unresolved items after {max_rounds} rounds "
         f"— human review recommended.\n>\n"
-        + "\n".join(f"> - {line.lstrip('- ')}" for line in issues.splitlines() if line.strip())
+        + "\n".join(f"> - {line.removeprefix('- ')}" for line in issues.splitlines() if line.strip())
     )
 
 
-def _generate_plan(project_path, idea, context="", skill_dir=None):
+def _generate_plan(
+    project_path,
+    idea,
+    context="",
+    skill_dir=None,
+    project_name: str = "",
+    instance_dir: str = "",
+    iterations: int = 1,
+    notify_fn=None,
+):
     """Run Claude to generate a structured plan for a new idea."""
     from app.config import get_plan_review_config
+    from app.skill_memory import build_memory_block_for_skill
 
-    prompt = load_prompt_or_skill(skill_dir, "plan", IDEA=idea, CONTEXT=context)
+    project_memory = build_memory_block_for_skill(
+        project_path, idea, project_name=project_name, instance_dir=instance_dir,
+    )
+    prompt = load_prompt_or_skill(
+        skill_dir, "plan", IDEA=idea, CONTEXT=context, PROJECT_MEMORY=project_memory,
+    )
     plan = _run_claude_plan(prompt, project_path)
 
+    if iterations > 1:
+        plan = _critic_loop(
+            plan, project_path, idea=idea, context=context,
+            skill_dir=skill_dir, iterations=iterations, notify_fn=notify_fn,
+            project_name=project_name, instance_dir=instance_dir,
+        )
+
     review_cfg = get_plan_review_config()
-    if review_cfg["enabled"] and not _is_simple_plan(plan):
+    if review_cfg["enabled"] and not is_simple_plan(plan):
         plan = _review_loop(
             plan, project_path, idea=idea, context=context, skill_dir=skill_dir,
             max_rounds=review_cfg["max_rounds"],
+            project_name=project_name, instance_dir=instance_dir,
         )
 
     return plan
 
 
-def _generate_iteration_plan(project_path, issue_context, skill_dir=None):
+def _generate_iteration_plan(
+    project_path,
+    issue_context,
+    skill_dir=None,
+    project_name: str = "",
+    instance_dir: str = "",
+    iterations: int = 1,
+    notify_fn=None,
+):
     """Run Claude to generate an updated plan based on issue + comments."""
     from app.config import get_plan_review_config
+    from app.skill_memory import build_memory_block_for_skill
 
+    project_memory = build_memory_block_for_skill(
+        project_path,
+        issue_context,
+        project_name=project_name,
+        instance_dir=instance_dir,
+    )
     prompt = load_prompt_or_skill(
-        skill_dir, "plan-iterate", ISSUE_CONTEXT=issue_context
+        skill_dir, "plan-iterate",
+        ISSUE_CONTEXT=issue_context,
+        PROJECT_MEMORY=project_memory,
     )
     plan = _run_claude_plan(prompt, project_path)
 
+    if iterations > 1:
+        plan = _critic_loop(
+            plan, project_path, idea="", context="",
+            skill_dir=skill_dir, iterations=iterations, notify_fn=notify_fn,
+            is_iteration=True, issue_context=issue_context,
+            project_name=project_name, instance_dir=instance_dir,
+        )
+
     review_cfg = get_plan_review_config()
-    if review_cfg["enabled"] and not _is_simple_plan(plan):
+    if review_cfg["enabled"] and not is_simple_plan(plan):
         plan = _review_loop(
             plan, project_path, idea="", context="", skill_dir=skill_dir,
             max_rounds=review_cfg["max_rounds"],
             is_iteration=True, issue_context=issue_context,
+            project_name=project_name, instance_dir=instance_dir,
         )
 
     return plan
@@ -460,86 +807,20 @@ def _is_error_output(output: str) -> bool:
 def _run_claude_plan(prompt, project_path):
     """Execute Claude CLI with the given prompt and return the output."""
     from app.cli_provider import run_command_streaming
-    from app.config import get_skill_timeout
+    from app.config import get_skill_max_turns, get_skill_timeout
     output = run_command_streaming(
         prompt, project_path,
         allowed_tools=["Read", "Glob", "Grep", "WebFetch"],
-        max_turns=25, timeout=get_skill_timeout(),
+        model_key="mission",
+        max_turns=get_skill_max_turns(), timeout=get_skill_timeout(),
     )
     if _is_error_output(output):
         raise RuntimeError(output)
     return _strip_preamble(output)
 
 
-def _search_existing_issue(owner, repo, idea):
-    """Search for an existing open plan issue that matches the idea.
-
-    Returns (issue_number, title) if found, None otherwise.
-    """
-    # Build search keywords from the idea (first few significant words)
-    keywords = _extract_search_keywords(idea)
-    if not keywords:
-        return None
-
-    search_query = f"repo:{owner}/{repo} is:issue is:open {keywords}"
-    try:
-        result_json = api(
-            "search/issues",
-            extra_args=["--jq", '.items[:5] | [.[] | {number, title}]',
-                         "-f", f"q={search_query}",
-                         "-f", "per_page=5"],
-        )
-        results = json.loads(result_json)
-        if not isinstance(results, list) or not results:
-            return None
-
-        # Return the first match
-        hit = results[0]
-        return str(hit.get("number", "")), hit.get("title", "")
-    except Exception as e:
-        print(f"[plan_runner] Issue search failed: {e}", file=sys.stderr)
-        return None
 
 
-def _extract_search_keywords(idea):
-    """Extract meaningful search keywords from an idea string."""
-    # Remove common filler words, keep the substance
-    stop_words = {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "into", "about", "between",
-        "through", "and", "but", "or", "not", "no", "so", "if", "then",
-        "that", "this", "it", "its", "we", "our", "i", "my", "me", "you",
-        "your", "they", "them", "their", "let", "lets", "let's", "need",
-        "want", "add", "make", "get", "set", "use", "like",
-    }
-    words = re.findall(r'\b[a-zA-Z]{2,}\b', idea.lower())
-    keywords = [w for w in words if w not in stop_words]
-    # Take first 4 meaningful keywords for search
-    return " ".join(keywords[:4])
-
-
-def _get_repo_info(project_path):
-    """Get GitHub owner/repo from a local git repo."""
-    try:
-        output = run_gh("repo", "view", "--json", "owner,name",
-                        cwd=project_path, timeout=15)
-        data = json.loads(output)
-        owner = data.get("owner", {}).get("login", "")
-        repo = data.get("name", "")
-        if owner and repo:
-            return owner, repo
-    except Exception as e:
-        print(f"[plan_runner] Repo info fetch failed: {e}", file=sys.stderr)
-    return None, None
-
-
-def _fetch_issue_context(owner, repo, issue_number):
-    """Fetch issue title, body and comments via gh CLI."""
-    title, body, comments = fetch_issue_with_comments(owner, repo, issue_number)
-    comments_text = _format_comments(comments)
-    return title, body, comments_text
 
 
 def _format_comments(comments):
@@ -560,13 +841,6 @@ def _format_comments(comments):
             parts.append(f"**{author}** ({date}):\n{body}")
     return "\n\n---\n\n".join(parts)
 
-
-def _comment_on_issue(owner, repo, issue_number, body):
-    """Post a comment on an existing GitHub issue."""
-    api(
-        f"repos/{owner}/{repo}/issues/{issue_number}/comments",
-        input_data=body,
-    )
 
 
 def _extract_title(plan_text):
@@ -640,7 +914,7 @@ def main(argv=None):
     Returns exit code (0 = success, 1 = failure).
     """
     import argparse
-    import sys
+    from app.url_skill_args import add_url_skill_common_args
 
     parser = argparse.ArgumentParser(
         description="Generate a structured plan and post as GitHub issue/comment."
@@ -658,9 +932,10 @@ def main(argv=None):
         "--issue-url",
         help="GitHub issue URL to iterate on",
     )
+    add_url_skill_common_args(parser)
     parser.add_argument(
-        "--context",
-        help="Additional user context (e.g. 'Focus on phase 2')",
+        "--iterations", type=int, default=1, choices=range(1, 6),
+        help="Number of critique+refine turns (1-5, default 1)",
     )
     cli_args = parser.parse_args(argv)
 
@@ -672,6 +947,10 @@ def main(argv=None):
         issue_url=cli_args.issue_url,
         skill_dir=skill_dir,
         context=cli_args.context,
+        base_branch=cli_args.base_branch,
+        project_name=cli_args.project_name,
+        instance_dir=cli_args.instance_dir,
+        iterations=cli_args.iterations,
     )
     print(summary)
     return 0 if success else 1

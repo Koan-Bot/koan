@@ -73,8 +73,10 @@ def generate_spec(
             prompt,
             project_path,
             allowed_tools=["Read", "Glob", "Grep"],
+            model_key="lightweight",
             max_turns=5,
             timeout=_get_spec_timeout(),
+            max_turns_source=None,
         )
 
         if not output or not output.strip():
