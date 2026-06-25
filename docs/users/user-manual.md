@@ -631,17 +631,29 @@ Produces a pedagogical walkthrough of the PR: what problem it solves (with examp
 - `/xp https://github.com/org/repo/pull/55` — Same thing, shorter
 </details>
 
-**`/refactor`** — Queue a targeted refactoring mission.
+**`/refactor`** — Refactor a PR's changed code for clarity and simplicity while
+preserving behavior, then commit, push, and comment on the PR.
 
-- **Usage:** `/refactor <github-url-or-path>`
+It refactors only the code this PR introduced (diff vs. the base branch),
+makes one clean convention-aware commit, runs the project's tests (with one fix
+attempt if they break), pushes to the PR branch, and posts a bullet-list summary
+comment explaining what changed. Trailing text after the URL becomes extra focus
+for the refactor.
+
+- **Usage:** `/refactor [--now] <github-pr-url> [focus area]`
 - **Aliases:** `/rf`
-- **GitHub @mention:** `@koan-bot /refactor` on a PR or issue
+- **GitHub @mention:** `@koan-bot /refactor` on a PR
+
+> The same engine runs **internally** at the end of `/implement`, `/rebase`, and
+> `/fix` — right before the private review gate — to clean up freshly produced
+> code (an extra commit, no PR comment).
 
 <details>
 <summary>Use cases</summary>
 
-- `/refactor https://github.com/org/repo/pull/60` — Refactor code in a PR
-- `/rf https://github.com/org/repo/issues/70` — Refactor based on an issue description
+- `/refactor https://github.com/org/repo/pull/60` — Clean up a PR's code
+- `/refactor https://github.com/org/repo/pull/60 focus on the tests` — Scope the refactor
+- `/rf --now https://github.com/org/repo/pull/60` — Run it at the top of the queue
 </details>
 
 ### PR Management
@@ -1726,7 +1738,7 @@ Ten skills can be triggered by commenting `@koan-bot <command>` on GitHub issues
 | `/reviewrebase` | `@koan-bot /rr` on a PR |
 | `/planimplement` | `@koan-bot /planit` on an issue |
 | `/recreate` | `@koan-bot /recreate` on a PR |
-| `/refactor` | `@koan-bot /refactor` on a PR or issue |
+| `/refactor` | `@koan-bot /refactor` on a PR |
 | `/plan` | `@koan-bot /plan <idea>` on an issue |
 | `/profile` | `@koan-bot /profile` on a PR or issue |
 
@@ -2269,7 +2281,7 @@ All commands at a glance. **Tier:** B = Beginner, I = Intermediate, P = Power Us
 | `/debug <issue>` | `/dbg` | I | Structured 4-step debug loop (reproduce → hypothesize → fix → verify) |
 | `/review <PR> [PR ...] [--architecture] [--errors] [--bot-comments]` | `/rv` | I | Review one or more pull requests |
 | `/explain <PR>` | `/xp` | I | Explain a PR in plain language with examples |
-| `/refactor <desc>` | `/rf` | I | Targeted refactoring mission |
+| `/refactor <PR> [focus]` | `/rf` | I | Refactor a PR's changed code (preserves behavior), commit, push & comment |
 | `/ask <comment-url>` | `/question` | I | Ask a question about a PR/issue — posts AI reply to GitHub |
 | `/rebase <PR> [focus area]` | `/rb` | I | Rebase a PR onto its base branch; trailing text becomes focus context |
 | `/reviewrebase <PR>` | `/rr` | I | Review then rebase a PR (combo) |
