@@ -75,7 +75,10 @@ override the base branch for that mission.
 the review gate: the same engine as `/refactor` cleans up the freshly produced
 code, makes one extra commit, runs the tests, and pushes — silently (no PR
 comment, since it is part of the larger workflow). This makes large implement
-missions land cleaner code before review.
+missions land cleaner code before review. It adds an extra Claude step per
+mission, so disable it with `refactor_pass.enabled: false` in `config.yaml`
+(default on). If the pass leaves tests broken, the refactor commit is kept
+locally and **not** pushed.
 
 The private post-PR review gate for `/fix`, `/implement`, and `/rebase` is
 backend-only: it reuses `/review` analysis, fixes Blocking/Important findings

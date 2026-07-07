@@ -110,6 +110,7 @@ class TestRunRefactorPass:
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
              patch("app.claude_step.run_claude_step", return_value=_step()) as mock_step, \
              patch("app.pr_review.detect_test_command", return_value="make test"), \
+             patch("app.prompts.load_prompt", return_value="FIX"), \
              patch("app.claude_step.run_project_tests",
                    side_effect=[{"passed": False, "output": "boom", "details": "1 failed"},
                                 {"passed": True, "details": "ok"}]), \
@@ -118,8 +119,45 @@ class TestRunRefactorPass:
             result = run_refactor_pass("/proj")
 
         assert result.tests == "fixed and passing"
+        assert result.tests_ok is True
+        assert result.pushed is True
         # one refactor step + one fix step
         assert mock_step.call_count == 2
+
+    def test_tests_still_failing_skips_push(self):
+        patches = _patch_common()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("app.claude_step.run_claude_step", return_value=_step()), \
+             patch("app.pr_review.detect_test_command", return_value="make test"), \
+             patch("app.prompts.load_prompt", return_value="FIX"), \
+             patch("app.claude_step.run_project_tests",
+                   side_effect=[{"passed": False, "output": "boom", "details": "1 failed"},
+                                {"passed": False, "details": "still bad"}]), \
+             patch("app.git_utils.ordered_remotes", return_value=["origin"]), \
+             patch("app.claude_step._run_git") as mock_git:
+            result = run_refactor_pass("/proj")
+
+        # broken refactor is never published
+        assert result.committed is True
+        assert result.tests_ok is False
+        assert result.pushed is False
+        assert "still failing" in result.tests
+        mock_git.assert_not_called()
+
+    def test_preferred_remote_pushed_first(self):
+        patches = _patch_common()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("app.claude_step.run_claude_step", return_value=_step()), \
+             patch("app.pr_review.detect_test_command", return_value=None), \
+             patch("app.git_utils.ordered_remotes",
+                   return_value=["fork-sukria", "origin"]) as mock_remotes, \
+             patch("app.claude_step._run_git") as mock_git:
+            run_refactor_pass("/proj", preferred_remote="fork-sukria")
+
+        # head remote is the preferred push target
+        mock_remotes.assert_called_once_with("fork-sukria", cwd="/proj")
+        pushed_remote = mock_git.call_args.args[0][2]
+        assert pushed_remote == "fork-sukria"
 
     def test_uses_convention_subject_when_guidance_present(self):
         with patch("app.claude_step._get_current_branch", return_value="koan/x"), \
@@ -167,3 +205,28 @@ class TestRunInternalRefactorPass:
 
         assert notify.called
         assert "Refactor pass" in notify.call_args.args[0]
+
+    def test_disabled_by_config_skips_pass(self):
+        notify = MagicMock()
+        with patch("app.config.is_internal_refactor_pass_enabled",
+                   return_value=False), \
+             patch("app.refactor_step.run_refactor_pass") as mock_pass:
+            result = run_internal_refactor_pass("/proj", notify_fn=notify)
+
+        assert result.committed is False
+        mock_pass.assert_not_called()
+
+    def test_red_tests_warns_not_applied(self):
+        notify = MagicMock()
+        with patch("app.config.is_internal_refactor_pass_enabled",
+                   return_value=True), \
+             patch("app.refactor_step.run_refactor_pass",
+                   return_value=RefactorResult(
+                       committed=True, pushed=False, tests_ok=False,
+                       tests="still failing (1 failed)",
+                   )):
+            run_internal_refactor_pass("/proj", notify_fn=notify)
+
+        msg = notify.call_args.args[0]
+        assert "kept locally" in msg
+        assert "tests" in msg.lower()

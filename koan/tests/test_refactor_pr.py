@@ -76,6 +76,22 @@ class TestRunRefactor:
         assert success is False
         assert "push" in summary.lower()
 
+    def test_tests_failing_fails_without_comment(self):
+        success, summary, run_gh, mock_pass = _run(
+            refactor_result=RefactorResult(
+                committed=True, pushed=False, tests_ok=False,
+                tests="still failing (1 failed)",
+            ),
+        )
+        assert success is False
+        assert "tests" in summary.lower()
+        # the head remote resolved for the PR is forwarded to the pass
+        assert mock_pass.call_args.kwargs["preferred_remote"] == "origin"
+        # no PR comment is posted when the refactor could not be pushed
+        assert not any(
+            c.args[:2] == ("pr", "comment") for c in run_gh.call_args_list
+        )
+
     def test_missing_branch_fails(self):
         success, summary, _, mock_pass = _run(context={"branch": ""})
         assert success is False

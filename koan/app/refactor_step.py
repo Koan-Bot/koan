@@ -20,7 +20,7 @@ fast-forward push is always sufficient (no force, no rebase).
 
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def _noop(_msg: str) -> None:
 class RefactorResult:
     """Outcome of a single refactor pass."""
 
-    __slots__ = ("bullets", "committed", "pushed", "summary", "tests")
+    __slots__ = ("bullets", "committed", "pushed", "summary", "tests", "tests_ok")
 
     def __init__(
         self,
@@ -54,12 +54,17 @@ class RefactorResult:
         bullets: Optional[List[str]] = None,
         tests: str = "",
         summary: str = "",
+        tests_ok: bool = True,
     ):
         self.committed = committed
         self.pushed = pushed
         self.bullets = bullets or []
         self.tests = tests
         self.summary = summary
+        # False only when tests ran and stayed broken after the fix attempt.
+        # True when tests passed, were repaired, were skipped, or never ran.
+        # Callers use this to gate pushing broken refactors.
+        self.tests_ok = tests_ok
 
     def __bool__(self) -> bool:
         return self.committed
@@ -77,6 +82,7 @@ def run_refactor_pass(
     push: bool = True,
     project_name: str = "",
     instance_dir: str = "",
+    preferred_remote: Optional[str] = None,
 ) -> RefactorResult:
     """Refactor the changed code on the current branch.
 
@@ -92,8 +98,13 @@ def run_refactor_pass(
         run_tests: Run the project's tests after refactoring (single fix
             attempt on failure).
         push: Push the new commit to the branch's remote (plain fast-forward).
+            The push is skipped when tests ran and stayed broken — a broken
+            refactor is never published.
         project_name: Project name (auto-resolved from the path when omitted).
         instance_dir: Instance directory (reserved for future use).
+        preferred_remote: Remote to push to first (e.g. the PR head remote for
+            fork PRs). When given, it is tried before the default
+            ``origin`` / ``upstream`` fallbacks.
 
     Returns:
         A :class:`RefactorResult`. ``committed`` is False when the refactor
@@ -147,10 +158,17 @@ def run_refactor_pass(
     bullets = _parse_summary_bullets(step.output)
 
     tests_status = ""
+    tests_ok = True
     if run_tests:
-        tests_status = _run_tests_with_one_fix(project_path, notify)
+        tests_status, tests_ok = _run_tests_with_one_fix(project_path, notify)
 
-    pushed = _push_branch(branch, project_path) if push else False
+    # Never publish a refactor that leaves tests broken. Keep the commit
+    # locally (the next checkout resets the branch to the remote tip) but
+    # skip the push and surface the failure via tests_ok.
+    do_push = push and tests_ok
+    pushed = (
+        _push_branch(branch, project_path, preferred_remote) if do_push else False
+    )
 
     summary = "Refactoring applied"
     if bullets:
@@ -160,6 +178,7 @@ def run_refactor_pass(
         pushed=pushed,
         bullets=bullets,
         tests=tests_status,
+        tests_ok=tests_ok,
         summary=summary,
     )
 
@@ -177,8 +196,18 @@ def run_internal_refactor_pass(
     Runs immediately before the private review gate. Produces an extra commit
     and pushes it, but never posts a PR comment (internal workflow) and never
     raises — a refactor failure must not block the review gate.
+
+    Opt out via ``refactor_pass.enabled: false`` in config.yaml (default on).
     """
+    from app.config import is_internal_refactor_pass_enabled
+
     notify = notify_fn or _noop
+
+    if not is_internal_refactor_pass_enabled():
+        return RefactorResult(
+            committed=False, summary="refactor pass disabled by config",
+        )
+
     try:
         result = run_refactor_pass(
             project_path,
@@ -194,8 +223,15 @@ def run_internal_refactor_pass(
         logger.warning("[refactor] internal pass failed: %s", e)
         return RefactorResult(committed=False, summary=f"refactor pass skipped: {e}")
 
-    if result.committed:
+    if result.committed and result.pushed:
         notify("🛠️ Refactor pass applied before review gate")
+    elif result.committed and not result.tests_ok:
+        # Commit kept locally but not pushed — tests stayed broken. The review
+        # gate must not be told this "applied"; surface it as a distinct warning.
+        notify(
+            "⚠️ Refactor pass kept locally — tests still failing, not pushed "
+            f"({result.tests})"
+        )
     else:
         notify("🛠️ Refactor pass: no changes needed")
     return result
@@ -227,51 +263,64 @@ def _parse_summary_bullets(output: str) -> List[str]:
     return bullets
 
 
-def _run_tests_with_one_fix(project_path: str, notify) -> str:
+def _run_tests_with_one_fix(project_path: str, notify) -> Tuple[str, bool]:
     """Run the test suite; on failure, attempt one Claude fix and re-run.
 
-    Returns a short human-readable status string.
+    Returns a ``(status, tests_ok)`` tuple: *status* is a short human-readable
+    string, *tests_ok* is False only when tests ran and stayed broken after the
+    fix attempt (callers gate the push on this).
     """
     from app.claude_step import run_claude_step, run_project_tests
     from app.config import get_skill_max_turns
     from app.pr_review import detect_test_command
+    from app.prompts import load_prompt
 
     test_cmd = detect_test_command(project_path)
     if not test_cmd:
-        return "skipped (no test command detected)"
+        return "skipped (no test command detected)", True
 
     notify("Running tests after refactor...")
     result = run_project_tests(project_path, test_cmd=test_cmd)
     if result.get("passed"):
-        return f"passing ({result.get('details', 'OK')})"
+        return f"passing ({result.get('details', 'OK')})", True
 
     notify("Tests failing after refactor — attempting one fix...")
-    fix_prompt = (
-        "The test suite is failing after a refactoring pass. "
-        f"Test command: `{test_cmd}`\n\n"
-        f"Test output:\n```\n{result.get('output', '')[:3000]}\n```\n\n"
-        "Fix the failures by correcting the refactoring — preserve the original "
-        "behavior. Only modify what is necessary."
+    fix_prompt = load_prompt(
+        "refactor_test_fix",
+        PROJECT_PATH=project_path,
+        TEST_CMD=test_cmd,
+        TEST_OUTPUT=result.get("output", "")[:3000],
     )
-    run_claude_step(
+    fix_actions: List[str] = []
+    fix_step = run_claude_step(
         prompt=fix_prompt,
         project_path=project_path,
         commit_msg="fix: repair tests after refactoring",
-        success_label="",
-        failure_label="",
-        actions_log=[],
+        success_label="Repaired tests after refactor",
+        failure_label="Test-repair step failed",
+        actions_log=fix_actions,
         max_turns=get_skill_max_turns(),
         timeout=600,
     )
 
     retest = run_project_tests(project_path, test_cmd=test_cmd)
     if retest.get("passed"):
-        return "fixed and passing"
-    return f"still failing ({retest.get('details', 'unknown')})"
+        return "fixed and passing", True
+    detail = retest.get("details", "unknown")
+    if getattr(fix_step, "committed", False):
+        # The repair committed something but tests are still red — fold that
+        # into the status so the caller (and PR comment) reports it honestly.
+        return f"still failing ({detail}; repair commit kept locally)", False
+    return f"still failing ({detail})", False
 
 
-def _push_branch(branch: str, project_path: str) -> bool:
+def _push_branch(
+    branch: str, project_path: str, preferred_remote: Optional[str] = None,
+) -> bool:
     """Plain (non-force) push of *branch*, trying each remote in order.
+
+    *preferred_remote* (e.g. the PR head remote for fork PRs) is tried first so
+    the new commit lands on the branch's actual remote rather than ``origin``.
 
     Returns True on the first successful push, False if all remotes reject it.
     Never raises — a push failure is reported to the caller, not fatal.
@@ -279,7 +328,7 @@ def _push_branch(branch: str, project_path: str) -> bool:
     from app.claude_step import _run_git
     from app.git_utils import ordered_remotes
 
-    for remote in ordered_remotes(None, cwd=project_path):
+    for remote in ordered_remotes(preferred_remote, cwd=project_path):
         try:
             _run_git(["git", "push", remote, branch], cwd=project_path)
             return True

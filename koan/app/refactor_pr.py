@@ -105,6 +105,7 @@ def run_refactor(
             notify_fn=notify_fn,
             run_tests=True,
             push=True,
+            preferred_remote=head_remote,
         )
     except Exception as e:
         _safe_checkout(original_branch, project_path)
@@ -120,6 +121,13 @@ def run_refactor(
 
     if not result.pushed:
         _safe_checkout(original_branch, project_path)
+        if not result.tests_ok:
+            # Tests stayed broken after the fix attempt — the refactor commit
+            # was kept locally but NOT pushed, and no success comment is posted.
+            return False, (
+                f"Refactored `{branch}` but the tests are still failing "
+                f"({result.tests}) — changes kept locally, not pushed."
+            )
         return False, (
             f"Refactored `{branch}` but the push was rejected — the branch may "
             "not be pushable from this instance."

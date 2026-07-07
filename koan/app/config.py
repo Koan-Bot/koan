@@ -823,6 +823,25 @@ def get_cli_output_journal() -> bool:
     return bool(value)
 
 
+def is_internal_refactor_pass_enabled() -> bool:
+    """Check if the internal refactor pass is enabled.
+
+    The internal refactor pass runs the same engine as ``/refactor`` at the end
+    of ``/implement``, ``/rebase`` and ``/fix`` — right before the private
+    review gate — to clean up freshly produced code. It adds an extra Claude
+    step (and roughly doubles per-mission cost), so it is configurable.
+
+    Config key: refactor_pass.enabled (default: True — opt-out).
+    """
+    config = _load_config()
+    section = config.get("refactor_pass", {})
+    if isinstance(section, dict):
+        return bool(section.get("enabled", True))
+    if isinstance(section, bool):
+        return section
+    return True
+
+
 def is_ci_check_enabled() -> bool:
     """Check if the CI check system is enabled.
 
