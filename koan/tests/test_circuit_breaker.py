@@ -357,13 +357,14 @@ class TestSkipLogging:
         def broken():
             raise RuntimeError("boom")
 
-        broken()  # opens the circuit
-        capsys.readouterr()
+        broken()  # opens the circuit (executes, not a skip)
+        broken()  # skip 1 — logs
+        capsys.readouterr()  # drop open-circuit + skip-1 logs
         # Skips 2, 3, 4 stay silent; skip 5 logs again.
         for _ in range(4):
             broken()
         captured = capsys.readouterr()
-        # Only the 1st and 5th skip emit a line.
+        # Only the 5th skip emits a line.
         assert captured.err.count("circuit OPEN, skipped") == 1
         assert "skipped 5 call" in captured.err
 
