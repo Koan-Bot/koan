@@ -1816,10 +1816,23 @@ def _parse_error_hunter_output(raw_output: str) -> list:
     except json.JSONDecodeError:
         pass
 
-    print(
-        "[review_runner] silent-failure-hunter: could not parse JSON output",
-        file=sys.stderr,
-    )
+    # Neither extraction succeeded. Distinguish a genuine parse failure —
+    # JSON-looking content that failed to decode, where findings may have been
+    # lost — from the routine case where the model narrated in prose because it
+    # found nothing. Only the former warrants a "could not parse" warning; the
+    # latter is the expected "no findings" outcome, and flagging it as a parse
+    # error pollutes the logs and misleads audits into thinking the pass broke.
+    if re.search(r"[\[{]", raw_output):
+        print(
+            "[review_runner] silent-failure-hunter: could not parse JSON output",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[review_runner] silent-failure-hunter: no JSON in response "
+            "(no findings reported)",
+            file=sys.stderr,
+        )
     return []
 
 

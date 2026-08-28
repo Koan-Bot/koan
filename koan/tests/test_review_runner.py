@@ -7683,6 +7683,55 @@ class TestRunErrorHunter:
         assert kwargs["project_name"] == "my-toolkit"
 
 
+class TestParseErrorHunterOutput:
+    """Tests for _parse_error_hunter_output diagnostics and extraction."""
+
+    def test_prose_no_findings_is_not_flagged_as_parse_error(self, capsys):
+        """The routine no-findings case (model narrates in prose, emits no
+        JSON) must NOT log 'could not parse JSON output' — that false alarm
+        fired on every clean review and misled log audits into thinking the
+        pass had broken. It should report 'no JSON in response' instead.
+        """
+        from app.review_runner import _parse_error_hunter_output
+
+        raw = ("I analyzed the diff for silent-failure patterns. "
+               "The change adds a guard and does not swallow any errors.")
+        assert _parse_error_hunter_output(raw) == []
+        err = capsys.readouterr().err
+        assert "could not parse JSON output" not in err
+        assert "no JSON in response" in err
+
+    def test_malformed_json_is_still_flagged(self, capsys):
+        """JSON-looking content that fails to decode is a genuine parse
+        failure (findings may have been lost) and must keep the warning.
+        """
+        from app.review_runner import _parse_error_hunter_output
+
+        raw = 'Here are the findings: [{"severity": "HIGH", "title": broken'
+        assert _parse_error_hunter_output(raw) == []
+        assert "could not parse JSON output" in capsys.readouterr().err
+
+    def test_valid_findings_still_parse(self):
+        """Regression guard: well-formed arrays, prose-wrapped arrays, and
+        fenced arrays must still yield findings after the diagnostic change.
+        """
+        from app.review_runner import _parse_error_hunter_output
+
+        obj = '[{"severity": "HIGH", "title": "x"}]'
+        assert len(_parse_error_hunter_output(obj)) == 1
+        assert len(_parse_error_hunter_output(f"Findings:\n{obj}")) == 1
+        assert len(_parse_error_hunter_output(f"```json\n{obj}\n```")) == 1
+
+    def test_empty_array_returns_no_findings_quietly(self, capsys):
+        """A bare empty array is a valid 'no findings' answer — it parses and
+        emits no parse-error diagnostic.
+        """
+        from app.review_runner import _parse_error_hunter_output
+
+        assert _parse_error_hunter_output("[]") == []
+        assert "could not parse JSON output" not in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Bot comment triage — run_review integration
 # ---------------------------------------------------------------------------
