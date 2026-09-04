@@ -4047,6 +4047,39 @@ class TestCheckIfAlreadySolved:
     @patch("app.cli_provider.build_full_command", return_value=["claude", "--fake"])
     @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f", "review": "r"})
     @patch("app.rebase_pr._run_git", return_value="")
+    def test_claude_failure_reports_why(self, _git, _mc, _cmd, mock_claude):
+        """The check is a guard against redoing work that already landed.
+        When it is skipped, the summary must say why — otherwise a quota
+        outage and a crashed CLI look identical to the operator."""
+        mock_claude.return_value = {
+            "success": False, "output": "",
+            "error": "You've hit your limit. Resets at 6pm (UTC)",
+        }
+        actions = []
+        _check_if_already_solved(actions, self._PR_CONTEXT, REBASE_SKILL_DIR, "/project")
+        assert any("hit your limit" in a for a in actions)
+
+    @patch("app.rebase_pr.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--fake"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f", "review": "r"})
+    @patch("app.rebase_pr._run_git", return_value="")
+    def test_unparseable_output_reports_what_came_back(self, _git, _mc, _cmd, mock_claude):
+        """A model that narrates instead of emitting JSON must leave a trace of
+        what it actually said, so the prompt can be repaired."""
+        mock_claude.return_value = {
+            "success": True,
+            "output": "I could not determine whether this was already solved.",
+            "error": "",
+        }
+        actions = []
+        result, _ = _check_if_already_solved(actions, self._PR_CONTEXT, REBASE_SKILL_DIR, "/project")
+        assert result is False
+        assert any("could not determine" in a for a in actions)
+
+    @patch("app.rebase_pr.run_claude")
+    @patch("app.cli_provider.build_full_command", return_value=["claude", "--fake"])
+    @patch("app.config.get_model_config", return_value={"mission": "m", "fallback": "f", "review": "r"})
+    @patch("app.rebase_pr._run_git", return_value="")
     def test_malformed_json_returns_false(self, _git, _mc, _cmd, mock_claude):
         mock_claude.return_value = {
             "success": True,
