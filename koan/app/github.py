@@ -110,8 +110,14 @@ def run_gh(
         if result.returncode != 0:
             if _is_sso_error(result.stderr):
                 raise SSOAuthRequired(result.stderr)
+            # ``gh api`` reduces stderr to "<message> (HTTP <code>)" and writes
+            # the API's JSON error body — which carries the actual reason — to
+            # stdout. Callers discriminate on that reason (a self-review 422 vs.
+            # any other 422), so append it instead of throwing it away.
+            detail = result.stdout.strip() if isinstance(result.stdout, str) else ""
+            suffix = f" — {detail[:300]}" if detail else ""
             raise RuntimeError(
-                f"gh failed: {' '.join(cmd[:4])}... — {result.stderr[:300]}"
+                f"gh failed: {' '.join(cmd[:4])}... — {result.stderr[:300]}{suffix}"
             )
         return result.stdout.strip()
 
