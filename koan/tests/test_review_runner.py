@@ -6955,6 +6955,31 @@ class TestSubmitReviewVerdict:
             )
         assert result is True
 
+    @patch("app.github.subprocess.run")
+    def test_self_review_detected_from_real_gh_failure(self, mock_run):
+        """The self-review fallback must trigger on the error ``run_gh``
+        actually raises for a self-review 422.
+
+        ``gh`` writes only ``gh: Unprocessable Entity (HTTP 422)`` to stderr —
+        "Can not ... your own pull request" is in the JSON body on stdout. When
+        that body is dropped, `_is_self_review_error` never matches and every
+        verdict on a bot-authored PR is lost instead of posting as a COMMENT.
+        """
+        from app.github import run_gh
+        from app.review_runner import _is_self_review_error
+
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)\n",
+            stdout='{"message":"Unprocessable Entity","errors":'
+                   '["Can not request changes on your own pull request"],'
+                   '"status":"422"}',
+        )
+        with pytest.raises(RuntimeError) as exc:
+            run_gh("api", "repos/owner/repo/pulls/42/reviews", "-X", "POST")
+
+        assert _is_self_review_error(exc.value) is True
+
     @patch("app.review_runner.run_gh",
            side_effect=RuntimeError("gh: Unprocessable Entity (HTTP 422) "
                                     "No commits between base and head"))

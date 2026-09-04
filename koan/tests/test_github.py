@@ -57,6 +57,31 @@ class TestRunGh:
         with pytest.raises(RuntimeError, match="auth required"):
             run_gh("api", "repos/o/r")
 
+    @patch("app.github.subprocess.run")
+    def test_error_message_includes_api_error_body(self, mock_run):
+        """``gh api`` puts only ``<message> (HTTP <code>)`` on stderr; the
+        specific reason lives in the JSON body it writes to stdout. Callers
+        discriminate on that reason (e.g. self-review 422 vs. any other 422),
+        so it has to survive into the raised error."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)\n",
+            stdout='{"message":"Unprocessable Entity","errors":'
+                   '["Can not approve your own pull request"],"status":"422"}',
+        )
+        with pytest.raises(RuntimeError, match="Can not approve your own pull request"):
+            run_gh("api", "repos/o/r/pulls/1/reviews", "-X", "POST")
+
+    @patch("app.github.subprocess.run")
+    def test_error_message_omits_empty_stdout(self, mock_run):
+        """Nothing is appended when the failing command wrote no stdout."""
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr="not found", stdout="",
+        )
+        with pytest.raises(RuntimeError) as exc:
+            run_gh("pr", "view", "999")
+        assert str(exc.value).endswith("not found")
+
     @patch("app.retry.time.sleep")
     @patch("app.github.subprocess.run")
     def test_timeout_propagates(self, mock_run, mock_sleep):
