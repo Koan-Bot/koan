@@ -1315,21 +1315,32 @@ def _check_if_already_solved(
 
     result = run_claude(cmd, project_path, timeout=120)
 
+    # This check is a guard, so every skip path has to say *why* — a quota
+    # outage, a timeout and a model that narrated instead of answering all
+    # degrade to "run the rebase anyway", but they need different fixes.
     if not result["success"]:
-        actions_log.append("Already-solved check: skipped (Claude call failed)")
+        reason = (result.get("error") or "no error reported").strip()
+        actions_log.append(
+            f"Already-solved check: skipped (Claude call failed: {reason[:200]})"
+        )
         return False, None
 
     # Extract the first JSON object from the output
     raw = result.get("output", "")
     json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
     if not json_match:
-        actions_log.append("Already-solved check: skipped (no JSON in response)")
+        actions_log.append(
+            f"Already-solved check: skipped (no JSON in response: {raw.strip()[:200]})"
+        )
         return False, None
 
     try:
         data = json.loads(json_match.group(0))
     except (json.JSONDecodeError, ValueError):
-        actions_log.append("Already-solved check: skipped (JSON parse error)")
+        actions_log.append(
+            f"Already-solved check: skipped (JSON parse error: "
+            f"{json_match.group(0)[:200]})"
+        )
         return False, None
 
     already_solved = data.get("already_solved", False)
