@@ -175,12 +175,23 @@ def test_request_body_requiredness_matches_handlers(app):
     assert spec["paths"]["/v1/pause"]["post"]["requestBody"]["required"] is False
 
 
+class _EmptyMissionStore:
+    """Store double: the list handler only needs `list_by_state` to be empty."""
+
+    def list_by_state(self, state, project=None, limit=None):
+        return []
+
+
 def test_query_parameter_schemas_match_handler_accesses(app):
     cases = {
         ("get", "/v1/missions"): (
             "missions.list_missions_route",
-            {"status": None, "project": None},
-            (("app.api.routes_missions.list_missions", []),),
+            {"status": None, "project": None, "limit": None},
+            (
+                ("app.api.routes_missions.list_missions", []),
+                ("app.mission_store.transition.ensure_store_synced", None),
+                ("app.mission_store.get_mission_store", _EmptyMissionStore()),
+            ),
         ),
         ("get", "/v1/usage"): (
             "observability.usage",
