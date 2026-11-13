@@ -7425,7 +7425,7 @@ class TestBatchVerdictRideInRunReview:
     @patch("app.review_runner._is_review_requested", return_value=False)
     @patch("app.review_runner._submit_review_verdict")
     @patch("app.review_runner._post_inline_finding_comments")
-    @patch("app.review_runner._submit_batch_review", return_value=(False, 0, EVENT_NOT_APPLIED))
+    @patch("app.review_runner._submit_batch_review", return_value=(False, 0, EVENT_UNKNOWN))
     @patch(
         "app.review_runner._fetch_existing_inline_anchors_checked",
         side_effect=[(set(), True), (set(), False)],

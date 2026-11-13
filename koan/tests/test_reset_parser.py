@@ -442,14 +442,20 @@ class TestParseResetTimeEdgeCases:
         assert ts is None
 
     def test_us_timezone(self):
-        """Parse with US/Eastern timezone."""
+        """Parse with a US timezone.
+
+        Uses the canonical ``America/New_York`` rather than the legacy
+        ``US/Eastern`` alias: newer distro tzdata packages ship legacy links
+        separately (e.g. Ubuntu's ``tzdata-legacy``), so the alias is not
+        guaranteed to resolve on CI runners.
+        """
         from app.reset_parser import parse_reset_time
 
-        now = datetime(2026, 2, 4, 8, 0, 0, tzinfo=ZoneInfo("US/Eastern"))
-        ts, info = parse_reset_time("resets 10am (US/Eastern)", now=now)
+        now = datetime(2026, 2, 4, 8, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        ts, info = parse_reset_time("resets 10am (America/New_York)", now=now)
 
         assert ts is not None
-        reset_dt = datetime.fromtimestamp(ts, tz=ZoneInfo("US/Eastern"))
+        reset_dt = datetime.fromtimestamp(ts, tz=ZoneInfo("America/New_York"))
         assert reset_dt.hour == 10
 
     def test_date_12pm_edge(self):
